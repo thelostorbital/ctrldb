@@ -45,10 +45,10 @@ spend review findings on formatting or lint issues already enforced by CI.
   Until a concrete process adapter is introduced, `os/exec` must remain
   forbidden, and the repository-wide architecture check must continue to
   reject cgo and its compiler directives, Go assembly, SWIG inputs, precompiled
-  native objects, process-package imports, `go:linkname`, and the standard
-  library's lower-level `os.StartProcess` API. An eventual exception must be
-  limited to the exact validated implementation boundary and arrive with
-  executable rejection tests.
+  native objects, dynamic Go plugins, process-package imports, `go:linkname`,
+  and the standard library's lower-level `os.StartProcess` API. An eventual
+  exception must be limited to the exact validated implementation boundary and
+  arrive with executable rejection tests.
 - Database access must be least-privilege and deny-by-default. Flag any public
   exposure that is not explicit, narrowly scoped, authenticated, encrypted,
   audited, time-bounded, and reliably revocable. Broad CIDRs or indefinite

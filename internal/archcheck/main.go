@@ -8,7 +8,6 @@ package main
 import (
 	"fmt"
 	"go/ast"
-	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -37,6 +36,7 @@ var forbiddenProcessImports = map[string]string{
 	"go/build":                 "go/build is forbidden because it can launch the Go tool outside the validated runner adapter",
 	"net/http/cgi":             "net/http/cgi is forbidden because it launches executables outside the validated runner adapter",
 	"os/exec":                  "os/exec is forbidden until an exact validated adapter boundary is introduced",
+	"plugin":                   "dynamic Go plugins are forbidden until an exact validated loading boundary is introduced",
 	"syscall":                  "low-level process packages are forbidden; use the validated runner adapter",
 	"golang.org/x/sys/execabs": "low-level process packages are forbidden; use the validated runner adapter",
 	"golang.org/x/sys/unix":    "low-level process packages are forbidden; use the validated runner adapter",
@@ -187,7 +187,7 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 
 	uses := make(map[*ast.Ident]types.Object)
 	configuration := types.Config{
-		Importer:                 importer.Default(),
+		Importer:                 architectureImporter{},
 		DisableUnusedImportCheck: true,
 		Error:                    func(error) {},
 	}
@@ -213,6 +213,25 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 		return true
 	})
 	return findings, nil
+}
+
+// architectureImporter supplies the minimum package metadata needed to
+// distinguish the real os.StartProcess symbol from local lookalikes. Unlike
+// go/importer.Default, it never invokes the Go tool or any other subprocess.
+type architectureImporter struct{}
+
+func (architectureImporter) Import(importPath string) (*types.Package, error) {
+	packageName := importPath
+	if separator := strings.LastIndexByte(importPath, '/'); separator >= 0 {
+		packageName = importPath[separator+1:]
+	}
+	imported := types.NewPackage(importPath, packageName)
+	if importPath == "os" {
+		signature := types.NewSignatureType(nil, nil, nil, nil, nil, false)
+		imported.Scope().Insert(types.NewFunc(token.NoPos, imported, "StartProcess", signature))
+	}
+	imported.MarkComplete()
+	return imported, nil
 }
 
 func policyForSource(relativePath string) sourcePolicy {

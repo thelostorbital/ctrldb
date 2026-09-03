@@ -59,6 +59,11 @@ func TestFindArchitectureViolations(t *testing.T) {
 			want:   1,
 		},
 		{
+			name:   "plugin import",
+			source: "package fixture\nimport _ \"plugin\"\n",
+			want:   1,
+		},
+		{
 			name:   "cgo import",
 			source: "package fixture\nimport \"C\"\n",
 			want:   1,

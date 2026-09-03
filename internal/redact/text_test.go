@@ -5,6 +5,7 @@ package redact_test
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -118,6 +119,38 @@ func TestTextJSONSerializationContainsOnlySanitizedText(t *testing.T) {
 	}
 	if string(encoded) != `"token=[redacted]"` {
 		t.Fatalf("json.Marshal() = %s, want sanitized text", encoded)
+	}
+
+	var decoded redact.Text
+	if err := json.Unmarshal([]byte(`"password=SECRET_MARKER_DECODE"`), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() returned an error: %v", err)
+	}
+	if got := decoded.String(); got != "password=[redacted]" {
+		t.Fatalf("decoded Text = %q, want sanitized text", got)
+	}
+
+	if err := decoded.UnmarshalText([]byte("token=SECRET_MARKER_TEXT_DECODE")); err != nil {
+		t.Fatalf("UnmarshalText() returned an error: %v", err)
+	}
+	if got := decoded.String(); got != "token=[redacted]" {
+		t.Fatalf("text-decoded Text = %q, want sanitized text", got)
+	}
+}
+
+func TestTextRejectsInvalidSerializationAndNilDestination(t *testing.T) {
+	t.Parallel()
+
+	var destination *redact.Text
+	if err := destination.UnmarshalText([]byte("safe")); !errors.Is(err, redact.ErrNilTextDestination) {
+		t.Fatalf("nil Text.UnmarshalText() error = %v, want ErrNilTextDestination", err)
+	}
+	if err := destination.UnmarshalJSON([]byte(`"safe"`)); !errors.Is(err, redact.ErrNilTextDestination) {
+		t.Fatalf("nil Text.UnmarshalJSON() error = %v, want ErrNilTextDestination", err)
+	}
+
+	var text redact.Text
+	if err := json.Unmarshal([]byte(`{"not":"a string"}`), &text); err == nil {
+		t.Fatal("json.Unmarshal() accepted a non-string Text value")
 	}
 }
 

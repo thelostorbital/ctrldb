@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -20,6 +21,9 @@ const (
 	redactedValue = "[redacted]"
 	redactedToken = "[redacted-token]"
 )
+
+// ErrNilTextDestination is returned when decoding targets a nil Text pointer.
+var ErrNilTextDestination = errors.New("redact: nil Text destination")
 
 var (
 	ansiCSI = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
@@ -80,6 +84,33 @@ func (text Text) MarshalText() ([]byte, error) {
 // MarshalJSON implements json.Marshaler.
 func (text Text) MarshalJSON() ([]byte, error) {
 	return json.Marshal(text.value)
+}
+
+// UnmarshalText sanitizes serialized text before storing it in Text.
+func (text *Text) UnmarshalText(value []byte) error {
+	if text == nil {
+		return ErrNilTextDestination
+	}
+
+	*text = Sanitize(string(value))
+
+	return nil
+}
+
+// UnmarshalJSON sanitizes a serialized JSON string before storing it in Text.
+func (text *Text) UnmarshalJSON(value []byte) error {
+	if text == nil {
+		return ErrNilTextDestination
+	}
+
+	var raw string
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return fmt.Errorf("redact: decode Text: %w", err)
+	}
+
+	*text = Sanitize(raw)
+
+	return nil
 }
 
 // SanitizeJSON parses and recursively redacts a JSON document. Invalid or

@@ -28,8 +28,8 @@ security scanning, and maintainability checks.
 ```sh
 qlty fmt --all
 qlty check --all --no-fix --level=low --fail-level=low
-go test ./...
 go run ./internal/archcheck
+go test ./...
 ```
 
 ## License

@@ -49,6 +49,11 @@ func TestFindArchitectureViolations(t *testing.T) {
 			want:   1,
 		},
 		{
+			name:   "cgo import",
+			source: "package fixture\nimport \"C\"\n",
+			want:   1,
+		},
+		{
 			name:   "raw os exec import",
 			source: "package fixture\nimport _ `os/exec`\n",
 			want:   1,

@@ -33,6 +33,7 @@ type sourcePolicy struct {
 }
 
 var forbiddenProcessImports = map[string]string{
+	"C":                        "cgo is forbidden until an exact validated native boundary is introduced",
 	"os/exec":                  "os/exec is forbidden until an exact validated adapter boundary is introduced",
 	"syscall":                  "low-level process packages are forbidden; use the validated runner adapter",
 	"golang.org/x/sys/execabs": "low-level process packages are forbidden; use the validated runner adapter",

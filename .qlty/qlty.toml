@@ -28,7 +28,7 @@ default = true
 
 [[plugin]]
 name = "golangci-lint"
-version = "2.12.2"
+version = "2.13.2"
 drivers = ["lint", "format"]
 mode = "block"
 

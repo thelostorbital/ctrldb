@@ -167,7 +167,7 @@ spec:
         noncurrentRetentionDays: 30
     verification:
       network:
-        vpc: ctrldb-restore-verification
+        vpc: ctrldb-staging
         subnet: ctrldb-restore-verification
         cidr: 10.30.0.0/24
         tag: ctrldb-restore-verification

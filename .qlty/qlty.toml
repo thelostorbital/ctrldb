@@ -1,0 +1,63 @@
+config_version = "0"
+
+# Qlty also honors .gitignore. Keep this list limited to generated or vendored
+# content so application, configuration, test, and documentation files remain
+# visible to every applicable check.
+exclude_patterns = [
+  "**/build/**",
+  "**/dist/**",
+  "**/generated/**",
+  "**/node_modules/**",
+  "**/vendor/**",
+]
+
+test_patterns = [
+  "**/*_test.go",
+  "**/test/**",
+  "**/tests/**",
+]
+
+# Smell reports are review signals, not merge blockers. Correctness, security,
+# formatting, and workflow checks below are blocking.
+[smells]
+mode = "comment"
+
+[[source]]
+name = "default"
+default = true
+
+[[plugin]]
+name = "golangci-lint"
+version = "2.12.2"
+drivers = ["lint", "format"]
+mode = "block"
+
+[[plugin]]
+name = "gitleaks"
+version = "8.29.1"
+mode = "block"
+
+[[plugin]]
+name = "osv-scanner"
+version = "2.3.0"
+mode = "block"
+
+[[plugin]]
+name = "markdownlint"
+version = "0.46.0"
+mode = "block"
+
+[[plugin]]
+name = "editorconfig-checker"
+version = "3.6.1"
+mode = "block"
+
+[[plugin]]
+name = "actionlint"
+version = "1.7.9"
+mode = "block"
+
+[[plugin]]
+name = "zizmor"
+version = "1.16.3"
+mode = "block"

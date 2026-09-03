@@ -1,0 +1,37 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Test and analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install Qlty
+        uses: qltysh/qlty-action/install@782ebe01413b63470fe8c3d481de77cef79e1486 # v2.1.0
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run quality and security checks
+        run: qlty check --all --no-fix --level=low --fail-level=low

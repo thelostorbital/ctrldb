@@ -1,0 +1,36 @@
+# Build and test output
+/bin/
+/build/
+/dist/
+/ctrldb
+coverage.out
+*.prof
+*.test
+
+# Local CtrlDB state
+.ctrldb/
+
+# Credentials and local environment
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+*.pem
+*credentials*.json
+*service-account*.json
+
+# Infrastructure state
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log

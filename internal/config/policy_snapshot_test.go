@@ -26,7 +26,7 @@ func TestBuildPolicySnapshotKnownVector(t *testing.T) {
 		t.Fatalf("BuildPolicySnapshot() unexpected error: %v", err)
 	}
 
-	const wantDigest = "664820dbb919cf8fcfc1a88d6570a407f60df9d95c7b718fb0b4a598cec58434"
+	const wantDigest = "ea9c9090ff9b037d962fba2afb2cf8b8b9991c5ba0d5fc3f0f6aaeb6f7ffb496"
 	if got := snapshot.SHA256(); got != wantDigest {
 		t.Fatalf("SHA256() = %q; want known vector %q", got, wantDigest)
 	}

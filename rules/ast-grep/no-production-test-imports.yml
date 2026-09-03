@@ -16,11 +16,11 @@ rule:
   any:
     - all:
         - kind: interpreted_string_literal
-        - regex: ^"([^"]*/)?(test|tests|testing|testutil|testutils|fake|fakes)(/[^"]*)?"$
+        - regex: ^"([^"]*/)?(test|tests|testing|httptest|testutil|testutils|fake|fakes)(/[^"]*)?"$
         - inside:
             kind: import_spec
     - all:
         - kind: raw_string_literal
-        - regex: ^`([^`]*/)?(test|tests|testing|testutil|testutils|fake|fakes)(/[^`]*)?`$
+        - regex: ^`([^`]*/)?(test|tests|testing|httptest|testutil|testutils|fake|fakes)(/[^`]*)?`$
         - inside:
             kind: import_spec

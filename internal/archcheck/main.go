@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 type finding struct {
@@ -24,6 +25,11 @@ type finding struct {
 	line     int
 	column   int
 	message  string
+}
+
+type sourcePolicy struct {
+	allowBubbleTeaImport    bool
+	allowTestInfrastructure bool
 }
 
 var forbiddenProcessImports = map[string]string{
@@ -72,7 +78,11 @@ func scan(root string) ([]finding, error) {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
-		fileFindings, err := findProcessBoundaryViolations(path, contents)
+		relativePath, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("locate %s beneath %s: %w", path, root, err)
+		}
+		fileFindings, err := findArchitectureViolations(path, contents, policyForSource(relativePath))
 		if err != nil {
 			return err
 		}
@@ -95,30 +105,62 @@ func scan(root string) ([]finding, error) {
 	return findings, nil
 }
 
-func findProcessBoundaryViolations(filename string, contents []byte) ([]finding, error) {
+func findArchitectureViolations(filename string, contents []byte, policy sourcePolicy) ([]finding, error) {
 	files := token.NewFileSet()
-	parsed, err := parser.ParseFile(files, filename, contents, parser.SkipObjectResolution)
+	parsed, err := parser.ParseFile(files, filename, contents, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", filename, err)
 	}
 
 	var findings []finding
+	for _, group := range parsed.Comments {
+		for _, comment := range group.List {
+			linknameArguments, isLinkname := strings.CutPrefix(comment.Text, "//go:linkname")
+			if !isLinkname || (linknameArguments != "" && linknameArguments[0] != ' ' && linknameArguments[0] != '\t') {
+				continue
+			}
+			position := files.Position(comment.Pos())
+			findings = append(findings, finding{
+				filename: position.Filename,
+				line:     position.Line,
+				column:   position.Column,
+				message:  "go:linkname is forbidden; it can bypass validated package boundaries",
+			})
+		}
+	}
 	for _, imported := range parsed.Imports {
+		if strings.HasPrefix(imported.Path.Value, "\"") && strings.Contains(imported.Path.Value, `\`) {
+			position := files.Position(imported.Path.Pos())
+			findings = append(findings, finding{
+				filename: position.Filename,
+				line:     position.Line,
+				column:   position.Column,
+				message:  "Go import paths must use their literal spelling; escape sequences are forbidden",
+			})
+		}
 		importPath, err := strconv.Unquote(imported.Path.Value)
 		if err != nil {
 			return nil, fmt.Errorf("decode import in %s: %w", filename, err)
 		}
-		message, forbidden := forbiddenProcessImports[importPath]
-		if !forbidden {
-			continue
+		var messages []string
+		if message, forbidden := forbiddenProcessImports[importPath]; forbidden {
+			messages = append(messages, message)
 		}
-		position := files.Position(imported.Path.Pos())
-		findings = append(findings, finding{
-			filename: position.Filename,
-			line:     position.Line,
-			column:   position.Column,
-			message:  message,
-		})
+		if isBubbleTeaImport(importPath) && !policy.allowBubbleTeaImport {
+			messages = append(messages, "Bubble Tea is restricted to internal/tui")
+		}
+		if isTestInfrastructureImport(importPath) && !policy.allowTestInfrastructure {
+			messages = append(messages, "production code must not import test-only or fake infrastructure")
+		}
+		for _, message := range messages {
+			position := files.Position(imported.Path.Pos())
+			findings = append(findings, finding{
+				filename: position.Filename,
+				line:     position.Line,
+				column:   position.Column,
+				message:  message,
+			})
+		}
 	}
 
 	uses := make(map[*ast.Ident]types.Object)
@@ -127,7 +169,8 @@ func findProcessBoundaryViolations(filename string, contents []byte) ([]finding,
 		DisableUnusedImportCheck: true,
 		Error:                    func(error) {},
 	}
-	_, _ = configuration.Check(parsed.Name.Name, files, []*ast.File{parsed}, &types.Info{Uses: uses})
+	checkedPackagePath := "github.com/thelostorbital/ctrldb/.archcheck/" + parsed.Name.Name
+	_, _ = configuration.Check(checkedPackagePath, files, []*ast.File{parsed}, &types.Info{Uses: uses})
 
 	ast.Inspect(parsed, func(node ast.Node) bool {
 		identifier, ok := node.(*ast.Ident)
@@ -148,4 +191,50 @@ func findProcessBoundaryViolations(filename string, contents []byte) ([]finding,
 		return true
 	})
 	return findings, nil
+}
+
+func policyForSource(relativePath string) sourcePolicy {
+	normalized := filepath.ToSlash(filepath.Clean(relativePath))
+	policy := sourcePolicy{
+		allowBubbleTeaImport:    strings.HasPrefix(normalized, "internal/tui/"),
+		allowTestInfrastructure: strings.HasSuffix(normalized, "_test.go"),
+	}
+	if policy.allowTestInfrastructure {
+		return policy
+	}
+
+	for _, directory := range strings.Split(filepath.ToSlash(filepath.Dir(relativePath)), "/") {
+		switch directory {
+		case "test", "tests", "testutil", "testutils", "fake", "fakes":
+			policy.allowTestInfrastructure = true
+			return policy
+		}
+	}
+	return policy
+}
+
+func isBubbleTeaImport(importPath string) bool {
+	if importPath == "charm.land/bubbletea/v2" || importPath == "github.com/charmbracelet/bubbletea" {
+		return true
+	}
+	version, versioned := strings.CutPrefix(importPath, "github.com/charmbracelet/bubbletea/v")
+	if !versioned || version == "" {
+		return false
+	}
+	for _, character := range version {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isTestInfrastructureImport(importPath string) bool {
+	for _, component := range strings.Split(importPath, "/") {
+		switch component {
+		case "test", "tests", "testing", "httptest", "testutil", "testutils", "fake", "fakes":
+			return true
+		}
+	}
+	return false
 }

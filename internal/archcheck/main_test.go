@@ -9,13 +9,14 @@ import (
 	"testing"
 )
 
-func TestFindProcessBoundaryViolations(t *testing.T) {
+func TestFindArchitectureViolations(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		source string
-		want   int
+		name     string
+		filename string
+		source   string
+		want     int
 	}{
 		{
 			name:   "default import",
@@ -55,7 +56,7 @@ func TestFindProcessBoundaryViolations(t *testing.T) {
 		{
 			name:   "escaped os exec import",
 			source: "package fixture\nimport _ \"o\\x73/ex\\x65c\"\n",
-			want:   1,
+			want:   2,
 		},
 		{
 			name:   "syscall import",
@@ -76,6 +77,15 @@ func TestFindProcessBoundaryViolations(t *testing.T) {
 			name:   "windows import",
 			source: "package fixture\nimport _ `golang.org/x/sys/windows`\n",
 			want:   1,
+		},
+		{
+			name: "linkname directive",
+			source: `package fixture
+import _ "unsafe"
+//go:linkname startProcess os.StartProcess
+func startProcess()
+`,
+			want: 1,
 		},
 		{
 			name: "shadowed package name",
@@ -101,14 +111,47 @@ func useLocalProcessAPI() {
 }
 `,
 		},
+		{
+			name:   "local package named os",
+			source: "package os\nfunc StartProcess() {}\nvar _ = StartProcess\n",
+		},
+		{
+			name:   "Bubble Tea outside TUI",
+			source: "package fixture\nimport _ \"charm.land/bubbletea/v2\"\n",
+			want:   1,
+		},
+		{
+			name:     "Bubble Tea inside TUI",
+			filename: "internal/tui/fixture.go",
+			source:   "package fixture\nimport _ \"charm.land/bubbletea/v2\"\n",
+		},
+		{
+			name:   "test infrastructure in production",
+			source: "package fixture\nimport _ \"net/http/httptest\"\n",
+			want:   1,
+		},
+		{
+			name:     "test infrastructure in test",
+			filename: "internal/example/fixture_test.go",
+			source:   "package fixture\nimport _ \"net/http/httptest\"\n",
+		},
+		{
+			name:   "escaped import path",
+			source: "package fixture\nimport _ \"example.com/\\x66oo\"\n",
+			want:   1,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			findings, err := findProcessBoundaryViolations("fixture.go", []byte(test.source))
+			filename := test.filename
+			if filename == "" {
+				filename = "fixture.go"
+			}
+			findings, err := findArchitectureViolations(filename, []byte(test.source), policyForSource(filename))
 			if err != nil {
-				t.Fatalf("find process boundary violations: %v", err)
+				t.Fatalf("find architecture violations: %v", err)
 			}
 			if len(findings) != test.want {
 				t.Fatalf("got %d findings, want %d", len(findings), test.want)

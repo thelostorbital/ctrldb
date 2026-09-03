@@ -1,0 +1,5 @@
+package fixture
+
+import `net/http/httptest`
+
+var _ = httptest.NewRecorder

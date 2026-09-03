@@ -1,0 +1,5 @@
+package fixture
+
+import `testutil`
+
+var _ = testutil.Value

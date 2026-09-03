@@ -1,0 +1,5 @@
+package fixture
+
+import `testing/fstest`
+
+var _ = fstest.MapFS{}

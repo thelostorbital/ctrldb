@@ -1,0 +1,5 @@
+package fixture
+
+import `go.uber.org/mock/gomock`
+
+var _ = gomock.NewController

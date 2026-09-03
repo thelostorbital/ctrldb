@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+
+# Copyright 2026 CtrlBoard.dev
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+fixture_source_dir="$repo_root/rules/ast-grep/testdata"
+architecture_fixture_dir="$repo_root/internal/architecture_rule_fixture"
+architecture_fixture="$architecture_fixture_dir/fixture.go"
+generated_fixture_dir="$repo_root/generated"
+generated_fixture="$generated_fixture_dir/architecture_rule_fixture.go"
+test_helper_fixture_dir="$architecture_fixture_dir/testutil"
+test_helper_fixture="$test_helper_fixture_dir/fixture.go"
+testdata_fixture_dir="$architecture_fixture_dir/testdata"
+testdata_fixture="$testdata_fixture_dir/fixture.go"
+qlty_bin="${QLTY_BIN:-qlty}"
+architecture_fixture_dir_created=false
+generated_fixture_dir_created=false
+test_helper_fixture_dir_created=false
+testdata_fixture_dir_created=false
+
+cleanup() {
+  rm -f "$architecture_fixture" "$generated_fixture" "$test_helper_fixture" "$testdata_fixture"
+  if [[ $testdata_fixture_dir_created == true ]]; then
+    rmdir "$testdata_fixture_dir" 2>/dev/null || true
+  fi
+  if [[ $test_helper_fixture_dir_created == true ]]; then
+    rmdir "$test_helper_fixture_dir" 2>/dev/null || true
+  fi
+  if [[ $architecture_fixture_dir_created == true ]]; then
+    rmdir "$architecture_fixture_dir" 2>/dev/null || true
+  fi
+  if [[ $generated_fixture_dir_created == true ]]; then
+    rmdir "$generated_fixture_dir" 2>/dev/null || true
+  fi
+}
+
+run_qlty() {
+  QLTY_TELEMETRY=off "$qlty_bin" check \
+    --no-fix \
+    --no-cache \
+    --filter=ast-grep \
+    --level=low \
+    --fail-level=low \
+    "$1"
+}
+
+assert_accepted() {
+  local source_file=$1
+  local target_file=$2
+
+  cp "$source_file" "$target_file"
+  if ! run_qlty "$target_file"; then
+    echo "architecture rules rejected safe fixture: $source_file" >&2
+    exit 1
+  fi
+  rm -f "$target_file"
+}
+
+assert_rejected() {
+  local source_file=$1
+  local target_file=$2
+  local expected_rule=$3
+
+  cp "$source_file" "$target_file"
+
+  set +e
+  output=$(run_qlty "$target_file" 2>&1)
+  exit_code=$?
+  set -e
+
+  rm -f "$target_file"
+
+  if [[ $exit_code -eq 0 ]]; then
+    echo "architecture rules accepted forbidden fixture: $source_file" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$expected_rule" <<<"$output"; then
+    printf '%s\n' "$output" >&2
+    echo "architecture rule did not report $expected_rule for $source_file" >&2
+    exit 1
+  fi
+
+  echo "verified $expected_rule rejects $(basename "$source_file")"
+}
+
+for target_file in "$architecture_fixture" "$generated_fixture" "$test_helper_fixture" "$testdata_fixture"; do
+  if [[ -e $target_file ]]; then
+    echo "refusing to overwrite existing architecture rule fixture: $target_file" >&2
+    exit 1
+  fi
+done
+
+trap cleanup EXIT
+
+if [[ ! -d $architecture_fixture_dir ]]; then
+  mkdir "$architecture_fixture_dir"
+  architecture_fixture_dir_created=true
+fi
+if [[ ! -d $generated_fixture_dir ]]; then
+  mkdir "$generated_fixture_dir"
+  generated_fixture_dir_created=true
+fi
+if [[ ! -d $test_helper_fixture_dir ]]; then
+  mkdir "$test_helper_fixture_dir"
+  test_helper_fixture_dir_created=true
+fi
+if [[ ! -d $testdata_fixture_dir ]]; then
+  mkdir "$testdata_fixture_dir"
+  testdata_fixture_dir_created=true
+fi
+
+assert_accepted "$fixture_source_dir/allowed.go.txt" "$architecture_fixture"
+assert_accepted "$fixture_source_dir/test-infrastructure-import.go.txt" "$test_helper_fixture"
+assert_accepted "$fixture_source_dir/testify-import.go.txt" "$test_helper_fixture"
+assert_accepted "$fixture_source_dir/test-infrastructure-import.go.txt" "$testdata_fixture"
+
+assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
+assert_rejected "$fixture_source_dir/raw-bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
+assert_rejected "$fixture_source_dir/legacy-bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
+assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/bare-test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-bare-test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/testing-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-testing-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/httptest-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-httptest-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/mock-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-mock-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/testify-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-testify-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/testdata-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-testdata-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/escaped-os-exec-import.go.txt" "$architecture_fixture" no-escaped-import-paths
+assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$generated_fixture" bubble-tea-import-boundary
+assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$generated_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/escaped-os-exec-import.go.txt" "$generated_fixture" no-escaped-import-paths
+
+echo "all architecture rule acceptance and rejection cases passed"

@@ -26,8 +26,10 @@ CtrlDB requires Go 1.27 or later. The repository uses
 security scanning, and maintainability checks.
 
 ```sh
+export QLTY_TELEMETRY=off
 qlty fmt --all
 qlty check --all --no-fix --level=low --fail-level=low
+go run ./internal/archcheck
 go test ./...
 ```
 

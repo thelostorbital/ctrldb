@@ -1,0 +1,40 @@
+id: no-production-test-imports
+language: Go
+severity: warning
+message: Production code must not import test-only or fake infrastructure.
+files:
+  - "**/*.go"
+ignores:
+  - "**/*_test.go"
+  - "**/test/**/*.go"
+  - "**/tests/**/*.go"
+  - "**/testdata/**/*.go"
+  - "**/testutil/**/*.go"
+  - "**/testutils/**/*.go"
+  - "**/fake/**/*.go"
+  - "**/fakes/**/*.go"
+  - "**/mock/**/*.go"
+  - "**/mocks/**/*.go"
+  - "**/gomock/**/*.go"
+rule:
+  any:
+    - all:
+        - kind: interpreted_string_literal
+        - regex: ^"([^"]*/)?(test|tests|testdata|testing|httptest|testutil|testutils|fake|fakes|mock|mocks|gomock)(/[^"]*)?"$
+        - inside:
+            kind: import_spec
+    - all:
+        - kind: raw_string_literal
+        - regex: ^`([^`]*/)?(test|tests|testdata|testing|httptest|testutil|testutils|fake|fakes|mock|mocks|gomock)(/[^`]*)?`$
+        - inside:
+            kind: import_spec
+    - all:
+        - kind: interpreted_string_literal
+        - regex: ^"github\.com/stretchr/testify(/[^\"]*)?"$
+        - inside:
+            kind: import_spec
+    - all:
+        - kind: raw_string_literal
+        - regex: ^`github\.com/stretchr/testify(/[^`]*)?`$
+        - inside:
+            kind: import_spec

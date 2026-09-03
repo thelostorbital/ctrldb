@@ -1,0 +1,6 @@
+package fixture
+
+const (
+	providerTestURL = "https://example.invalid/test"
+	processDocPath  = "os/exec"
+)

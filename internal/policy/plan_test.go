@@ -38,14 +38,20 @@ func TestPlanEncodeDecodeRoundTrip(t *testing.T) {
 func TestPlanDecodeResanitizesStoredText(t *testing.T) {
 	t.Parallel()
 
-	encoded, err := policy.EncodePlan(validPlan())
+	plan := validPlan()
+	plan.Steps[0].CommandRedacted = redact.Sanitize("password=SECRET_MARKER_STORED_PLAN")
+	plan, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+	encoded, err := policy.EncodePlan(plan)
 	if err != nil {
 		t.Fatalf("EncodePlan() returned an error: %v", err)
 	}
 
 	encoded = bytes.Replace(
 		encoded,
-		[]byte(`"commandRedacted":"gcloud compute instances stop example"`),
+		[]byte(`"commandRedacted":"[redacted]"`),
 		[]byte(`"commandRedacted":"password=SECRET_MARKER_STORED_PLAN"`),
 		1,
 	)
@@ -55,6 +61,102 @@ func TestPlanDecodeResanitizesStoredText(t *testing.T) {
 	}
 	if got := decoded.Steps[0].CommandRedacted.String(); got != "password=[redacted]" {
 		t.Fatalf("decoded command = %q, want a redacted value", got)
+	}
+}
+
+func TestPlanSealAndHashVerification(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	if err := policy.VerifyPlanHash(plan); err != nil {
+		t.Fatalf("VerifyPlanHash() returned an error: %v", err)
+	}
+
+	const knownDigest = "cdfd99dc269be17d5043b723208fa7f566657dca6e56202e9136cfc2fc0be02a"
+	if plan.PlanHash != knownDigest {
+		t.Fatalf("sealed plan digest = %q, want known vector %q", plan.PlanHash, knownDigest)
+	}
+
+	input := plan
+	input.PlanHash = "ignored-by-computation"
+	digest, err := policy.ComputePlanHash(input)
+	if err != nil {
+		t.Fatalf("ComputePlanHash() returned an error: %v", err)
+	}
+	if digest != plan.PlanHash {
+		t.Fatalf("ComputePlanHash() = %q, want %q", digest, plan.PlanHash)
+	}
+	if input.PlanHash != "ignored-by-computation" {
+		t.Fatalf("ComputePlanHash() mutated its input to %q", input.PlanHash)
+	}
+
+	tampered := plan
+	tampered.Downtime.ExpectedSeconds++
+	if err := policy.VerifyPlanHash(tampered); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("VerifyPlanHash() tampered error = %v, want ErrInvalidPlan", err)
+	}
+	if _, err := policy.EncodePlan(tampered); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("EncodePlan() tampered error = %v, want ErrInvalidPlan", err)
+	}
+
+	encoded, err := policy.EncodePlan(plan)
+	if err != nil {
+		t.Fatalf("EncodePlan() returned an error: %v", err)
+	}
+	encoded = bytes.Replace(encoded, []byte(`"generation-7"`), []byte(`"generation-8"`), 1)
+	if _, err := policy.DecodePlan(encoded); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan() tampered error = %v, want ErrInvalidPlan", err)
+	}
+}
+
+func TestPlanHashCoversEveryReviewSection(t *testing.T) {
+	t.Parallel()
+
+	original := validPlan()
+	tests := []struct {
+		name   string
+		mutate func(*domain.Plan)
+	}{
+		{name: "plan id", mutate: func(plan *domain.Plan) { plan.PlanID = "plan-fedcba9876543210" }},
+		{name: "workflow", mutate: func(plan *domain.Plan) { plan.WorkflowID = "WF-DSK-01" }},
+		{name: "approval", mutate: func(plan *domain.Plan) { plan.ApprovalClass = domain.ApprovalSecuritySensitive }},
+		{name: "expiry", mutate: func(plan *domain.Plan) { plan.ExpiresAt = plan.ExpiresAt.Add(time.Minute) }},
+		{name: "cooling off", mutate: func(plan *domain.Plan) { plan.CoolingOffSeconds++ }},
+		{name: "policy hash", mutate: func(plan *domain.Plan) {
+			plan.PolicyHash.Local = strings.Repeat("c", 64)
+			plan.PolicyHash.Approved = strings.Repeat("c", 64)
+		}},
+		{name: "intent", mutate: func(plan *domain.Plan) {
+			plan.Intent = &domain.PlanIntent{
+				WindowStart: time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC),
+				ValidUntil:  time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+			}
+		}},
+		{name: "resource", mutate: func(plan *domain.Plan) { plan.Resources[0].Fingerprint = "generation-8" }},
+		{name: "precondition", mutate: func(plan *domain.Plan) { plan.Preconditions[0].Detail = redact.Sanitize("ready") }},
+		{name: "step", mutate: func(plan *domain.Plan) { plan.Steps[0].Executor = "compute-api" }},
+		{name: "cost", mutate: func(plan *domain.Plan) { plan.Cost.RunRate.AmountUSD++ }},
+		{name: "downtime", mutate: func(plan *domain.Plan) { plan.Downtime.ExpectedSeconds++ }},
+		{name: "exposure", mutate: func(plan *domain.Plan) { plan.Exposure = domain.ExposurePrivate }},
+		{name: "protection", mutate: func(plan *domain.Plan) { plan.Protection[0] = redact.Sanitize("verified snapshot") }},
+		{name: "rollback", mutate: func(plan *domain.Plan) { plan.Rollback.Assets[0] = "replacement-instance" }},
+		{name: "point of no return", mutate: func(plan *domain.Plan) { plan.PointOfNoReturn = "" }},
+		{name: "verification", mutate: func(plan *domain.Plan) { plan.Verification[0] = redact.Sanitize("database health check") }},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			changed := validPlan()
+			test.mutate(&changed)
+			digest, err := policy.ComputePlanHash(changed)
+			if err != nil {
+				t.Fatalf("ComputePlanHash() returned an error: %v", err)
+			}
+			if digest == original.PlanHash {
+				t.Fatalf("changing %s did not change the plan digest", test.name)
+			}
+		})
 	}
 }
 
@@ -169,6 +271,14 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 			if _, err := policy.EncodePlan(plan); !errors.Is(err, policy.ErrInvalidPlan) {
 				t.Fatalf("EncodePlan() error = %v, want ErrInvalidPlan", err)
 			}
+			_, err := policy.SealPlan(plan)
+			if test.name == "plan hash" {
+				if err != nil {
+					t.Fatalf("SealPlan() should replace an invalid prior hash: %v", err)
+				}
+			} else if !errors.Is(err, policy.ErrInvalidPlan) {
+				t.Fatalf("SealPlan() error = %v, want ErrInvalidPlan", err)
+			}
 		})
 	}
 }
@@ -204,6 +314,10 @@ func TestPlanAllowsScheduledDestructiveStepUp(t *testing.T) {
 		WindowStart: time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC),
 		ValidUntil:  time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC),
 	}
+	plan, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
 
 	if err := policy.ValidatePlan(plan); err != nil {
 		t.Fatalf("ValidatePlan() returned an error: %v", err)
@@ -213,9 +327,8 @@ func TestPlanAllowsScheduledDestructiveStepUp(t *testing.T) {
 func validPlan() domain.Plan {
 	ceiling := 200.0
 
-	return domain.Plan{
+	plan := domain.Plan{
 		PlanID:            "plan-0123456789abcdef",
-		PlanHash:          strings.Repeat("a", 64),
 		WorkflowID:        "WF-VM-02",
 		ApprovalClass:     domain.ApprovalProtected,
 		ExpiresAt:         time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC),
@@ -272,4 +385,11 @@ func validPlan() domain.Plan {
 			redact.Sanitize("independent instance and database health check"),
 		},
 	}
+
+	sealed, err := policy.SealPlan(plan)
+	if err != nil {
+		panic(err)
+	}
+
+	return sealed
 }

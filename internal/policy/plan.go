@@ -6,12 +6,14 @@ package policy
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
@@ -32,7 +34,65 @@ var (
 	planHashPattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	workflowIDPattern = regexp.MustCompile(`^WF-[A-Z0-9]+-[0-9]{2}$`)
 	datePattern       = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
+	zeroPlanHash      = strings.Repeat("0", sha256.Size*2)
 )
+
+// SealPlan structurally validates plan and returns a copy carrying the digest
+// of its complete reviewable contents. The input value is never modified.
+func SealPlan(plan domain.Plan) (domain.Plan, error) {
+	plan.PlanHash = zeroPlanHash
+	if err := validatePlanStructure(plan); err != nil {
+		return domain.Plan{}, err
+	}
+
+	digest, err := computePlanHash(plan)
+	if err != nil {
+		return domain.Plan{}, err
+	}
+	plan.PlanHash = digest
+
+	return plan, nil
+}
+
+// ComputePlanHash returns the digest SealPlan would assign without modifying
+// plan. Any existing PlanHash value is deliberately ignored.
+func ComputePlanHash(plan domain.Plan) (string, error) {
+	plan.PlanHash = zeroPlanHash
+	if err := validatePlanStructure(plan); err != nil {
+		return "", err
+	}
+
+	return computePlanHash(plan)
+}
+
+// VerifyPlanHash validates both the plan structure and its content digest.
+func VerifyPlanHash(plan domain.Plan) error {
+	if err := validatePlanStructure(plan); err != nil {
+		return err
+	}
+
+	digest, err := computePlanHash(plan)
+	if err != nil {
+		return err
+	}
+	if plan.PlanHash != digest {
+		return invalid("planHash", "does not match the plan contents")
+	}
+
+	return nil
+}
+
+func computePlanHash(plan domain.Plan) (string, error) {
+	plan.PlanHash = ""
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		return "", fmt.Errorf("%w: hash encoding: %v", ErrInvalidPlan, err)
+	}
+
+	digest := sha256.Sum256(encoded)
+
+	return fmt.Sprintf("%x", digest), nil
+}
 
 // EncodePlan validates plan and serializes it as compact JSON.
 func EncodePlan(plan domain.Plan) ([]byte, error) {
@@ -71,8 +131,13 @@ func DecodePlan(encoded []byte) (domain.Plan, error) {
 	return plan, nil
 }
 
-// ValidatePlan checks the resource-independent PlanV1 invariants.
+// ValidatePlan checks the resource-independent PlanV1 invariants and content
+// digest.
 func ValidatePlan(plan domain.Plan) error {
+	return VerifyPlanHash(plan)
+}
+
+func validatePlanStructure(plan domain.Plan) error {
 	if !planIDPattern.MatchString(plan.PlanID) {
 		return invalid("planId", "must match plan-<16 lowercase hex>")
 	}

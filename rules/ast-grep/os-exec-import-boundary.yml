@@ -9,7 +9,6 @@ ignores:
   - internal/gcp/**/*.go
   - internal/remote/**/*.go
   - internal/hostagent/**/*.go
-  - "**/*_test.go"
 rule:
   kind: interpreted_string_literal
   regex: ^"os/exec"$

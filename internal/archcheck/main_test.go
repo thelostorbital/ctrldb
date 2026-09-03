@@ -64,6 +64,16 @@ func TestFindArchitectureViolations(t *testing.T) {
 			want:   1,
 		},
 		{
+			name:   "go packages import",
+			source: "package fixture\nimport _ \"golang.org/x/tools/go/packages\"\n",
+			want:   1,
+		},
+		{
+			name:   "go packages subpackage import",
+			source: "package fixture\nimport _ \"golang.org/x/tools/go/packages/packagestest\"\n",
+			want:   1,
+		},
+		{
 			name:   "plugin import",
 			source: "package fixture\nimport _ \"plugin\"\n",
 			want:   1,
@@ -168,6 +178,11 @@ func useLocalProcessAPI() {
 			want:   1,
 		},
 		{
+			name:   "testdata package in production",
+			source: "package fixture\nimport _ \"example.com/project/testdata/support\"\n",
+			want:   1,
+		},
+		{
 			name:   "mock infrastructure in production",
 			source: "package fixture\nimport _ \"github.com/stretchr/testify/mock\"\n",
 			want:   1,
@@ -190,6 +205,11 @@ func useLocalProcessAPI() {
 		{
 			name:     "test infrastructure in test",
 			filename: "internal/example/fixture_test.go",
+			source:   "package fixture\nimport _ \"net/http/httptest\"\n",
+		},
+		{
+			name:     "test infrastructure in testdata",
+			filename: "internal/example/testdata/fixture.go",
 			source:   "package fixture\nimport _ \"net/http/httptest\"\n",
 		},
 		{

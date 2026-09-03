@@ -32,16 +32,17 @@ type sourcePolicy struct {
 }
 
 var forbiddenProcessImports = map[string]string{
-	"C":                        "cgo is forbidden until an exact validated native boundary is introduced",
-	"go/build":                 "go/build is forbidden because it can launch the Go tool outside the validated runner adapter",
-	"go/importer":              "go/importer is forbidden because its default importer can launch the Go tool outside the validated runner adapter",
-	"net/http/cgi":             "net/http/cgi is forbidden because it launches executables outside the validated runner adapter",
-	"os/exec":                  "os/exec is forbidden until an exact validated adapter boundary is introduced",
-	"plugin":                   "dynamic Go plugins are forbidden until an exact validated loading boundary is introduced",
-	"syscall":                  "low-level process packages are forbidden; use the validated runner adapter",
-	"golang.org/x/sys/execabs": "low-level process packages are forbidden; use the validated runner adapter",
-	"golang.org/x/sys/unix":    "low-level process packages are forbidden; use the validated runner adapter",
-	"golang.org/x/sys/windows": "low-level process packages are forbidden; use the validated runner adapter",
+	"C":                              "cgo is forbidden until an exact validated native boundary is introduced",
+	"go/build":                       "go/build is forbidden because it can launch the Go tool outside the validated runner adapter",
+	"go/importer":                    "go/importer is forbidden because its default importer can launch the Go tool outside the validated runner adapter",
+	"golang.org/x/tools/go/packages": "go/packages is forbidden because its default driver can launch the Go tool outside the validated runner adapter",
+	"net/http/cgi":                   "net/http/cgi is forbidden because it launches executables outside the validated runner adapter",
+	"os/exec":                        "os/exec is forbidden until an exact validated adapter boundary is introduced",
+	"plugin":                         "dynamic Go plugins are forbidden until an exact validated loading boundary is introduced",
+	"syscall":                        "low-level process packages are forbidden; use the validated runner adapter",
+	"golang.org/x/sys/execabs":       "low-level process packages are forbidden; use the validated runner adapter",
+	"golang.org/x/sys/unix":          "low-level process packages are forbidden; use the validated runner adapter",
+	"golang.org/x/sys/windows":       "low-level process packages are forbidden; use the validated runner adapter",
 }
 
 func main() {
@@ -247,7 +248,7 @@ func policyForSource(relativePath string) sourcePolicy {
 
 	for _, directory := range strings.Split(filepath.ToSlash(filepath.Dir(relativePath)), "/") {
 		switch directory {
-		case "test", "tests", "testutil", "testutils", "fake", "fakes", "mock", "mocks", "gomock":
+		case "test", "tests", "testdata", "testutil", "testutils", "fake", "fakes", "mock", "mocks", "gomock":
 			policy.allowTestInfrastructure = true
 			return policy
 		}
@@ -277,7 +278,7 @@ func isTestInfrastructureImport(importPath string) bool {
 	}
 	for _, component := range strings.Split(importPath, "/") {
 		switch component {
-		case "test", "tests", "testing", "httptest", "testutil", "testutils", "fake", "fakes", "mock", "mocks", "gomock":
+		case "test", "tests", "testdata", "testing", "httptest", "testutil", "testutils", "fake", "fakes", "mock", "mocks", "gomock":
 			return true
 		}
 	}
@@ -289,7 +290,8 @@ func forbiddenProcessImportMessage(importPath string) (string, bool) {
 		return message, true
 	}
 	if strings.HasPrefix(importPath, "golang.org/x/sys/unix/") ||
-		strings.HasPrefix(importPath, "golang.org/x/sys/windows/") {
+		strings.HasPrefix(importPath, "golang.org/x/sys/windows/") ||
+		strings.HasPrefix(importPath, "golang.org/x/tools/go/packages/") {
 		return "low-level process packages are forbidden; use the validated runner adapter", true
 	}
 	return "", false

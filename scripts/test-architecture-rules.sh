@@ -13,13 +13,19 @@ generated_fixture_dir="$repo_root/generated"
 generated_fixture="$generated_fixture_dir/architecture_rule_fixture.go"
 test_helper_fixture_dir="$architecture_fixture_dir/testutil"
 test_helper_fixture="$test_helper_fixture_dir/fixture.go"
+testdata_fixture_dir="$architecture_fixture_dir/testdata"
+testdata_fixture="$testdata_fixture_dir/fixture.go"
 qlty_bin="${QLTY_BIN:-qlty}"
 architecture_fixture_dir_created=false
 generated_fixture_dir_created=false
 test_helper_fixture_dir_created=false
+testdata_fixture_dir_created=false
 
 cleanup() {
-  rm -f "$architecture_fixture" "$generated_fixture" "$test_helper_fixture"
+  rm -f "$architecture_fixture" "$generated_fixture" "$test_helper_fixture" "$testdata_fixture"
+  if [[ $testdata_fixture_dir_created == true ]]; then
+    rmdir "$testdata_fixture_dir" 2>/dev/null || true
+  fi
   if [[ $test_helper_fixture_dir_created == true ]]; then
     rmdir "$test_helper_fixture_dir" 2>/dev/null || true
   fi
@@ -80,7 +86,7 @@ assert_rejected() {
   echo "verified $expected_rule rejects $(basename "$source_file")"
 }
 
-for target_file in "$architecture_fixture" "$generated_fixture" "$test_helper_fixture"; do
+for target_file in "$architecture_fixture" "$generated_fixture" "$test_helper_fixture" "$testdata_fixture"; do
   if [[ -e $target_file ]]; then
     echo "refusing to overwrite existing architecture rule fixture: $target_file" >&2
     exit 1
@@ -101,10 +107,15 @@ if [[ ! -d $test_helper_fixture_dir ]]; then
   mkdir "$test_helper_fixture_dir"
   test_helper_fixture_dir_created=true
 fi
+if [[ ! -d $testdata_fixture_dir ]]; then
+  mkdir "$testdata_fixture_dir"
+  testdata_fixture_dir_created=true
+fi
 
 assert_accepted "$fixture_source_dir/allowed.go.txt" "$architecture_fixture"
 assert_accepted "$fixture_source_dir/test-infrastructure-import.go.txt" "$test_helper_fixture"
 assert_accepted "$fixture_source_dir/testify-import.go.txt" "$test_helper_fixture"
+assert_accepted "$fixture_source_dir/test-infrastructure-import.go.txt" "$testdata_fixture"
 
 assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
 assert_rejected "$fixture_source_dir/raw-bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
@@ -121,6 +132,8 @@ assert_rejected "$fixture_source_dir/mock-import.go.txt" "$architecture_fixture"
 assert_rejected "$fixture_source_dir/raw-mock-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/testify-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/raw-testify-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/testdata-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-testdata-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/escaped-os-exec-import.go.txt" "$architecture_fixture" no-escaped-import-paths
 assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$generated_fixture" bubble-tea-import-boundary
 assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$generated_fixture" no-production-test-imports

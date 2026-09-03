@@ -59,6 +59,11 @@ func TestFindArchitectureViolations(t *testing.T) {
 			want:   1,
 		},
 		{
+			name:   "go importer import",
+			source: "package fixture\nimport _ \"go/importer\"\n",
+			want:   1,
+		},
+		{
 			name:   "plugin import",
 			source: "package fixture\nimport _ \"plugin\"\n",
 			want:   1,
@@ -165,6 +170,21 @@ func useLocalProcessAPI() {
 		{
 			name:   "mock infrastructure in production",
 			source: "package fixture\nimport _ \"github.com/stretchr/testify/mock\"\n",
+			want:   1,
+		},
+		{
+			name:   "testify assert in production",
+			source: "package fixture\nimport _ \"github.com/stretchr/testify/assert\"\n",
+			want:   1,
+		},
+		{
+			name:   "testify require in production",
+			source: "package fixture\nimport _ \"github.com/stretchr/testify/require\"\n",
+			want:   1,
+		},
+		{
+			name:   "testify suite in production",
+			source: "package fixture\nimport _ \"github.com/stretchr/testify/suite\"\n",
 			want:   1,
 		},
 		{

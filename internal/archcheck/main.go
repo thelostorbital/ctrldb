@@ -34,6 +34,7 @@ type sourcePolicy struct {
 var forbiddenProcessImports = map[string]string{
 	"C":                        "cgo is forbidden until an exact validated native boundary is introduced",
 	"go/build":                 "go/build is forbidden because it can launch the Go tool outside the validated runner adapter",
+	"go/importer":              "go/importer is forbidden because its default importer can launch the Go tool outside the validated runner adapter",
 	"net/http/cgi":             "net/http/cgi is forbidden because it launches executables outside the validated runner adapter",
 	"os/exec":                  "os/exec is forbidden until an exact validated adapter boundary is introduced",
 	"plugin":                   "dynamic Go plugins are forbidden until an exact validated loading boundary is introduced",
@@ -271,6 +272,9 @@ func isBubbleTeaImport(importPath string) bool {
 }
 
 func isTestInfrastructureImport(importPath string) bool {
+	if importPath == "github.com/stretchr/testify" || strings.HasPrefix(importPath, "github.com/stretchr/testify/") {
+		return true
+	}
 	for _, component := range strings.Split(importPath, "/") {
 		switch component {
 		case "test", "tests", "testing", "httptest", "testutil", "testutils", "fake", "fakes", "mock", "mocks", "gomock":

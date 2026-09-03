@@ -104,6 +104,7 @@ fi
 
 assert_accepted "$fixture_source_dir/allowed.go.txt" "$architecture_fixture"
 assert_accepted "$fixture_source_dir/test-infrastructure-import.go.txt" "$test_helper_fixture"
+assert_accepted "$fixture_source_dir/testify-import.go.txt" "$test_helper_fixture"
 
 assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
 assert_rejected "$fixture_source_dir/raw-bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
@@ -118,6 +119,8 @@ assert_rejected "$fixture_source_dir/httptest-import.go.txt" "$architecture_fixt
 assert_rejected "$fixture_source_dir/raw-httptest-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/mock-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/raw-mock-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/testify-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-testify-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/escaped-os-exec-import.go.txt" "$architecture_fixture" no-escaped-import-paths
 assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$generated_fixture" bubble-tea-import-boundary
 assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$generated_fixture" no-production-test-imports

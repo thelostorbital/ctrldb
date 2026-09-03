@@ -1,0 +1,21 @@
+package fixture
+
+type syscallController struct{}
+type unixController struct{}
+type windowsController struct{}
+
+func (syscallController) Exec()          {}
+func (syscallController) ForkExec()      {}
+func (syscallController) StartProcess()  {}
+func (unixController) Exec()             {}
+func (unixController) ForkExec()         {}
+func (windowsController) CreateProcess() {}
+
+func allowedLowLevelNames(syscall syscallController, unix unixController, windows windowsController) {
+	syscall.Exec()
+	syscall.ForkExec()
+	syscall.StartProcess()
+	unix.Exec()
+	unix.ForkExec()
+	windows.CreateProcess()
+}

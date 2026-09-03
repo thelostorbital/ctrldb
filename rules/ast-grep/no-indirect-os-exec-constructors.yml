@@ -1,0 +1,27 @@
+id: no-indirect-os-exec-constructors
+language: Go
+severity: warning
+message: Do not store os/exec constructors in function values; call the reviewed API directly.
+files:
+  - "**/*.go"
+rule:
+  all:
+    - any:
+        - pattern:
+            context: var _ = exec.Command
+            selector: selector_expression
+        - pattern:
+            context: var _ = exec.CommandContext
+            selector: selector_expression
+    - not:
+        inside:
+          kind: call_expression
+          stopBy: end
+    - inside:
+        kind: source_file
+        stopBy: end
+        has:
+          pattern:
+            context: import "os/exec"
+            selector: import_spec
+          stopBy: end

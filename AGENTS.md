@@ -42,6 +42,9 @@ spend review findings on formatting or lint issues already enforced by CI.
 - External processes must be invoked with structured arguments, bounded
   execution, checked exit status, and sanitized output. Never construct shell
   commands by interpolating resource names, user input, or provider output.
+  In the approved adapter packages, import `os/exec` without an alias, call its
+  constructors directly rather than storing them in function values, and keep
+  executable selection visible to the validated runner boundary.
 - Database access must be least-privilege and deny-by-default. Flag any public
   exposure that is not explicit, narrowly scoped, authenticated, encrypted,
   audited, time-bounded, and reliably revocable. Broad CIDRs or indefinite

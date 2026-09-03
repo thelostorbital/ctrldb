@@ -57,21 +57,3 @@ rule:
             context: var _ = $PKG.StartProcess
             selector: selector_expression
         - inside: *raw-aliased-os-import
-    - pattern:
-        context: func f() { syscall.StartProcess($$$ARGS) }
-        selector: call_expression
-    - pattern:
-        context: func f() { syscall.Exec($$$ARGS) }
-        selector: call_expression
-    - pattern:
-        context: func f() { syscall.ForkExec($$$ARGS) }
-        selector: call_expression
-    - pattern:
-        context: func f() { unix.Exec($$$ARGS) }
-        selector: call_expression
-    - pattern:
-        context: func f() { unix.ForkExec($$$ARGS) }
-        selector: call_expression
-    - pattern:
-        context: func f() { windows.CreateProcess($$$ARGS) }
-        selector: call_expression

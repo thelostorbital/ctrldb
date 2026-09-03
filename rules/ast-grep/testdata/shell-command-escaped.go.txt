@@ -1,0 +1,5 @@
+package gcp
+
+import "os/exec"
+
+var _ = exec.Command("\x73h", "-c", "echo unsafe")

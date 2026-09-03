@@ -20,30 +20,6 @@ rule:
               stopBy: end
     - all:
         - pattern:
-            context: func f() { $PKG.Command($SHELL, $$$ARGS) }
-            selector: call_expression
-        - inside:
-            kind: source_file
-            stopBy: end
-            has:
-              pattern:
-                context: import $PKG "os/exec"
-                selector: import_spec
-              stopBy: end
-    - all:
-        - pattern:
-            context: func f() { $PKG.Command($SHELL, $$$ARGS) }
-            selector: call_expression
-        - inside:
-            kind: source_file
-            stopBy: end
-            has:
-              pattern:
-                context: import $PKG `os/exec`
-                selector: import_spec
-              stopBy: end
-    - all:
-        - pattern:
             context: func f() { exec.CommandContext($CTX, $SHELL, $$$ARGS) }
             selector: call_expression
         - inside:
@@ -52,30 +28,6 @@ rule:
             has:
               pattern:
                 context: import "os/exec"
-                selector: import_spec
-              stopBy: end
-    - all:
-        - pattern:
-            context: func f() { $PKG.CommandContext($CTX, $SHELL, $$$ARGS) }
-            selector: call_expression
-        - inside:
-            kind: source_file
-            stopBy: end
-            has:
-              pattern:
-                context: import $PKG "os/exec"
-                selector: import_spec
-              stopBy: end
-    - all:
-        - pattern:
-            context: func f() { $PKG.CommandContext($CTX, $SHELL, $$$ARGS) }
-            selector: call_expression
-        - inside:
-            kind: source_file
-            stopBy: end
-            has:
-              pattern:
-                context: import $PKG `os/exec`
                 selector: import_spec
               stopBy: end
     - all:
@@ -95,40 +47,6 @@ rule:
                 context: import "os/exec"
                 selector: import_spec
               stopBy: end
-    - all:
-        - pattern:
-            context: var _ = $PKG.Cmd{$$$FIELDS}
-            selector: composite_literal
-        - has:
-            pattern:
-              context: 'var _ = T{Path: $SHELL}'
-              selector: keyed_element
-            stopBy: end
-        - inside:
-            kind: source_file
-            stopBy: end
-            has:
-              pattern:
-                context: import $PKG "os/exec"
-                selector: import_spec
-              stopBy: end
-    - all:
-        - pattern:
-            context: var _ = $PKG.Cmd{$$$FIELDS}
-            selector: composite_literal
-        - has:
-            pattern:
-              context: 'var _ = T{Path: $SHELL}'
-              selector: keyed_element
-            stopBy: end
-        - inside:
-            kind: source_file
-            stopBy: end
-            has:
-              pattern:
-                context: import $PKG `os/exec`
-                selector: import_spec
-              stopBy: end
 constraints:
   SHELL:
-    regex: '(?i)^["`]([^"`/\\]*[/\\])*(bash|cmd|cmd\.exe|csh|dash|env|fish|ksh|powershell|powershell\.exe|pwsh|sh|tcsh|zsh)["`]$'
+    regex: '(?i)(^["`]([^"`/\\]*[/\\])*(bash|cmd|cmd\.exe|csh|dash|env|fish|ksh|powershell|powershell\.exe|pwsh|sh|tcsh|zsh)["`]$|^".*\\.*"$)'

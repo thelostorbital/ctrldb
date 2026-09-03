@@ -2,7 +2,9 @@ package gcp
 
 import "os/exec"
 
-func unsafeVariableCommand() {
+type commandRunner struct{}
+
+func (commandRunner) unsafeVariableCommand() {
 	shell := "sh"
 	_ = exec.Command(shell, "-c", "echo unsafe")
 }

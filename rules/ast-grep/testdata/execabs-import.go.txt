@@ -1,0 +1,5 @@
+package fixture
+
+import "golang.org/x/sys/execabs"
+
+var _ = execabs.Command

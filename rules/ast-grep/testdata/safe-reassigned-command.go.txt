@@ -1,9 +1,0 @@
-package gcp
-
-import "os/exec"
-
-func safeReassignedCommand() {
-	executable := "sh"
-	executable = "gcloud"
-	_ = exec.Command(executable, "version")
-}

@@ -1,0 +1,12 @@
+id: no-escaped-import-paths
+language: Go
+severity: warning
+message: Go import paths must use their literal spelling; escape sequences are forbidden.
+files:
+  - "**/*.go"
+rule:
+  all:
+    - kind: interpreted_string_literal
+    - regex: '^"[^"\\]*\\[^"\\]*"$'
+    - inside:
+        kind: import_spec

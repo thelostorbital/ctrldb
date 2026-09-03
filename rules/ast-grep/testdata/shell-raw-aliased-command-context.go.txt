@@ -1,8 +1,0 @@
-package gcp
-
-import (
-	"context"
-	process `os/exec`
-)
-
-var _ = process.CommandContext(context.Background(), "tcsh", "-c", "echo unsafe")

@@ -1,5 +1,0 @@
-package fixture
-
-import "golang.org/x/sys/windows"
-
-var _ = windows.CreateProcess(nil, nil, nil, nil, false, 0, nil, nil, nil, nil)

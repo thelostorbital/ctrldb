@@ -1,8 +1,0 @@
-package gcp
-
-import "os/exec"
-
-func unsafeEscapedVariableCommand() {
-	shell := "\x73h"
-	_ = exec.Command(shell, "-c", "echo unsafe")
-}

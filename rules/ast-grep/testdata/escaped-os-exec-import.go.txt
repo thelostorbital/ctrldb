@@ -1,0 +1,5 @@
+package fixture
+
+import "o\x73/exec"
+
+var _ = exec.ErrWaitDelay

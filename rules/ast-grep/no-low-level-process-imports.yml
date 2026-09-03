@@ -8,11 +8,11 @@ rule:
   any:
     - all:
         - kind: interpreted_string_literal
-        - regex: ^"(syscall|golang\.org/x/sys/(unix|windows))"$
+        - regex: ^"(syscall|golang\.org/x/sys/(execabs|unix|windows))"$
         - inside:
             kind: import_spec
     - all:
         - kind: raw_string_literal
-        - regex: ^`(syscall|golang\.org/x/sys/(unix|windows))`$
+        - regex: ^`(syscall|golang\.org/x/sys/(execabs|unix|windows))`$
         - inside:
             kind: import_spec

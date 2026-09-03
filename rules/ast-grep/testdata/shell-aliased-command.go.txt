@@ -1,5 +1,0 @@
-package gcp
-
-import process "os/exec"
-
-var _ = process.Command("ksh", "-c", "echo unsafe")

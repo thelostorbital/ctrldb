@@ -1,5 +1,0 @@
-package gcp
-
-import "os/exec"
-
-var _ = &exec.Cmd{Path: "/usr/bin/env"}

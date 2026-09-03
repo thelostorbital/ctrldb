@@ -1,5 +1,0 @@
-package fixture
-
-import "golang.org/x/sys/unix"
-
-var _, _ = unix.ForkExec("tool", nil, nil)

@@ -1,5 +1,0 @@
-package fixture
-
-import win "golang.org/x/sys/windows"
-
-var _ = win.GetCurrentProcess

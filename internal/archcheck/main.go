@@ -16,12 +16,22 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 )
 
 type finding struct {
 	filename string
 	line     int
 	column   int
+	message  string
+}
+
+var forbiddenProcessImports = map[string]string{
+	"os/exec":                  "os/exec is forbidden until an exact validated adapter boundary is introduced",
+	"syscall":                  "low-level process packages are forbidden; use the validated runner adapter",
+	"golang.org/x/sys/execabs": "low-level process packages are forbidden; use the validated runner adapter",
+	"golang.org/x/sys/unix":    "low-level process packages are forbidden; use the validated runner adapter",
+	"golang.org/x/sys/windows": "low-level process packages are forbidden; use the validated runner adapter",
 }
 
 func main() {
@@ -32,13 +42,7 @@ func main() {
 	}
 
 	for _, result := range findings {
-		fmt.Fprintf(
-			os.Stderr,
-			"%s:%d:%d: os.StartProcess is forbidden; process creation belongs to the validated adapter boundary\n",
-			result.filename,
-			result.line,
-			result.column,
-		)
+		fmt.Fprintf(os.Stderr, "%s:%d:%d: %s\n", result.filename, result.line, result.column, result.message)
 	}
 	if len(findings) != 0 {
 		os.Exit(1)
@@ -53,7 +57,7 @@ func scan(root string) ([]finding, error) {
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
-			case ".git", "testdata", "vendor":
+			case ".git", "vendor":
 				if path != root {
 					return filepath.SkipDir
 				}
@@ -68,7 +72,7 @@ func scan(root string) ([]finding, error) {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
-		fileFindings, err := findForbiddenStartProcess(path, contents)
+		fileFindings, err := findProcessBoundaryViolations(path, contents)
 		if err != nil {
 			return err
 		}
@@ -91,11 +95,30 @@ func scan(root string) ([]finding, error) {
 	return findings, nil
 }
 
-func findForbiddenStartProcess(filename string, contents []byte) ([]finding, error) {
+func findProcessBoundaryViolations(filename string, contents []byte) ([]finding, error) {
 	files := token.NewFileSet()
 	parsed, err := parser.ParseFile(files, filename, contents, parser.SkipObjectResolution)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", filename, err)
+	}
+
+	var findings []finding
+	for _, imported := range parsed.Imports {
+		importPath, err := strconv.Unquote(imported.Path.Value)
+		if err != nil {
+			return nil, fmt.Errorf("decode import in %s: %w", filename, err)
+		}
+		message, forbidden := forbiddenProcessImports[importPath]
+		if !forbidden {
+			continue
+		}
+		position := files.Position(imported.Path.Pos())
+		findings = append(findings, finding{
+			filename: position.Filename,
+			line:     position.Line,
+			column:   position.Column,
+			message:  message,
+		})
 	}
 
 	uses := make(map[*ast.Ident]types.Object)
@@ -106,7 +129,6 @@ func findForbiddenStartProcess(filename string, contents []byte) ([]finding, err
 	}
 	_, _ = configuration.Check(parsed.Name.Name, files, []*ast.File{parsed}, &types.Info{Uses: uses})
 
-	var findings []finding
 	ast.Inspect(parsed, func(node ast.Node) bool {
 		identifier, ok := node.(*ast.Ident)
 		if !ok {
@@ -121,6 +143,7 @@ func findForbiddenStartProcess(filename string, contents []byte) ([]finding, err
 			filename: position.Filename,
 			line:     position.Line,
 			column:   position.Column,
+			message:  "os.StartProcess is forbidden; process creation belongs to the validated adapter boundary",
 		})
 		return true
 	})

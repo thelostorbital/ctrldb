@@ -4,9 +4,6 @@ config_version = "0"
 # content so application, configuration, test, and documentation files remain
 # visible to every applicable check.
 exclude_patterns = [
-  "**/build/**",
-  "**/dist/**",
-  "**/generated/**",
   "**/node_modules/**",
   "**/vendor/**",
 ]

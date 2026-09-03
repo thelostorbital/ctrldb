@@ -142,4 +142,14 @@ func TestScanIncludesImportableSpecialDirectories(t *testing.T) {
 	if len(findings) != len(files) {
 		t.Fatalf("got %d findings, want %d", len(findings), len(files))
 	}
+	foundByPath := make(map[string]int, len(findings))
+	for _, result := range findings {
+		foundByPath[result.filename]++
+	}
+	for name := range files {
+		path := filepath.Join(root, name)
+		if foundByPath[path] != 1 {
+			t.Errorf("got %d findings for %s, want 1", foundByPath[path], name)
+		}
+	}
 }

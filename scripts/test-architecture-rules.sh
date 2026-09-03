@@ -9,19 +9,25 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture_source_dir="$repo_root/rules/ast-grep/testdata"
 architecture_fixture_dir="$repo_root/internal/architecture_rule_fixture"
 architecture_fixture="$architecture_fixture_dir/fixture.go"
+generated_fixture_dir="$repo_root/generated"
+generated_fixture="$generated_fixture_dir/architecture_rule_fixture.go"
 test_helper_fixture_dir="$architecture_fixture_dir/testutil"
 test_helper_fixture="$test_helper_fixture_dir/fixture.go"
 qlty_bin="${QLTY_BIN:-qlty}"
 architecture_fixture_dir_created=false
+generated_fixture_dir_created=false
 test_helper_fixture_dir_created=false
 
 cleanup() {
-  rm -f "$architecture_fixture" "$test_helper_fixture"
+  rm -f "$architecture_fixture" "$generated_fixture" "$test_helper_fixture"
   if [[ $test_helper_fixture_dir_created == true ]]; then
     rmdir "$test_helper_fixture_dir" 2>/dev/null || true
   fi
   if [[ $architecture_fixture_dir_created == true ]]; then
     rmdir "$architecture_fixture_dir" 2>/dev/null || true
+  fi
+  if [[ $generated_fixture_dir_created == true ]]; then
+    rmdir "$generated_fixture_dir" 2>/dev/null || true
   fi
 }
 
@@ -74,7 +80,7 @@ assert_rejected() {
   echo "verified $expected_rule rejects $(basename "$source_file")"
 }
 
-for target_file in "$architecture_fixture" "$test_helper_fixture"; do
+for target_file in "$architecture_fixture" "$generated_fixture" "$test_helper_fixture"; do
   if [[ -e $target_file ]]; then
     echo "refusing to overwrite existing architecture rule fixture: $target_file" >&2
     exit 1
@@ -86,6 +92,10 @@ trap cleanup EXIT
 if [[ ! -d $architecture_fixture_dir ]]; then
   mkdir "$architecture_fixture_dir"
   architecture_fixture_dir_created=true
+fi
+if [[ ! -d $generated_fixture_dir ]]; then
+  mkdir "$generated_fixture_dir"
+  generated_fixture_dir_created=true
 fi
 if [[ ! -d $test_helper_fixture_dir ]]; then
   mkdir "$test_helper_fixture_dir"
@@ -102,6 +112,11 @@ assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$archit
 assert_rejected "$fixture_source_dir/raw-test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/bare-test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/raw-bare-test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/testing-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-testing-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/escaped-os-exec-import.go.txt" "$architecture_fixture" no-escaped-import-paths
+assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$generated_fixture" bubble-tea-import-boundary
+assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$generated_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/escaped-os-exec-import.go.txt" "$generated_fixture" no-escaped-import-paths
 
 echo "all architecture rule acceptance and rejection cases passed"

@@ -1,0 +1,5 @@
+package fixture
+
+import "syscall"
+
+var _, _ = syscall.StartProcess("tool", nil, nil)

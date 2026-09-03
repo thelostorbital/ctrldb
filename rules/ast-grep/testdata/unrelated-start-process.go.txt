@@ -1,0 +1,9 @@
+package fixture
+
+type operationController struct{}
+
+func (operationController) StartProcess() {}
+
+func allowed(controller operationController) {
+	controller.StartProcess()
+}

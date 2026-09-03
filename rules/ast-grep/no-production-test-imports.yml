@@ -3,13 +3,18 @@ language: Go
 severity: warning
 message: Production code must not import test-only or fake infrastructure.
 files:
-  - cmd/**/*.go
-  - internal/**/*.go
+  - "**/*.go"
 ignores:
   - "**/*_test.go"
 rule:
-  all:
-    - kind: interpreted_string_literal
-    - regex: ^"[^"]*/(test|tests|testutil|testutils|fake|fakes)(/[^"]*)?"$
-    - inside:
-        kind: import_spec
+  any:
+    - all:
+        - kind: interpreted_string_literal
+        - regex: ^"[^"]*/(test|tests|testutil|testutils|fake|fakes)(/[^"]*)?"$
+        - inside:
+            kind: import_spec
+    - all:
+        - kind: raw_string_literal
+        - regex: ^`[^`]*/(test|tests|testutil|testutils|fake|fakes)(/[^`]*)?`$
+        - inside:
+            kind: import_spec

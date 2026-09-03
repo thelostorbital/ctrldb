@@ -3,8 +3,7 @@ language: Go
 severity: warning
 message: Shell processes are forbidden; invoke programs with structured arguments.
 files:
-  - cmd/**/*.go
-  - internal/**/*.go
+  - "**/*.go"
 rule:
   any:
     - pattern:
@@ -13,6 +12,15 @@ rule:
     - pattern:
         context: func f() { $PKG.CommandContext($CTX, $SHELL, $$$ARGS) }
         selector: call_expression
+    - all:
+        - pattern:
+            context: var _ = $PKG.Cmd{$$$FIELDS}
+            selector: composite_literal
+        - has:
+            pattern:
+              context: 'var _ = T{Path: $SHELL}'
+              selector: keyed_element
+            stopBy: end
 constraints:
   SHELL:
     regex: '(?i)^["`]([^"`/\\]*[/\\])*(bash|cmd|cmd\.exe|csh|dash|env|fish|ksh|powershell|powershell\.exe|pwsh|sh|tcsh|zsh)["`]$'

@@ -11,12 +11,13 @@ architecture_fixture_dir="$repo_root/internal/architecture_rule_fixture"
 architecture_fixture="$architecture_fixture_dir/fixture.go"
 adapter_fixture_dir="$repo_root/internal/gcp"
 adapter_fixture="$adapter_fixture_dir/architecture_rule_fixture.go"
+root_fixture="$repo_root/architecture_rule_fixture.go"
 qlty_bin="${QLTY_BIN:-qlty}"
 architecture_fixture_dir_created=false
 adapter_fixture_dir_created=false
 
 cleanup() {
-  rm -f "$architecture_fixture" "$adapter_fixture"
+  rm -f "$architecture_fixture" "$adapter_fixture" "$root_fixture"
   if [[ $architecture_fixture_dir_created == true ]]; then
     rmdir "$architecture_fixture_dir" 2>/dev/null || true
   fi
@@ -74,7 +75,7 @@ assert_rejected() {
   echo "verified $expected_rule rejects $(basename "$source_file")"
 }
 
-for target_file in "$architecture_fixture" "$adapter_fixture"; do
+for target_file in "$architecture_fixture" "$adapter_fixture" "$root_fixture"; do
   if [[ -e $target_file ]]; then
     echo "refusing to overwrite existing architecture rule fixture: $target_file" >&2
     exit 1
@@ -93,17 +94,26 @@ if [[ ! -d $adapter_fixture_dir ]]; then
 fi
 
 assert_accepted "$fixture_source_dir/allowed.go.txt" "$architecture_fixture"
+assert_accepted "$fixture_source_dir/unrelated-start-process.go.txt" "$architecture_fixture"
 
 assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
+assert_rejected "$fixture_source_dir/raw-bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
 assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/os-exec-import.go.txt" "$architecture_fixture" os-exec-import-boundary
+assert_rejected "$fixture_source_dir/raw-os-exec-import.go.txt" "$architecture_fixture" os-exec-import-boundary
+assert_rejected "$fixture_source_dir/os-exec-import.go.txt" "$root_fixture" os-exec-import-boundary
 
 assert_rejected "$fixture_source_dir/shell-command-short.go.txt" "$adapter_fixture" no-shell-launchers
 assert_rejected "$fixture_source_dir/shell-command-absolute-raw.go.txt" "$adapter_fixture" no-shell-launchers
 assert_rejected "$fixture_source_dir/shell-command-windows.go.txt" "$adapter_fixture" no-shell-launchers
 assert_rejected "$fixture_source_dir/shell-command-context.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-cmd-literal.go.txt" "$adapter_fixture" no-shell-launchers
 
 assert_rejected "$fixture_source_dir/os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/aliased-os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/raw-aliased-os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/syscall-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
 assert_rejected "$fixture_source_dir/syscall-exec.go.txt" "$architecture_fixture" no-raw-process-apis
 assert_rejected "$fixture_source_dir/syscall-fork-exec.go.txt" "$architecture_fixture" no-raw-process-apis
 assert_rejected "$fixture_source_dir/unix-exec.go.txt" "$architecture_fixture" no-raw-process-apis
@@ -111,6 +121,7 @@ assert_rejected "$fixture_source_dir/unix-fork-exec.go.txt" "$architecture_fixtu
 assert_rejected "$fixture_source_dir/windows-create-process.go.txt" "$architecture_fixture" no-raw-process-apis
 
 assert_rejected "$fixture_source_dir/aliased-syscall-import.go.txt" "$architecture_fixture" no-low-level-process-imports
+assert_rejected "$fixture_source_dir/raw-aliased-syscall-import.go.txt" "$architecture_fixture" no-low-level-process-imports
 assert_rejected "$fixture_source_dir/aliased-unix-import.go.txt" "$architecture_fixture" no-low-level-process-imports
 assert_rejected "$fixture_source_dir/aliased-windows-import.go.txt" "$architecture_fixture" no-low-level-process-imports
 

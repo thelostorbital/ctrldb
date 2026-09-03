@@ -1,0 +1,5 @@
+package gcp
+
+import process "os/exec"
+
+var _ = &process.Cmd{Dir: "/tmp", Path: `/usr/bin/sh`}

@@ -3,12 +3,38 @@ language: Go
 severity: warning
 message: Low-level process APIs are forbidden; use the validated runner adapter.
 files:
-  - cmd/**/*.go
-  - internal/**/*.go
+  - "**/*.go"
 rule:
   any:
     - pattern:
-        context: func f() { $PKG.StartProcess($$$ARGS) }
+        context: func f() { os.StartProcess($$$ARGS) }
+        selector: call_expression
+    - all:
+        - pattern:
+            context: func f() { $PKG.StartProcess($$$ARGS) }
+            selector: call_expression
+        - inside:
+            kind: source_file
+            stopBy: end
+            has:
+              pattern:
+                context: import $PKG "os"
+                selector: import_spec
+              stopBy: end
+    - all:
+        - pattern:
+            context: func f() { $PKG.StartProcess($$$ARGS) }
+            selector: call_expression
+        - inside:
+            kind: source_file
+            stopBy: end
+            has:
+              pattern:
+                context: import $PKG `os`
+                selector: import_spec
+              stopBy: end
+    - pattern:
+        context: func f() { syscall.StartProcess($$$ARGS) }
         selector: call_expression
     - pattern:
         context: func f() { syscall.Exec($$$ARGS) }

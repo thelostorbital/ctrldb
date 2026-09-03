@@ -1,0 +1,5 @@
+package fixture
+
+import stdos `os`
+
+var _, _ = stdos.StartProcess("tool", nil, nil)

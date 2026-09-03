@@ -15,4 +15,4 @@ rule:
         selector: call_expression
 constraints:
   SHELL:
-    regex: '(?i)^"([^"/\\]*[/\\])*(bash|cmd|cmd\.exe|csh|dash|env|fish|ksh|powershell|powershell\.exe|pwsh|sh|tcsh|zsh)"$'
+    regex: '(?i)^["`]([^"`/\\]*[/\\])*(bash|cmd|cmd\.exe|csh|dash|env|fish|ksh|powershell|powershell\.exe|pwsh|sh|tcsh|zsh)["`]$'

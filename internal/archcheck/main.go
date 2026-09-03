@@ -34,6 +34,7 @@ type sourcePolicy struct {
 
 var forbiddenProcessImports = map[string]string{
 	"C":                        "cgo is forbidden until an exact validated native boundary is introduced",
+	"go/build":                 "go/build is forbidden because it can launch the Go tool outside the validated runner adapter",
 	"net/http/cgi":             "net/http/cgi is forbidden because it launches executables outside the validated runner adapter",
 	"os/exec":                  "os/exec is forbidden until an exact validated adapter boundary is introduced",
 	"syscall":                  "low-level process packages are forbidden; use the validated runner adapter",
@@ -73,20 +74,25 @@ func scan(root string) ([]finding, error) {
 			return nil
 		}
 		extension := filepath.Ext(path)
-		if extension == ".s" || extension == ".syso" {
-			message := "Go assembly is forbidden until an exact validated native boundary is introduced"
-			if extension == ".syso" {
-				message = "precompiled native object files are forbidden until an exact validated native boundary is introduced"
-			}
+		var nativeArtifactMessage string
+		switch extension {
+		case ".s":
+			nativeArtifactMessage = "Go assembly is forbidden until an exact validated native boundary is introduced"
+		case ".syso":
+			nativeArtifactMessage = "precompiled native object files are forbidden until an exact validated native boundary is introduced"
+		case ".swig", ".swigcxx":
+			nativeArtifactMessage = "SWIG inputs are forbidden until an exact validated native boundary is introduced"
+		case ".go":
+		default:
+			return nil
+		}
+		if nativeArtifactMessage != "" {
 			findings = append(findings, finding{
 				filename: path,
 				line:     1,
 				column:   1,
-				message:  message,
+				message:  nativeArtifactMessage,
 			})
-			return nil
-		}
-		if extension != ".go" {
 			return nil
 		}
 
@@ -131,8 +137,8 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 	var findings []finding
 	for _, group := range parsed.Comments {
 		for _, comment := range group.List {
-			linknameArguments, isLinkname := strings.CutPrefix(comment.Text, "//go:linkname")
-			if !isLinkname || (linknameArguments != "" && linknameArguments[0] != ' ' && linknameArguments[0] != '\t') {
+			message, forbidden := forbiddenCompilerDirective(comment.Text)
+			if !forbidden {
 				continue
 			}
 			position := files.Position(comment.Pos())
@@ -140,7 +146,7 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 				filename: position.Filename,
 				line:     position.Line,
 				column:   position.Column,
-				message:  "go:linkname is forbidden; it can bypass validated package boundaries",
+				message:  message,
 			})
 		}
 	}
@@ -262,6 +268,17 @@ func forbiddenProcessImportMessage(importPath string) (string, bool) {
 	if strings.HasPrefix(importPath, "golang.org/x/sys/unix/") ||
 		strings.HasPrefix(importPath, "golang.org/x/sys/windows/") {
 		return "low-level process packages are forbidden; use the validated runner adapter", true
+	}
+	return "", false
+}
+
+func forbiddenCompilerDirective(comment string) (string, bool) {
+	linknameArguments, isLinkname := strings.CutPrefix(comment, "//go:linkname")
+	if isLinkname && (linknameArguments == "" || linknameArguments[0] == ' ' || linknameArguments[0] == '\t') {
+		return "go:linkname is forbidden; it can bypass validated package boundaries", true
+	}
+	if strings.HasPrefix(comment, "//go:cgo_") {
+		return "go:cgo compiler directives are forbidden; they can link native code outside the validated boundary", true
 	}
 	return "", false
 }

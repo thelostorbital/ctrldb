@@ -60,6 +60,7 @@ func TestTerminalOperationStates(t *testing.T) {
 		domain.OperationCompleteWithFailedVerification,
 		domain.OperationCompleteWithDocumentationError,
 		domain.OperationVerifiedRollback,
+		domain.OperationCancelled,
 		domain.OperationFailed,
 		domain.OperationFailedCleanup,
 	}

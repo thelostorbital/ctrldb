@@ -36,7 +36,7 @@ jobs:
           cache: false
 
       - name: Install Qlty
-        uses: qltysh/qlty-action/install@782ebe01413b63470fe8c3d481de77cef79e1486 # v2.1.0
+        uses: qltysh/qlty-action/install@08a0a862c159eae9b9003081da6663d96efef637 # v2.3.0
 
       - name: Verify module files are tidy
         run: go mod tidy -diff

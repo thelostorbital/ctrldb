@@ -10,11 +10,11 @@ rule:
   any:
     - all:
         - kind: interpreted_string_literal
-        - regex: ^"charm\.land/bubbletea/v2"$
+        - regex: ^"(charm\.land/bubbletea/v2|github\.com/charmbracelet/bubbletea(/v[0-9]+)?)"$
         - inside:
             kind: import_spec
     - all:
         - kind: raw_string_literal
-        - regex: ^`charm\.land/bubbletea/v2`$
+        - regex: ^`(charm\.land/bubbletea/v2|github\.com/charmbracelet/bubbletea(/v[0-9]+)?)`$
         - inside:
             kind: import_spec

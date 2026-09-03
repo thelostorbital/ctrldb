@@ -1,0 +1,10 @@
+package fixture
+
+type variableController struct{}
+
+func (variableController) Command(string) {}
+
+func allowedVariableCommand(controller variableController) {
+	shell := "sh"
+	controller.Command(shell)
+}

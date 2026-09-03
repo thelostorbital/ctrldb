@@ -1,0 +1,11 @@
+package gcp
+
+import (
+	"context"
+	process `os/exec`
+)
+
+func unsafeRawAliasedVariableCommandContext() {
+	shell := "tcsh"
+	_ = process.CommandContext(context.Background(), shell, "-c", "echo unsafe")
+}

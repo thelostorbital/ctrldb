@@ -1,0 +1,11 @@
+package gcp
+
+import (
+	"context"
+	"os/exec"
+)
+
+func unsafeVariableCommandContext() {
+	shell := "zsh"
+	_ = exec.CommandContext(context.Background(), shell, "-c", "echo unsafe")
+}

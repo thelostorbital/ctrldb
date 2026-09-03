@@ -1,0 +1,8 @@
+package gcp
+
+import process `os/exec`
+
+func unsafeRawAliasedVariableCommand() {
+	shell := "dash"
+	_ = process.Command(shell, "-c", "echo unsafe")
+}

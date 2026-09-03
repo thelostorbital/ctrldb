@@ -1,0 +1,8 @@
+package gcp
+
+import "os/exec"
+
+func unsafeVariableCommand() {
+	shell := "sh"
+	_ = exec.Command(shell, "-c", "echo unsafe")
+}

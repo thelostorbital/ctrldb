@@ -1,0 +1,75 @@
+id: no-shell-variable-launchers
+language: Go
+severity: warning
+message: Shell processes are forbidden, including shell literals assigned to local variables.
+files:
+  - "**/*.go"
+rule:
+  any:
+    - all:
+        - pattern:
+            context: func f() { exec.Command($EXECUTABLE, $$$ARGS) }
+            selector: call_expression
+        - inside: &local-shell-binding
+            kind: function_declaration
+            stopBy: end
+            has:
+              pattern:
+                context: func f() { $EXECUTABLE := $SHELL }
+                selector: short_var_declaration
+              stopBy: end
+        - inside: &default-os-exec-import
+            kind: source_file
+            stopBy: end
+            has:
+              pattern:
+                context: import "os/exec"
+                selector: import_spec
+              stopBy: end
+    - all:
+        - pattern:
+            context: func f() { $PKG.Command($EXECUTABLE, $$$ARGS) }
+            selector: call_expression
+        - inside: *local-shell-binding
+        - inside: &aliased-os-exec-import
+            kind: source_file
+            stopBy: end
+            has:
+              pattern:
+                context: import $PKG "os/exec"
+                selector: import_spec
+              stopBy: end
+    - all:
+        - pattern:
+            context: func f() { $PKG.Command($EXECUTABLE, $$$ARGS) }
+            selector: call_expression
+        - inside: *local-shell-binding
+        - inside: &raw-aliased-os-exec-import
+            kind: source_file
+            stopBy: end
+            has:
+              pattern:
+                context: import $PKG `os/exec`
+                selector: import_spec
+              stopBy: end
+    - all:
+        - pattern:
+            context: func f() { exec.CommandContext($CTX, $EXECUTABLE, $$$ARGS) }
+            selector: call_expression
+        - inside: *local-shell-binding
+        - inside: *default-os-exec-import
+    - all:
+        - pattern:
+            context: func f() { $PKG.CommandContext($CTX, $EXECUTABLE, $$$ARGS) }
+            selector: call_expression
+        - inside: *local-shell-binding
+        - inside: *aliased-os-exec-import
+    - all:
+        - pattern:
+            context: func f() { $PKG.CommandContext($CTX, $EXECUTABLE, $$$ARGS) }
+            selector: call_expression
+        - inside: *local-shell-binding
+        - inside: *raw-aliased-os-exec-import
+constraints:
+  SHELL:
+    regex: '(?i)^["`]([^"`/\\]*[/\\])*(bash|cmd|cmd\.exe|csh|dash|env|fish|ksh|powershell|powershell\.exe|pwsh|sh|tcsh|zsh)["`]$'

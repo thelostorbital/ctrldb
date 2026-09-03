@@ -6,14 +6,28 @@ files:
   - "**/*.go"
 rule:
   any:
-    - pattern:
-        context: func f() { os.StartProcess($$$ARGS) }
-        selector: call_expression
+    - all:
+        - pattern:
+            context: func f() { os.StartProcess($$$ARGS) }
+            selector: call_expression
+        - inside: &default-os-import
+            kind: source_file
+            stopBy: end
+            has:
+              pattern:
+                context: import "os"
+                selector: import_spec
+              stopBy: end
+    - all:
+        - pattern:
+            context: var _ = os.StartProcess
+            selector: selector_expression
+        - inside: *default-os-import
     - all:
         - pattern:
             context: func f() { $PKG.StartProcess($$$ARGS) }
             selector: call_expression
-        - inside:
+        - inside: &aliased-os-import
             kind: source_file
             stopBy: end
             has:
@@ -23,9 +37,14 @@ rule:
               stopBy: end
     - all:
         - pattern:
+            context: var _ = $PKG.StartProcess
+            selector: selector_expression
+        - inside: *aliased-os-import
+    - all:
+        - pattern:
             context: func f() { $PKG.StartProcess($$$ARGS) }
             selector: call_expression
-        - inside:
+        - inside: &raw-aliased-os-import
             kind: source_file
             stopBy: end
             has:
@@ -33,6 +52,11 @@ rule:
                 context: import $PKG `os`
                 selector: import_spec
               stopBy: end
+    - all:
+        - pattern:
+            context: var _ = $PKG.StartProcess
+            selector: selector_expression
+        - inside: *raw-aliased-os-import
     - pattern:
         context: func f() { syscall.StartProcess($$$ARGS) }
         selector: call_expression

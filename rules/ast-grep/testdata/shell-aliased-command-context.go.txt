@@ -1,0 +1,8 @@
+package gcp
+
+import (
+	"context"
+	process "os/exec"
+)
+
+var _ = process.CommandContext(context.Background(), "fish", "-c", "echo unsafe")

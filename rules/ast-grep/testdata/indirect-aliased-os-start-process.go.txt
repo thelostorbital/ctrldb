@@ -1,0 +1,5 @@
+package fixture
+
+import stdos "os"
+
+var start = stdos.StartProcess

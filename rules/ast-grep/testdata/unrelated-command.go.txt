@@ -1,0 +1,9 @@
+package fixture
+
+type operationController struct{}
+
+func (operationController) Command(string) {}
+
+func allowed(controller operationController) {
+	controller.Command("sh")
+}

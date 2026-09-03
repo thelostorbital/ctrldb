@@ -95,9 +95,12 @@ fi
 
 assert_accepted "$fixture_source_dir/allowed.go.txt" "$architecture_fixture"
 assert_accepted "$fixture_source_dir/unrelated-start-process.go.txt" "$architecture_fixture"
+assert_accepted "$fixture_source_dir/unrelated-command.go.txt" "$architecture_fixture"
+assert_accepted "$fixture_source_dir/unrelated-variable-command.go.txt" "$architecture_fixture"
 
 assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
 assert_rejected "$fixture_source_dir/raw-bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
+assert_rejected "$fixture_source_dir/legacy-bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
 assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/raw-test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/os-exec-import.go.txt" "$architecture_fixture" os-exec-import-boundary
@@ -107,12 +110,26 @@ assert_rejected "$fixture_source_dir/os-exec-import.go.txt" "$root_fixture" os-e
 assert_rejected "$fixture_source_dir/shell-command-short.go.txt" "$adapter_fixture" no-shell-launchers
 assert_rejected "$fixture_source_dir/shell-command-absolute-raw.go.txt" "$adapter_fixture" no-shell-launchers
 assert_rejected "$fixture_source_dir/shell-command-windows.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-aliased-command.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-raw-aliased-command.go.txt" "$adapter_fixture" no-shell-launchers
 assert_rejected "$fixture_source_dir/shell-command-context.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-aliased-command-context.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-raw-aliased-command-context.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-default-cmd-literal.go.txt" "$adapter_fixture" no-shell-launchers
 assert_rejected "$fixture_source_dir/shell-cmd-literal.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-raw-aliased-cmd-literal.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-variable-command.go.txt" "$adapter_fixture" no-shell-variable-launchers
+assert_rejected "$fixture_source_dir/shell-aliased-variable-command.go.txt" "$adapter_fixture" no-shell-variable-launchers
+assert_rejected "$fixture_source_dir/shell-raw-aliased-variable-command.go.txt" "$adapter_fixture" no-shell-variable-launchers
+assert_rejected "$fixture_source_dir/shell-variable-command-context.go.txt" "$adapter_fixture" no-shell-variable-launchers
+assert_rejected "$fixture_source_dir/shell-aliased-variable-command-context.go.txt" "$adapter_fixture" no-shell-variable-launchers
+assert_rejected "$fixture_source_dir/shell-raw-aliased-variable-command-context.go.txt" "$adapter_fixture" no-shell-variable-launchers
 
 assert_rejected "$fixture_source_dir/os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
 assert_rejected "$fixture_source_dir/aliased-os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
 assert_rejected "$fixture_source_dir/raw-aliased-os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/indirect-os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/indirect-aliased-os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
 assert_rejected "$fixture_source_dir/syscall-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
 assert_rejected "$fixture_source_dir/syscall-exec.go.txt" "$architecture_fixture" no-raw-process-apis
 assert_rejected "$fixture_source_dir/syscall-fork-exec.go.txt" "$architecture_fixture" no-raw-process-apis

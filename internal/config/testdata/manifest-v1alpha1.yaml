@@ -1,0 +1,357 @@
+# Copyright 2026 CtrlBoard.dev
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: ctrldb.ctrlboard.dev/v1alpha1
+kind: MongoEnvironment
+metadata:
+  name: staging
+  class: staging
+spec:
+  gcp:
+    project: example-project
+    region: us-central1
+    zone: us-central1-a
+    network: ctrldb-staging
+    subnet: ctrldb-staging
+    identity:
+      discovery: user
+      mutation: user
+      operatorServiceAccount: ctrldb-operator@example-project.iam.gserviceaccount.com
+      provisionerServiceAccount: ctrldb-provisioner@example-project.iam.gserviceaccount.com
+      destructiveIdentity: user
+      hostAccess: user
+    sharedVpc:
+      hostProject: null
+  host:
+    instancePrefix: ctrldb-staging
+    members:
+      - name: ctrldb-staging-1
+        ordinal: 1
+        zone: us-central1-a
+        memberName: mongodb-1
+    machineType: e2-medium
+    dataDisk:
+      name: ctrldb-staging-data-1
+      deviceName: mongodb-data
+      sizeGiB: 100
+      type: pd-balanced
+      scope: zonal
+      replicaZones: []
+      filesystem: xfs
+      mount: /var/lib/mongodb
+    bootDisk:
+      sizeGiB: 20
+      type: pd-balanced
+      imageFamily: ubuntu-2404-lts-amd64
+      imageProject: ubuntu-os-cloud
+    privateAddress:
+      name: ctrldb-staging-1
+      ip: 10.20.0.10
+    networkTag: ctrldb-mongodb
+    serviceAccount: ctrldb-host@example-project.iam.gserviceaccount.com
+    stackDir: /opt/ctrldb
+    secretsEscrow:
+      enabled: true
+      secretPrefix: ctrldb-staging
+      replicationRegions: [us-central1]
+    quarantineDirs: [/var/lib/ctrldb/quarantine]
+    osUpdates:
+      unattendedSecurity: true
+      automaticReboot: false
+      osInventory: true
+    snapshots:
+      data:
+        schedule: "02:00"
+        timezone: UTC
+        retentionDays: 7
+        onSourceDiskDelete: KEEP_AUTO_SNAPSHOTS
+      boot:
+        weekly: true
+        day: SUNDAY
+        schedule: "03:00"
+        timezone: UTC
+        retentionDays: 28
+  capacity:
+    minMachineType: e2-medium
+    maxMachineType: n2-standard-8
+    maxDataDiskGiB: 500
+    autoExpand:
+      enabled: true
+      triggerPercent: 80
+      forMinutes: 15
+      stepPercent: 20
+      stepMinGiB: 20
+      minHoursBetweenSteps: 24
+      costSignalMaxAgeHours: 24
+      maxStepsWithoutFreshCostSignal: 1
+    scaleMethod: rolling
+    rolling:
+      maxTwoVoterMinutes: 60
+      initialSyncTimeoutHours: 8
+      forceReconfigEscape: false
+    rehearsal:
+      caps:
+        maxMachineType: n2-standard-4
+        maxDiskGiB: 150
+        maxInstances: 3
+        maxLifetimeHours: 8
+        maxEstimatedUSDPerRun: 25
+  failover:
+    heartbeatMissingMinutes: 5
+    preRenderPlans: [WF-FAIL-01]
+    autoReplace: false
+    gcpInvariants:
+      automaticRestart: true
+      onHostMaintenance: MIGRATE
+  topology:
+    homeRegion: us-central1
+    current: single-member
+    target: three-member
+    migrateWhen: workload requires high availability
+    members:
+      - zone: us-central1-a
+        region: us-central1
+        priority: 1
+        votes: 1
+  mongodb:
+    topology: single-member
+    replicaSet: rs0
+    majorLine: "8.0"
+    imageDigest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    tls:
+      mode: requireTLS
+      caKind: private
+      serverCertDays: 90
+      alertDays: [30, 14, 7]
+      clientCerts: optional
+      autoRenew:
+        acme: false
+        privateCa: false
+    smokeDatabase: ctrldb_validation
+  pbm:
+    version: 2.15.0
+    imageDigest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+    bucket: example-project-ctrldb-backups
+    prefix: staging
+    pitr:
+      enabled: true
+      oplogSpanMin: 15
+    backup:
+      schedule:
+        time: "01:00"
+        timezone: UTC
+        jitterMinutes: 10
+      compression: s2
+      parallelCollections: 4
+      maxMinutes: 45
+      staleAfterHours: 26
+    protection:
+      convenienceBindingsRemoved: true
+      viewers: [group:database-viewers@example.com]
+      softDeleteDays: 30
+      dataAccessAuditLogs:
+        storage: true
+        secretManager: true
+      denyPolicy:
+        enabled: true
+        tagKey: ctrldb-protected
+        templateVersion: permanent-v1
+    replication:
+      mode: transfer-copy
+      regions: [us-east1]
+      drBucket: example-project-ctrldb-dr
+      transferServiceAccount: ctrldb-transfer@example-project.iam.gserviceaccount.com
+      schedule: 15m
+      drVersioning:
+        enabled: true
+        noncurrentRetentionDays: 30
+    verification:
+      network:
+        vpc: ctrldb-restore-verification
+        subnet: ctrldb-restore-verification
+        cidr: 10.30.0.0/24
+        tag: ctrldb-restore-verification
+        egress:
+          kind: operation-scoped-cloud-nat
+          maxLifetimeHours: 4
+    historicalPrefixes:
+      - prefix: pre-migration
+        hold:
+          name: migration-baseline
+          reason: Retain the final source export during the migration window.
+          expiry: "2027-01-01T00:00:00Z"
+    retention:
+      dailyDays: 14
+      weeklyWeeks: 8
+      monthlyMonths: 12
+      verificationMaxAgeDays: 7
+      enforce:
+        dailyTier: true
+        maxDeletesPerRun: 10
+        supervisedDays: 30
+      holds:
+        - name: migration-window
+          reason: Preserve the verified migration baseline.
+          scope:
+            prefix: pre-migration
+          owner: database-team
+          expiry: "2027-01-01T00:00:00Z"
+    verificationSchedule:
+      currentSizeEvery: 7d
+      projectedSizeEvery: 90d
+      projectedProfile:
+        machineType: n2-standard-4
+        dataDiskGiB: 150
+        parallelCollections: 4
+        insertionWorkers: 4
+  application:
+    name: example-api
+    restartHook:
+      kind: manual
+      ref: application restart runbook
+      idempotent: true
+    freeze:
+      kind: stop-app
+      pauseJobs: [example-worker]
+    healthChecks:
+      - name: health
+        url: https://api.example.com/health
+        expect: 200
+    healthTimeoutSeconds: 120
+    smokeEndpoints:
+      - name: search
+        url: https://api.example.com/search
+        kind: search
+    trust: system
+    caBundleSecretRef: null
+    secretDiscovery:
+      namePattern: ^example-[a-z0-9-]+$
+      labels:
+        managed-by: ctrldb
+    drivers:
+      - name: mongodb-go-driver
+        version: 2.4.0
+    staging: null
+    databases:
+      - name: application
+        secretRef: projects/example-project/secrets/application-mongodb-uri
+        disposition: migrate
+        uriKind: replica-set
+        consumers: [example-api]
+  upgrade:
+    soakDays: 7
+  gapsAcceptedIn: control-bucket
+  indexes:
+    catalogRef: ./config/indexes.yaml
+  users:
+    catalogRef: ./config/users.yaml
+    rotationDays: 90
+    rotationGraceHours: 24
+  patch:
+    checkSchedule:
+      time: "04:00"
+      timezone: UTC
+    upstream:
+      mongodb: community
+      pbm: percona
+      line: "8.0"
+  monitoring:
+    channels:
+      email: [alerts@example.com]
+      mobileApp: google-cloud
+    criticalOverride: [mongodb_down, backup_stale]
+  automations:
+    AUTO-01: {mode: enforce}
+    AUTO-02: {mode: enforce}
+    AUTO-03: {mode: recommend}
+    AUTO-04: {mode: enforce}
+    AUTO-05: {mode: observe}
+    AUTO-06: {mode: recommend}
+    AUTO-07: {mode: recommend}
+    AUTO-08: {mode: observe}
+    AUTO-09: {mode: observe}
+    AUTO-10: {mode: observe}
+    AUTO-11: {mode: recommend}
+    AUTO-12: {mode: enforce}
+    AUTO-13: {mode: observe}
+    AUTO-14: {mode: recommend}
+    AUTO-15: {mode: observe}
+    AUTO-16: {mode: enforce}
+    AUTO-17: {mode: enforce}
+  access:
+    defaultLeaseHours: 8
+    maxLeaseHours: 24
+    adminSessionMaxHours: 4
+    maxSourceCidrBits: 32
+    firewallLogging:
+      temporary: true
+      application: true
+      retentionDays: 30
+    breakGlass:
+      enabled: true
+      user: emergency
+      secretRef: projects/example-project/secrets/mongodb-emergency-user
+      maxMinutes: 30
+      principals: [group:database-admins@example.com]
+    maxTotalLeaseHours: 72
+    publicEndpoint:
+      policy: forbidden
+      internetWide:
+        allowed: false
+        defaultExpiryHours: 1
+        allowNever: false
+    reviewAfterDays: 90
+    profiles:
+      - name: application
+        kind: vpc-app
+        role: readWrite
+        databases: [application]
+        sources:
+          - kind: service-account
+            value: example-api@example-project.iam.gserviceaccount.com
+        reviewAfterDays: 90
+  policy:
+    publicDatabaseEndpoint: forbidden
+    requireFreshBackupBeforeMutation: true
+    destructiveOperations: interactive-only
+    dataDestructiveCoolingOff: 24h
+    planValidity: 1h
+    costCeilingUSDPerMonth: 300
+    enforceCostCeiling: true
+    maxPauseHours: 8
+    overrides:
+      acknowledged: true
+    rpoMinutes: 15
+    regionalDisasterRpoMinutes: 60
+    rtoMinutes: 60
+    retention:
+      dailyDays: 14
+      weeklyWeeks: 8
+      monthlyMonths: 12
+    residency: [us-central1, us-east1]
+  control:
+    stateBucket: example-project-ctrldb-state
+    auditBucket: example-project-ctrldb-audit
+    lockLeaseSeconds: 300
+  reconciler:
+    enabled: true
+    schedulerJob: ctrldb-reconcile
+    runJob: ctrldb-reconcile
+    serviceAccount: ctrldb-reconciler@example-project.iam.gserviceaccount.com
+    imageDigest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+  migration:
+    method: full-copy
+    maxFullCopyGiB: 100
+    exportHost: target
+    inventoryMaxAgeDays: 7
+    rehearsalMaxAgeDays: 30
+    exportTimeoutMinutes: 60
+    importTimeoutMinutes: 60
+    importParallel: 4
+    reverseImportParallel: 4
+    archiveBucket: example-project-ctrldb-migration
+    safetyWindowDays: 7
+    sourceRunningDays: 7
+    state: null
+  docs:
+    repositoryPath: ./docs

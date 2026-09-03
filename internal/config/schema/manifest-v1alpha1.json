@@ -1,0 +1,1334 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ctrldb.ctrlboard.dev/schemas/manifest-v1alpha1.json",
+  "title": "CtrlDB MongoEnvironment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "ctrldb.ctrlboard.dev/v1alpha1" },
+    "kind": { "const": "MongoEnvironment" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "spec": { "$ref": "#/$defs/spec" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "metadata": {
+            "properties": { "class": { "const": "production" } },
+            "required": ["class"]
+          }
+        },
+        "required": ["metadata"]
+      },
+      "then": {
+        "properties": {
+          "spec": {
+            "properties": {
+              "gcp": {
+                "properties": {
+                  "identity": {
+                    "properties": { "mutation": { "const": "impersonate" } },
+                    "required": ["mutation"]
+                  }
+                },
+                "required": ["identity"]
+              }
+            },
+            "required": ["gcp"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metadata": {
+            "properties": { "class": { "const": "disposable" } },
+            "required": ["class"]
+          }
+        },
+        "required": ["metadata"]
+      },
+      "else": {
+        "properties": {
+          "spec": { "not": { "required": ["testIsolation"] } }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "class"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "class": { "enum": ["production", "staging", "rehearsal", "disposable"] }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gcp", "host", "capacity", "failover", "topology", "mongodb", "pbm",
+        "upgrade", "gapsAcceptedIn", "indexes", "users", "patch", "monitoring",
+        "automations", "access", "policy", "control", "reconciler", "migration", "docs"
+      ],
+      "properties": {
+        "gcp": { "$ref": "#/$defs/gcp" },
+        "host": { "$ref": "#/$defs/host" },
+        "capacity": { "$ref": "#/$defs/capacity" },
+        "failover": { "$ref": "#/$defs/failover" },
+        "topology": { "$ref": "#/$defs/topology" },
+        "mongodb": { "$ref": "#/$defs/mongodb" },
+        "pbm": { "$ref": "#/$defs/pbm" },
+        "application": { "$ref": "#/$defs/application" },
+        "upgrade": { "$ref": "#/$defs/upgrade" },
+        "gapsAcceptedIn": { "const": "control-bucket" },
+        "indexes": { "$ref": "#/$defs/indexes" },
+        "users": { "$ref": "#/$defs/users" },
+        "patch": { "$ref": "#/$defs/patch" },
+        "monitoring": { "$ref": "#/$defs/monitoring" },
+        "automations": { "$ref": "#/$defs/automations" },
+        "access": { "$ref": "#/$defs/access" },
+        "policy": { "$ref": "#/$defs/policy" },
+        "control": { "$ref": "#/$defs/control" },
+        "reconciler": { "$ref": "#/$defs/reconciler" },
+        "testIsolation": { "$ref": "#/$defs/testIsolation" },
+        "migration": { "$ref": "#/$defs/migration" },
+        "docs": { "$ref": "#/$defs/docs" }
+      }
+    },
+    "gcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project", "region", "zone", "network", "subnet", "identity", "sharedVpc"],
+      "properties": {
+        "project": { "type": "string", "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$" },
+        "region": { "$ref": "#/$defs/region" },
+        "zone": { "$ref": "#/$defs/zone" },
+        "network": { "$ref": "#/$defs/gcpName" },
+        "subnet": { "$ref": "#/$defs/gcpName" },
+        "identity": { "$ref": "#/$defs/gcpIdentity" },
+        "sharedVpc": { "$ref": "#/$defs/sharedVpc" }
+      }
+    },
+    "gcpIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "discovery", "mutation", "operatorServiceAccount", "provisionerServiceAccount",
+        "destructiveIdentity", "hostAccess"
+      ],
+      "properties": {
+        "discovery": { "enum": ["user", "impersonate"] },
+        "mutation": { "enum": ["user", "impersonate"] },
+        "operatorServiceAccount": { "$ref": "#/$defs/serviceAccount" },
+        "provisionerServiceAccount": { "$ref": "#/$defs/serviceAccount" },
+        "destructiveIdentity": {
+          "oneOf": [
+            { "const": "user" },
+            { "$ref": "#/$defs/serviceAccount" }
+          ]
+        },
+        "hostAccess": { "const": "user" }
+      }
+    },
+    "sharedVpc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostProject"],
+      "properties": {
+        "hostProject": {
+          "type": ["string", "null"],
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instancePrefix", "members", "machineType", "dataDisk", "bootDisk", "privateAddress",
+        "networkTag", "serviceAccount", "stackDir", "secretsEscrow", "quarantineDirs",
+        "osUpdates", "snapshots"
+      ],
+      "properties": {
+        "instancePrefix": { "$ref": "#/$defs/gcpName" },
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/hostMember" }
+        },
+        "instance": { "$ref": "#/$defs/gcpName" },
+        "machineType": { "$ref": "#/$defs/machineType" },
+        "dataDisk": { "$ref": "#/$defs/dataDisk" },
+        "bootDisk": { "$ref": "#/$defs/bootDisk" },
+        "privateAddress": { "$ref": "#/$defs/privateAddress" },
+        "networkTag": { "$ref": "#/$defs/gcpName" },
+        "serviceAccount": { "$ref": "#/$defs/serviceAccount" },
+        "stackDir": { "type": "string", "pattern": "^/[^\\x00]*$", "maxLength": 512 },
+        "memberName": { "$ref": "#/$defs/nonEmptyString" },
+        "secretsEscrow": { "$ref": "#/$defs/secretsEscrow" },
+        "quarantineDirs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^/[^\\x00]*$", "maxLength": 512 }
+        },
+        "osUpdates": { "$ref": "#/$defs/osUpdates" },
+        "snapshots": { "$ref": "#/$defs/snapshots" }
+      }
+    },
+    "hostMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "ordinal", "zone", "memberName"],
+      "properties": {
+        "name": { "$ref": "#/$defs/gcpName" },
+        "ordinal": { "$ref": "#/$defs/positiveInteger" },
+        "zone": { "$ref": "#/$defs/zone" },
+        "memberName": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "dataDisk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "deviceName", "sizeGiB", "type", "scope", "replicaZones", "filesystem", "mount"],
+      "properties": {
+        "name": { "$ref": "#/$defs/gcpName" },
+        "deviceName": { "$ref": "#/$defs/gcpName" },
+        "sizeGiB": { "$ref": "#/$defs/positiveInteger" },
+        "type": { "enum": ["pd-balanced", "pd-ssd", "pd-standard", "hyperdisk-balanced"] },
+        "scope": { "enum": ["zonal", "regional"] },
+        "replicaZones": {
+          "type": "array",
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/zone" }
+        },
+        "filesystem": { "enum": ["xfs", "ext4"] },
+        "mount": { "type": "string", "pattern": "^/[^\\x00]*$", "maxLength": 512 }
+      }
+    },
+    "bootDisk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sizeGiB", "type", "imageFamily", "imageProject"],
+      "properties": {
+        "sizeGiB": { "$ref": "#/$defs/positiveInteger" },
+        "type": { "enum": ["pd-balanced", "pd-ssd", "pd-standard"] },
+        "imageFamily": { "$ref": "#/$defs/nonEmptyString" },
+        "imageProject": { "$ref": "#/$defs/gcpName" }
+      }
+    },
+    "privateAddress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "ip"],
+      "properties": {
+        "name": { "$ref": "#/$defs/gcpName" },
+        "ip": { "type": "string", "format": "ipv4" }
+      }
+    },
+    "secretsEscrow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "secretPrefix", "replicationRegions"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "secretPrefix": { "$ref": "#/$defs/nonEmptyString" },
+        "replicationRegions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/region" }
+        }
+      }
+    },
+    "osUpdates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unattendedSecurity", "automaticReboot", "osInventory"],
+      "properties": {
+        "unattendedSecurity": { "type": "boolean" },
+        "automaticReboot": { "type": "boolean" },
+        "osInventory": { "type": "boolean" }
+      }
+    },
+    "snapshots": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["data", "boot"],
+      "properties": {
+        "data": { "$ref": "#/$defs/dataSnapshot" },
+        "boot": { "$ref": "#/$defs/bootSnapshot" }
+      }
+    },
+    "dataSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schedule", "timezone", "retentionDays", "onSourceDiskDelete"],
+      "properties": {
+        "schedule": { "$ref": "#/$defs/clockTime" },
+        "timezone": { "$ref": "#/$defs/timezone" },
+        "retentionDays": { "$ref": "#/$defs/positiveInteger" },
+        "onSourceDiskDelete": { "enum": ["KEEP_AUTO_SNAPSHOTS", "APPLY_RETENTION_POLICY"] }
+      }
+    },
+    "bootSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["weekly", "day", "schedule", "timezone", "retentionDays"],
+      "properties": {
+        "weekly": { "type": "boolean" },
+        "day": { "enum": ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"] },
+        "schedule": { "$ref": "#/$defs/clockTime" },
+        "timezone": { "$ref": "#/$defs/timezone" },
+        "retentionDays": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minMachineType", "maxMachineType", "maxDataDiskGiB", "autoExpand", "scaleMethod", "rolling", "rehearsal"],
+      "properties": {
+        "minMachineType": { "$ref": "#/$defs/machineType" },
+        "maxMachineType": { "$ref": "#/$defs/machineType" },
+        "maxDataDiskGiB": { "$ref": "#/$defs/positiveInteger" },
+        "autoExpand": { "$ref": "#/$defs/autoExpand" },
+        "scaleMethod": { "enum": ["rolling", "stop-start"] },
+        "rolling": { "$ref": "#/$defs/rolling" },
+        "rehearsal": { "$ref": "#/$defs/rehearsal" }
+      }
+    },
+    "autoExpand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled", "triggerPercent", "forMinutes", "stepPercent", "stepMinGiB",
+        "minHoursBetweenSteps", "costSignalMaxAgeHours", "maxStepsWithoutFreshCostSignal"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "triggerPercent": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "forMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "stepPercent": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "stepMinGiB": { "$ref": "#/$defs/positiveInteger" },
+        "minHoursBetweenSteps": { "$ref": "#/$defs/nonNegativeInteger" },
+        "costSignalMaxAgeHours": { "$ref": "#/$defs/positiveInteger" },
+        "maxStepsWithoutFreshCostSignal": { "type": "integer", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "rolling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxTwoVoterMinutes", "initialSyncTimeoutHours", "forceReconfigEscape"],
+      "properties": {
+        "maxTwoVoterMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "initialSyncTimeoutHours": { "$ref": "#/$defs/positiveInteger" },
+        "forceReconfigEscape": { "type": "boolean" }
+      }
+    },
+    "rehearsal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caps"],
+      "properties": { "caps": { "$ref": "#/$defs/rehearsalCaps" } }
+    },
+    "rehearsalCaps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxMachineType", "maxDiskGiB", "maxInstances", "maxLifetimeHours", "maxEstimatedUSDPerRun"],
+      "properties": {
+        "maxMachineType": { "$ref": "#/$defs/machineType" },
+        "maxDiskGiB": { "$ref": "#/$defs/positiveInteger" },
+        "maxInstances": { "$ref": "#/$defs/positiveInteger" },
+        "maxLifetimeHours": { "$ref": "#/$defs/positiveInteger" },
+        "maxEstimatedUSDPerRun": { "$ref": "#/$defs/nonNegativeNumber" }
+      }
+    },
+    "failover": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["heartbeatMissingMinutes", "preRenderPlans", "autoReplace", "gcpInvariants"],
+      "properties": {
+        "heartbeatMissingMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "preRenderPlans": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^WF-[A-Z]+-[0-9]{2}$" }
+        },
+        "autoReplace": { "const": false },
+        "gcpInvariants": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["automaticRestart", "onHostMaintenance"],
+          "properties": {
+            "automaticRestart": { "const": true },
+            "onHostMaintenance": { "const": "MIGRATE" }
+          }
+        }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["homeRegion", "current", "target", "migrateWhen", "members"],
+      "properties": {
+        "homeRegion": { "$ref": "#/$defs/region" },
+        "current": { "enum": ["single-member", "three-member", "multi-region"] },
+        "target": { "enum": ["single-member", "three-member", "multi-region"] },
+        "migrateWhen": { "$ref": "#/$defs/nonEmptyString" },
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/topologyMember" }
+        }
+      }
+    },
+    "topologyMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["zone", "priority", "votes"],
+      "properties": {
+        "zone": { "$ref": "#/$defs/zone" },
+        "region": { "$ref": "#/$defs/region" },
+        "priority": { "$ref": "#/$defs/nonNegativeNumber" },
+        "votes": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "horizons": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "external": { "$ref": "#/$defs/nonEmptyString" },
+            "tunnel": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        }
+      }
+    },
+    "mongodb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topology", "replicaSet", "majorLine", "imageDigest", "tls", "smokeDatabase"],
+      "properties": {
+        "topology": { "enum": ["single-member", "three-member", "multi-region"] },
+        "replicaSet": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
+        "majorLine": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+        "imageDigest": { "$ref": "#/$defs/digest" },
+        "tls": { "$ref": "#/$defs/tls" },
+        "smokeDatabase": { "const": "ctrldb_validation" }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "caKind", "serverCertDays", "alertDays", "clientCerts", "autoRenew"],
+      "properties": {
+        "mode": { "const": "requireTLS" },
+        "caKind": { "enum": ["private", "public"] },
+        "serverCertDays": { "$ref": "#/$defs/positiveInteger" },
+        "alertDays": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/positiveInteger" }
+        },
+        "clientCerts": { "enum": ["disabled", "optional", "required"] },
+        "autoRenew": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["acme", "privateCa"],
+          "properties": {
+            "acme": { "type": "boolean" },
+            "privateCa": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "pbm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version", "imageDigest", "bucket", "prefix", "pitr", "backup", "protection",
+        "replication", "verification", "historicalPrefixes", "retention", "verificationSchedule"
+      ],
+      "properties": {
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$" },
+        "imageDigest": { "$ref": "#/$defs/digest" },
+        "bucket": { "$ref": "#/$defs/bucketName" },
+        "prefix": { "$ref": "#/$defs/nonEmptyString" },
+        "pitr": { "$ref": "#/$defs/pitr" },
+        "backup": { "$ref": "#/$defs/backup" },
+        "protection": { "$ref": "#/$defs/protection" },
+        "replication": { "$ref": "#/$defs/replication" },
+        "verification": { "$ref": "#/$defs/verification" },
+        "historicalPrefixes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/historicalPrefix" }
+        },
+        "retention": { "$ref": "#/$defs/retention" },
+        "verificationSchedule": { "$ref": "#/$defs/verificationSchedule" }
+      }
+    },
+    "pitr": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "oplogSpanMin"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "oplogSpanMin": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schedule", "compression", "parallelCollections", "maxMinutes", "staleAfterHours"],
+      "properties": {
+        "schedule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["time", "timezone", "jitterMinutes"],
+          "properties": {
+            "time": { "$ref": "#/$defs/clockTime" },
+            "timezone": { "$ref": "#/$defs/timezone" },
+            "jitterMinutes": { "$ref": "#/$defs/nonNegativeInteger" }
+          }
+        },
+        "compression": { "enum": ["none", "gzip", "pgzip", "lz4", "snappy", "s2"] },
+        "parallelCollections": { "$ref": "#/$defs/positiveInteger" },
+        "maxMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "staleAfterHours": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "protection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["convenienceBindingsRemoved", "viewers", "softDeleteDays", "dataAccessAuditLogs", "denyPolicy"],
+      "properties": {
+        "convenienceBindingsRemoved": { "type": "boolean" },
+        "viewers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "softDeleteDays": { "$ref": "#/$defs/positiveInteger" },
+        "dataAccessAuditLogs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["storage", "secretManager"],
+          "properties": {
+            "storage": { "type": "boolean" },
+            "secretManager": { "type": "boolean" }
+          }
+        },
+        "denyPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "tagKey", "templateVersion"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "tagKey": { "$ref": "#/$defs/nonEmptyString" },
+            "templateVersion": { "const": "permanent-v1" }
+          }
+        }
+      }
+    },
+    "replication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "regions", "drBucket", "transferServiceAccount", "schedule", "drVersioning"],
+      "properties": {
+        "mode": { "enum": ["transfer-copy", "none"] },
+        "regions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/region" }
+        },
+        "drBucket": { "$ref": "#/$defs/bucketName" },
+        "transferServiceAccount": { "$ref": "#/$defs/serviceAccount" },
+        "schedule": { "$ref": "#/$defs/duration" },
+        "drVersioning": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "noncurrentRetentionDays"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "noncurrentRetentionDays": { "$ref": "#/$defs/positiveInteger" }
+          }
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network"],
+      "properties": { "network": { "$ref": "#/$defs/verificationNetwork" } }
+    },
+    "verificationNetwork": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vpc", "subnet", "cidr", "tag", "egress"],
+      "properties": {
+        "vpc": { "$ref": "#/$defs/gcpName" },
+        "subnet": { "$ref": "#/$defs/gcpName" },
+        "cidr": { "$ref": "#/$defs/cidr" },
+        "tag": { "$ref": "#/$defs/gcpName" },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "maxLifetimeHours"],
+          "properties": {
+            "kind": { "const": "operation-scoped-cloud-nat" },
+            "maxLifetimeHours": { "$ref": "#/$defs/positiveInteger" }
+          }
+        }
+      }
+    },
+    "historicalPrefix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prefix", "hold"],
+      "properties": {
+        "prefix": { "$ref": "#/$defs/nonEmptyString" },
+        "hold": { "$ref": "#/$defs/basicHold" }
+      }
+    },
+    "basicHold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "reason", "expiry"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "expiry": { "$ref": "#/$defs/expiry" }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dailyDays", "weeklyWeeks", "monthlyMonths", "verificationMaxAgeDays", "enforce", "holds"],
+      "properties": {
+        "dailyDays": { "$ref": "#/$defs/positiveInteger" },
+        "weeklyWeeks": { "$ref": "#/$defs/positiveInteger" },
+        "monthlyMonths": { "$ref": "#/$defs/positiveInteger" },
+        "verificationMaxAgeDays": { "$ref": "#/$defs/positiveInteger" },
+        "enforce": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dailyTier", "maxDeletesPerRun", "supervisedDays"],
+          "properties": {
+            "dailyTier": { "type": "boolean" },
+            "maxDeletesPerRun": { "$ref": "#/$defs/positiveInteger" },
+            "supervisedDays": { "$ref": "#/$defs/positiveInteger" }
+          }
+        },
+        "holds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/retentionHold" }
+        }
+      }
+    },
+    "retentionHold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "reason", "scope", "owner", "expiry"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "backups": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/nonEmptyString" }
+            },
+            "prefix": { "$ref": "#/$defs/nonEmptyString" },
+            "ranges": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["start", "end"],
+                "properties": {
+                  "start": { "type": "string", "format": "date-time" },
+                  "end": { "type": "string", "format": "date-time" }
+                }
+              }
+            }
+          },
+          "oneOf": [
+            { "required": ["backups"] },
+            { "required": ["prefix"] },
+            { "required": ["ranges"] }
+          ]
+        },
+        "owner": { "$ref": "#/$defs/nonEmptyString" },
+        "expiry": { "$ref": "#/$defs/expiry" }
+      }
+    },
+    "verificationSchedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["currentSizeEvery", "projectedSizeEvery", "projectedProfile"],
+      "properties": {
+        "currentSizeEvery": { "$ref": "#/$defs/duration" },
+        "projectedSizeEvery": { "$ref": "#/$defs/duration" },
+        "projectedProfile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["machineType", "dataDiskGiB", "parallelCollections", "insertionWorkers"],
+          "properties": {
+            "machineType": { "$ref": "#/$defs/machineType" },
+            "dataDiskGiB": { "$ref": "#/$defs/positiveInteger" },
+            "parallelCollections": { "$ref": "#/$defs/positiveInteger" },
+            "insertionWorkers": { "$ref": "#/$defs/positiveInteger" }
+          }
+        }
+      }
+    },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "restartHook", "freeze", "healthChecks", "healthTimeoutSeconds",
+        "smokeEndpoints", "trust", "caBundleSecretRef", "secretDiscovery", "drivers", "staging", "databases"
+      ],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "restartHook": { "$ref": "#/$defs/restartHook" },
+        "freeze": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "pauseJobs"],
+          "properties": {
+            "kind": { "const": "stop-app" },
+            "pauseJobs": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/nonEmptyString" }
+            }
+          }
+        },
+        "healthChecks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/healthCheck" }
+        },
+        "healthTimeoutSeconds": { "$ref": "#/$defs/positiveInteger" },
+        "smokeEndpoints": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/smokeEndpoint" }
+        },
+        "trust": { "enum": ["system", "caFile"] },
+        "caBundleSecretRef": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/secretRef" }
+          ]
+        },
+        "secretDiscovery": { "$ref": "#/$defs/secretDiscovery" },
+        "drivers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/driver" }
+        },
+        "staging": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/stagingApplication" }
+          ]
+        },
+        "databases": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/applicationDatabase" }
+        }
+      }
+    },
+    "restartHook": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref", "idempotent"],
+      "properties": {
+        "kind": { "enum": ["orchestrator", "command", "manual"] },
+        "ref": { "$ref": "#/$defs/nonEmptyString" },
+        "idempotent": { "type": "boolean" }
+      }
+    },
+    "healthCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "url", "expect"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "url": { "type": "string", "format": "uri" },
+        "expect": { "type": "integer", "minimum": 100, "maximum": 599 }
+      }
+    },
+    "smokeEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "url", "kind"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "url": { "type": "string", "format": "uri" },
+        "kind": { "enum": ["search", "read", "write", "custom"] }
+      }
+    },
+    "secretDiscovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namePattern", "labels"],
+      "properties": {
+        "namePattern": { "type": "string", "format": "regex", "maxLength": 512 },
+        "labels": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z][a-z0-9_-]{0,62}$" },
+          "additionalProperties": { "type": "string", "maxLength": 63 }
+        }
+      }
+    },
+    "driver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "version": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "stagingApplication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["healthChecks", "restartHook"],
+      "properties": {
+        "healthChecks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/healthCheck" }
+        },
+        "restartHook": { "$ref": "#/$defs/restartHook" }
+      }
+    },
+    "applicationDatabase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "secretRef", "disposition", "consumers"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "secretRef": { "$ref": "#/$defs/secretRef" },
+        "disposition": { "enum": ["migrate", "exclude"] },
+        "uriKind": { "enum": ["replica-set", "srv"] },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "consumers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    },
+    "upgrade": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["soakDays"],
+      "properties": { "soakDays": { "$ref": "#/$defs/nonNegativeInteger" } }
+    },
+    "indexes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalogRef"],
+      "properties": { "catalogRef": { "$ref": "#/$defs/relativePath" } }
+    },
+    "users": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalogRef", "rotationDays", "rotationGraceHours"],
+      "properties": {
+        "catalogRef": { "$ref": "#/$defs/relativePath" },
+        "rotationDays": { "$ref": "#/$defs/positiveInteger" },
+        "rotationGraceHours": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkSchedule", "upstream"],
+      "properties": {
+        "checkSchedule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["time", "timezone"],
+          "properties": {
+            "time": { "$ref": "#/$defs/clockTime" },
+            "timezone": { "$ref": "#/$defs/timezone" }
+          }
+        },
+        "upstream": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mongodb", "pbm", "line"],
+          "properties": {
+            "mongodb": { "$ref": "#/$defs/nonEmptyString" },
+            "pbm": { "$ref": "#/$defs/nonEmptyString" },
+            "line": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" }
+          }
+        }
+      }
+    },
+    "monitoring": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channels", "criticalOverride"],
+      "properties": {
+        "channels": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["email", "mobileApp"],
+          "properties": {
+            "email": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "format": "email" }
+            },
+            "mobileApp": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        "criticalOverride": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,62}$" }
+        }
+      }
+    },
+    "automations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "AUTO-01": { "$ref": "#/$defs/automationOffEnforce" },
+        "AUTO-02": { "$ref": "#/$defs/automationOffEnforce" },
+        "AUTO-03": { "$ref": "#/$defs/automationOffRecommendEnforce" },
+        "AUTO-04": { "$ref": "#/$defs/automationOffEnforce" },
+        "AUTO-05": { "$ref": "#/$defs/automationAllModes" },
+        "AUTO-06": { "$ref": "#/$defs/automationOffRecommendEnforce" },
+        "AUTO-07": { "$ref": "#/$defs/automationOffRecommend" },
+        "AUTO-08": { "$ref": "#/$defs/automationOffObserveRecommend" },
+        "AUTO-09": { "$ref": "#/$defs/automationOffObserveRecommend" },
+        "AUTO-10": { "$ref": "#/$defs/automationOffObserveRecommend" },
+        "AUTO-11": { "$ref": "#/$defs/automationOffObserveRecommendEnforce" },
+        "AUTO-12": { "$ref": "#/$defs/automationOffEnforce" },
+        "AUTO-13": { "$ref": "#/$defs/automationOffObserve" },
+        "AUTO-14": { "$ref": "#/$defs/automationOffRecommendEnforce" },
+        "AUTO-15": { "$ref": "#/$defs/automationOffObserveRecommend" },
+        "AUTO-16": { "$ref": "#/$defs/automationOffEnforce" },
+        "AUTO-17": { "$ref": "#/$defs/automationOffEnforce" }
+      }
+    },
+    "automationOffEnforce": { "$ref": "#/$defs/automationModeOffEnforce" },
+    "automationOffRecommend": { "$ref": "#/$defs/automationModeOffRecommend" },
+    "automationOffObserve": { "$ref": "#/$defs/automationModeOffObserve" },
+    "automationOffRecommendEnforce": { "$ref": "#/$defs/automationModeOffRecommendEnforce" },
+    "automationOffObserveRecommend": { "$ref": "#/$defs/automationModeOffObserveRecommend" },
+    "automationOffObserveRecommendEnforce": { "$ref": "#/$defs/automationModeOffObserveRecommendEnforce" },
+    "automationAllModes": { "$ref": "#/$defs/automationModeAll" },
+    "automationModeOffEnforce": {
+      "type": "object", "additionalProperties": false, "required": ["mode"],
+      "properties": { "mode": { "enum": ["off", "enforce"] } }
+    },
+    "automationModeOffRecommend": {
+      "type": "object", "additionalProperties": false, "required": ["mode"],
+      "properties": { "mode": { "enum": ["off", "recommend"] } }
+    },
+    "automationModeOffObserve": {
+      "type": "object", "additionalProperties": false, "required": ["mode"],
+      "properties": { "mode": { "enum": ["off", "observe"] } }
+    },
+    "automationModeOffRecommendEnforce": {
+      "type": "object", "additionalProperties": false, "required": ["mode"],
+      "properties": { "mode": { "enum": ["off", "recommend", "enforce"] } }
+    },
+    "automationModeOffObserveRecommend": {
+      "type": "object", "additionalProperties": false, "required": ["mode"],
+      "properties": { "mode": { "enum": ["off", "observe", "recommend"] } }
+    },
+    "automationModeOffObserveRecommendEnforce": {
+      "type": "object", "additionalProperties": false, "required": ["mode"],
+      "properties": { "mode": { "enum": ["off", "observe", "recommend", "enforce"] } }
+    },
+    "automationModeAll": {
+      "type": "object", "additionalProperties": false, "required": ["mode"],
+      "properties": { "mode": { "enum": ["off", "observe", "recommend", "enforce"] } }
+    },
+    "access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "defaultLeaseHours", "maxLeaseHours", "adminSessionMaxHours", "maxSourceCidrBits",
+        "firewallLogging", "breakGlass", "maxTotalLeaseHours", "publicEndpoint", "reviewAfterDays", "profiles"
+      ],
+      "properties": {
+        "defaultLeaseHours": { "$ref": "#/$defs/positiveInteger" },
+        "maxLeaseHours": { "$ref": "#/$defs/positiveInteger" },
+        "adminSessionMaxHours": { "$ref": "#/$defs/positiveInteger" },
+        "maxSourceCidrBits": { "type": "integer", "minimum": 0, "maximum": 32 },
+        "firewallLogging": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["temporary", "application", "retentionDays"],
+          "properties": {
+            "temporary": { "type": "boolean" },
+            "application": { "type": "boolean" },
+            "retentionDays": { "$ref": "#/$defs/positiveInteger" }
+          }
+        },
+        "breakGlass": { "$ref": "#/$defs/breakGlass" },
+        "maxTotalLeaseHours": { "$ref": "#/$defs/positiveInteger" },
+        "publicEndpoint": { "$ref": "#/$defs/publicEndpoint" },
+        "reviewAfterDays": { "$ref": "#/$defs/positiveInteger" },
+        "profiles": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/accessProfile" }
+        }
+      }
+    },
+    "breakGlass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "user", "secretRef", "maxMinutes", "principals"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "user": { "const": "emergency" },
+        "secretRef": { "$ref": "#/$defs/secretRef" },
+        "maxMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "principals": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    },
+    "publicEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy", "internetWide"],
+      "properties": {
+        "policy": { "enum": ["forbidden", "profile-only"] },
+        "domain": { "type": "string", "format": "hostname" },
+        "acmeChallengeZone": { "type": "string", "format": "hostname" },
+        "internetWide": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed", "defaultExpiryHours", "allowNever"],
+          "properties": {
+            "allowed": { "type": "boolean" },
+            "defaultExpiryHours": { "$ref": "#/$defs/positiveInteger" },
+            "allowNever": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "accessProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": { "$ref": "#/$defs/dnsLabel" },
+        "kind": { "enum": ["vpc-app", "vpn", "overlay", "client-grant"] },
+        "role": { "enum": ["read", "readWrite", "dbAdmin", "root"] },
+        "databases": {
+          "type": "array", "uniqueItems": true,
+          "items": { "$ref": "#/$defs/dnsLabel" }
+        },
+        "sourceCidrs": {
+          "type": "array", "uniqueItems": true,
+          "items": { "$ref": "#/$defs/cidr" }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "value"],
+            "properties": {
+              "kind": { "enum": ["tag", "service-account", "cidr"] },
+              "value": { "$ref": "#/$defs/nonEmptyString" }
+            }
+          }
+        },
+        "reviewAfterDays": { "$ref": "#/$defs/positiveInteger" },
+        "principal": { "$ref": "#/$defs/nonEmptyString" },
+        "peer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ips", "asn", "interfaces", "secretRef"],
+          "properties": {
+            "ips": {
+              "type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true,
+              "items": { "type": "string", "format": "ipv4" }
+            },
+            "asn": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+            "interfaces": { "type": "integer", "enum": [1, 2, 4] },
+            "secretRef": { "$ref": "#/$defs/secretRef" }
+          }
+        },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "tags"],
+          "properties": {
+            "name": { "$ref": "#/$defs/dnsLabel" },
+            "tags": {
+              "type": "array", "uniqueItems": true,
+              "items": { "$ref": "#/$defs/nonEmptyString" }
+            }
+          }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publicDatabaseEndpoint", "requireFreshBackupBeforeMutation", "destructiveOperations",
+        "dataDestructiveCoolingOff", "planValidity", "costCeilingUSDPerMonth", "enforceCostCeiling",
+        "maxPauseHours", "overrides", "rpoMinutes", "regionalDisasterRpoMinutes", "rtoMinutes",
+        "retention", "residency"
+      ],
+      "properties": {
+        "publicDatabaseEndpoint": { "enum": ["forbidden", "profile-only"] },
+        "requireFreshBackupBeforeMutation": { "type": "boolean" },
+        "destructiveOperations": { "const": "interactive-only" },
+        "dataDestructiveCoolingOff": { "$ref": "#/$defs/duration" },
+        "planValidity": { "$ref": "#/$defs/duration" },
+        "costCeilingUSDPerMonth": { "$ref": "#/$defs/nonNegativeNumber" },
+        "enforceCostCeiling": { "type": "boolean" },
+        "maxPauseHours": { "$ref": "#/$defs/positiveInteger" },
+        "overrides": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["acknowledged"],
+          "properties": { "acknowledged": { "type": "boolean" } }
+        },
+        "rpoMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "regionalDisasterRpoMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "rtoMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "retention": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dailyDays", "weeklyWeeks", "monthlyMonths"],
+          "properties": {
+            "dailyDays": { "$ref": "#/$defs/positiveInteger" },
+            "weeklyWeeks": { "$ref": "#/$defs/positiveInteger" },
+            "monthlyMonths": { "$ref": "#/$defs/positiveInteger" }
+          }
+        },
+        "residency": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "$ref": "#/$defs/region" }
+        }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stateBucket", "auditBucket", "lockLeaseSeconds"],
+      "properties": {
+        "stateBucket": { "$ref": "#/$defs/bucketName" },
+        "auditBucket": { "$ref": "#/$defs/bucketName" },
+        "lockLeaseSeconds": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "reconciler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "schedulerJob", "runJob", "serviceAccount", "imageDigest"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "schedulerJob": { "$ref": "#/$defs/gcpName" },
+        "runJob": { "$ref": "#/$defs/gcpName" },
+        "serviceAccount": { "$ref": "#/$defs/serviceAccount" },
+        "imageDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "testIsolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namePrefix", "labels", "operatorServiceAccount", "destructiveServiceAccount",
+        "network", "ciPrincipal", "caps", "monitoringTests"
+      ],
+      "properties": {
+        "namePrefix": { "const": "ctrldb-test-" },
+        "labels": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["managed-by", "environment", "purpose"],
+          "properties": {
+            "managed-by": { "const": "ctrldb" },
+            "environment": { "const": "disposable" },
+            "purpose": { "const": "test" }
+          }
+        },
+        "operatorServiceAccount": { "$ref": "#/$defs/serviceAccount" },
+        "destructiveServiceAccount": { "$ref": "#/$defs/serviceAccount" },
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vpc", "subnet", "cidr", "nat"],
+          "properties": {
+            "vpc": { "const": "ctrldb-test-vpc" },
+            "subnet": { "type": "string", "pattern": "^ctrldb-test-[a-z0-9-]+$" },
+            "cidr": { "$ref": "#/$defs/cidr" },
+            "nat": { "const": "ctrldb-test-nat" }
+          }
+        },
+        "ciPrincipal": { "$ref": "#/$defs/nonEmptyString" },
+        "caps": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["maxMachineType", "maxDiskGiB", "maxInstances", "maxLifetime", "maxEstimatedUSDPerRun"],
+          "properties": {
+            "maxMachineType": { "$ref": "#/$defs/machineType" },
+            "maxDiskGiB": { "$ref": "#/$defs/positiveInteger" },
+            "maxInstances": { "$ref": "#/$defs/positiveInteger" },
+            "maxLifetime": { "$ref": "#/$defs/duration" },
+            "maxEstimatedUSDPerRun": { "$ref": "#/$defs/nonNegativeNumber" }
+          }
+        },
+        "monitoringTests": { "const": "manual-only" }
+      }
+    },
+    "migration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method", "maxFullCopyGiB", "exportHost", "inventoryMaxAgeDays", "rehearsalMaxAgeDays",
+        "exportTimeoutMinutes", "importTimeoutMinutes", "importParallel", "reverseImportParallel",
+        "archiveBucket", "safetyWindowDays", "sourceRunningDays", "state"
+      ],
+      "properties": {
+        "method": { "enum": ["full-copy", "live-sync"] },
+        "maxFullCopyGiB": { "$ref": "#/$defs/positiveInteger" },
+        "exportHost": { "enum": ["target", "workstation"] },
+        "inventoryMaxAgeDays": { "$ref": "#/$defs/positiveInteger" },
+        "rehearsalMaxAgeDays": { "$ref": "#/$defs/positiveInteger" },
+        "exportTimeoutMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "importTimeoutMinutes": { "$ref": "#/$defs/positiveInteger" },
+        "importParallel": { "$ref": "#/$defs/positiveInteger" },
+        "reverseImportParallel": { "$ref": "#/$defs/positiveInteger" },
+        "archiveBucket": { "$ref": "#/$defs/bucketName" },
+        "safetyWindowDays": { "$ref": "#/$defs/positiveInteger" },
+        "sourceRunningDays": { "$ref": "#/$defs/nonNegativeInteger" },
+        "state": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/migrationState" }
+          ]
+        }
+      }
+    },
+    "migrationState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cutoverOpId", "cutoverAt", "sourcePausedAt", "revertedAt", "decommissionedAt"],
+      "properties": {
+        "cutoverOpId": { "$ref": "#/$defs/nonEmptyString" },
+        "cutoverAt": { "type": "string", "format": "date-time" },
+        "sourcePausedAt": { "$ref": "#/$defs/nullableDateTime" },
+        "revertedAt": { "$ref": "#/$defs/nullableDateTime" },
+        "decommissionedAt": { "$ref": "#/$defs/nullableDateTime" }
+      }
+    },
+    "docs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryPath"],
+      "properties": { "repositoryPath": { "$ref": "#/$defs/relativePath" } }
+    },
+    "dnsLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "gcpName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "machineType": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,62}$"
+    },
+    "region": {
+      "type": "string",
+      "pattern": "^[a-z]+-[a-z0-9]+[0-9]$"
+    },
+    "zone": {
+      "type": "string",
+      "pattern": "^[a-z]+-[a-z0-9]+[0-9]-[a-z]$"
+    },
+    "serviceAccount": {
+      "type": "string",
+      "format": "email",
+      "pattern": "^[^@\\s]+@[^@\\s]+\\.iam\\.gserviceaccount\\.com$"
+    },
+    "secretRef": {
+      "type": "string",
+      "pattern": "^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/secrets/[A-Za-z0-9_-]+$"
+    },
+    "bucketName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 63,
+      "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[0-9]+(?:s|m|h|d)$"
+    },
+    "clockTime": {
+      "type": "string",
+      "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"
+    },
+    "timezone": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "cidr": {
+      "type": "string",
+      "pattern": "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^\\./[^\\x00]+$",
+      "maxLength": 512
+    },
+    "expiry": {
+      "oneOf": [
+        { "const": "never" },
+        { "type": "string", "format": "date-time" }
+      ]
+    },
+    "nullableDateTime": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "string", "format": "date-time" }
+      ]
+    },
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "nonNegativeNumber": { "type": "number", "minimum": 0 },
+    "nonEmptyString": { "type": "string", "minLength": 1, "maxLength": 1024 }
+  }
+}

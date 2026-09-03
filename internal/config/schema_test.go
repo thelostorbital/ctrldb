@@ -160,8 +160,28 @@ func TestProductionRequiresImpersonatedMutation(t *testing.T) {
 	})
 
 	nestedMap(t, manifest, "spec", "gcp", "identity")["mutation"] = "impersonate"
+	nestedMap(t, manifest, "spec", "policy")["dataDestructiveCoolingOff"] = "10m"
 	if _, err := DecodeManifest(marshalManifest(t, manifest)); err != nil {
 		t.Fatalf("DecodeManifest(production impersonation) unexpected error: %v", err)
+	}
+}
+
+func TestDecodeManifestIncludesLocalPolicyValidation(t *testing.T) {
+	t.Parallel()
+
+	manifest := manifestFixtureMap(t)
+	nestedMap(t, manifest, "spec", "pbm", "verification", "network")["vpc"] = "other-vpc"
+	encoded := marshalManifest(t, manifest)
+
+	document, err := DecodeManifestEnvelope(encoded)
+	if err != nil {
+		t.Fatalf("DecodeManifestEnvelope() unexpected error: %v", err)
+	}
+	if err := ValidateManifestSchema(document); err != nil {
+		t.Fatalf("ValidateManifestSchema() unexpected error: %v", err)
+	}
+	if _, err := DecodeManifest(encoded); !errors.Is(err, ErrManifestPolicyViolation) {
+		t.Fatalf("DecodeManifest() error = %v; want ErrManifestPolicyViolation", err)
 	}
 }
 

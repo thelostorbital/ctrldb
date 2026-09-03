@@ -64,7 +64,10 @@ func ValidateManifestPolicy(document ManifestDocument) error {
 	if err := ValidateManifestSchema(document); err != nil {
 		return err
 	}
+	return validateManifestPolicy(document)
+}
 
+func validateManifestPolicy(document ManifestDocument) error {
 	var manifest manifestPolicyWire
 	if err := json.Unmarshal(document.JSON(), &manifest); err != nil {
 		return ErrManifestPolicyUnavailable

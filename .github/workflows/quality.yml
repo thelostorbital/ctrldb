@@ -31,7 +31,13 @@ jobs:
         uses: qltysh/qlty-action/install@782ebe01413b63470fe8c3d481de77cef79e1486 # v2.1.0
 
       - name: Run tests
-        run: go test ./...
+        shell: bash
+        run: |
+          if find . -type f -name '*.go' -print -quit | grep -q .; then
+            go test ./...
+          else
+            echo "No Go packages yet; skipping tests."
+          fi
 
       - name: Run quality and security checks
         run: qlty check --all --no-fix --level=low --fail-level=low

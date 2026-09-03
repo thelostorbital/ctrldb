@@ -49,6 +49,11 @@ func TestFindArchitectureViolations(t *testing.T) {
 			want:   1,
 		},
 		{
+			name:   "CGI import",
+			source: "package fixture\nimport _ \"net/http/cgi\"\n",
+			want:   1,
+		},
+		{
 			name:   "cgo import",
 			source: "package fixture\nimport \"C\"\n",
 			want:   1,
@@ -183,6 +188,7 @@ func TestScanIncludesImportableSpecialDirectories(t *testing.T) {
 		"testdata/process/forbidden.go":  "package process\nimport _ \"os/exec\"\n",
 		"generated/process/forbidden.go": "package process\nimport _ \"syscall\"\n",
 		"assembly/launch_amd64.s":        "TEXT ·launch(SB),$0-0\nRET\n",
+		"native/launch_linux_amd64.syso": "native object fixture\n",
 	}
 	for name, contents := range files {
 		path := filepath.Join(root, name)

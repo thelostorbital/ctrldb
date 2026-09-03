@@ -34,6 +34,7 @@ type sourcePolicy struct {
 
 var forbiddenProcessImports = map[string]string{
 	"C":                        "cgo is forbidden until an exact validated native boundary is introduced",
+	"net/http/cgi":             "net/http/cgi is forbidden because it launches executables outside the validated runner adapter",
 	"os/exec":                  "os/exec is forbidden until an exact validated adapter boundary is introduced",
 	"syscall":                  "low-level process packages are forbidden; use the validated runner adapter",
 	"golang.org/x/sys/execabs": "low-level process packages are forbidden; use the validated runner adapter",
@@ -72,12 +73,16 @@ func scan(root string) ([]finding, error) {
 			return nil
 		}
 		extension := filepath.Ext(path)
-		if extension == ".s" {
+		if extension == ".s" || extension == ".syso" {
+			message := "Go assembly is forbidden until an exact validated native boundary is introduced"
+			if extension == ".syso" {
+				message = "precompiled native object files are forbidden until an exact validated native boundary is introduced"
+			}
 			findings = append(findings, finding{
 				filename: path,
 				line:     1,
 				column:   1,
-				message:  "Go assembly is forbidden until an exact validated native boundary is introduced",
+				message:  message,
 			})
 			return nil
 		}

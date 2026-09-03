@@ -71,7 +71,17 @@ func scan(root string) ([]finding, error) {
 			}
 			return nil
 		}
-		if filepath.Ext(path) != ".go" {
+		extension := filepath.Ext(path)
+		if extension == ".s" {
+			findings = append(findings, finding{
+				filename: path,
+				line:     1,
+				column:   1,
+				message:  "Go assembly is forbidden until an exact validated native boundary is introduced",
+			})
+			return nil
+		}
+		if extension != ".go" {
 			return nil
 		}
 
@@ -144,7 +154,7 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 			return nil, fmt.Errorf("decode import in %s: %w", filename, err)
 		}
 		var messages []string
-		if message, forbidden := forbiddenProcessImports[importPath]; forbidden {
+		if message, forbidden := forbiddenProcessImportMessage(importPath); forbidden {
 			messages = append(messages, message)
 		}
 		if isBubbleTeaImport(importPath) && !policy.allowBubbleTeaImport {
@@ -206,7 +216,7 @@ func policyForSource(relativePath string) sourcePolicy {
 
 	for _, directory := range strings.Split(filepath.ToSlash(filepath.Dir(relativePath)), "/") {
 		switch directory {
-		case "test", "tests", "testutil", "testutils", "fake", "fakes":
+		case "test", "tests", "testutil", "testutils", "fake", "fakes", "mock", "mocks", "gomock":
 			policy.allowTestInfrastructure = true
 			return policy
 		}
@@ -233,9 +243,20 @@ func isBubbleTeaImport(importPath string) bool {
 func isTestInfrastructureImport(importPath string) bool {
 	for _, component := range strings.Split(importPath, "/") {
 		switch component {
-		case "test", "tests", "testing", "httptest", "testutil", "testutils", "fake", "fakes":
+		case "test", "tests", "testing", "httptest", "testutil", "testutils", "fake", "fakes", "mock", "mocks", "gomock":
 			return true
 		}
 	}
 	return false
+}
+
+func forbiddenProcessImportMessage(importPath string) (string, bool) {
+	if message, forbidden := forbiddenProcessImports[importPath]; forbidden {
+		return message, true
+	}
+	if strings.HasPrefix(importPath, "golang.org/x/sys/unix/") ||
+		strings.HasPrefix(importPath, "golang.org/x/sys/windows/") {
+		return "low-level process packages are forbidden; use the validated runner adapter", true
+	}
+	return "", false
 }

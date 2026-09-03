@@ -84,6 +84,11 @@ func TestFindArchitectureViolations(t *testing.T) {
 			want:   1,
 		},
 		{
+			name:   "windows process subpackage",
+			source: "package fixture\nimport _ \"golang.org/x/sys/windows/svc/mgr\"\n",
+			want:   1,
+		},
+		{
 			name: "linkname directive",
 			source: `package fixture
 import _ "unsafe"
@@ -136,6 +141,11 @@ func useLocalProcessAPI() {
 			want:   1,
 		},
 		{
+			name:   "mock infrastructure in production",
+			source: "package fixture\nimport _ \"github.com/stretchr/testify/mock\"\n",
+			want:   1,
+		},
+		{
 			name:     "test infrastructure in test",
 			filename: "internal/example/fixture_test.go",
 			source:   "package fixture\nimport _ \"net/http/httptest\"\n",
@@ -172,6 +182,7 @@ func TestScanIncludesImportableSpecialDirectories(t *testing.T) {
 	files := map[string]string{
 		"testdata/process/forbidden.go":  "package process\nimport _ \"os/exec\"\n",
 		"generated/process/forbidden.go": "package process\nimport _ \"syscall\"\n",
+		"assembly/launch_amd64.s":        "TEXT ·launch(SB),$0-0\nRET\n",
 	}
 	for name, contents := range files {
 		path := filepath.Join(root, name)

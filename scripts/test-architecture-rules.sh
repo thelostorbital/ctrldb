@@ -116,6 +116,8 @@ assert_rejected "$fixture_source_dir/testing-import.go.txt" "$architecture_fixtu
 assert_rejected "$fixture_source_dir/raw-testing-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/httptest-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/raw-httptest-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/mock-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/raw-mock-import.go.txt" "$architecture_fixture" no-production-test-imports
 assert_rejected "$fixture_source_dir/escaped-os-exec-import.go.txt" "$architecture_fixture" no-escaped-import-paths
 assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$generated_fixture" bubble-tea-import-boundary
 assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$generated_fixture" no-production-test-imports

@@ -24,8 +24,9 @@ var (
 	ErrInvalidManifestEnvelope = errors.New("invalid manifest envelope")
 )
 
-// ManifestDocument is a syntax-checked manifest envelope. Full schema and
-// policy validation are separate boundaries and must run before planning.
+// ManifestDocument is a syntax-checked manifest envelope. DecodeManifest
+// returns a document that has also passed every local validation boundary;
+// lower-level tooling must complete schema and policy validation explicitly.
 type ManifestDocument struct {
 	identity       ManifestIdentity
 	normalizedJSON []byte
@@ -76,7 +77,8 @@ func (err *ManifestDecodeError) Column() int {
 // DecodeManifestEnvelope decodes exactly one YAML or JSON document, rejects
 // duplicate and unknown envelope fields, validates its identity, resolves YAML
 // aliases, and rejects credential-shaped values. It does not perform full JSON
-// Schema or policy validation.
+// Schema or policy validation. It is intended for migration and schema
+// tooling, never as the planning or mutation entry point.
 func DecodeManifestEnvelope(input []byte) (ManifestDocument, error) {
 	var wire manifestEnvelopeWire
 	decoder := yaml.NewDecoder(bytes.NewReader(input), yaml.Strict())

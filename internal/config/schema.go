@@ -72,13 +72,17 @@ func (err *ManifestSchemaError) Violations() []SchemaViolation {
 }
 
 // DecodeManifest performs safe envelope decoding followed by full structural
-// JSON Schema validation. Policy validation is a later boundary.
+// JSON Schema and resource-independent policy validation. Callers planning or
+// applying changes should use this complete local boundary.
 func DecodeManifest(input []byte) (ManifestDocument, error) {
 	document, err := DecodeManifestEnvelope(input)
 	if err != nil {
 		return ManifestDocument{}, err
 	}
 	if err := ValidateManifestSchema(document); err != nil {
+		return ManifestDocument{}, err
+	}
+	if err := validateManifestPolicy(document); err != nil {
 		return ManifestDocument{}, err
 	}
 	return document, nil

@@ -338,9 +338,12 @@ func TestValidateManifestPolicyRejectsStructurallyInvalidManifest(t *testing.T) 
 func decodePolicyManifest(t *testing.T, manifest map[string]any) ManifestDocument {
 	t.Helper()
 
-	document, err := DecodeManifest(marshalManifest(t, manifest))
+	document, err := DecodeManifestEnvelope(marshalManifest(t, manifest))
 	if err != nil {
-		t.Fatalf("DecodeManifest() unexpected error: %v", err)
+		t.Fatalf("DecodeManifestEnvelope() unexpected error: %v", err)
+	}
+	if err := ValidateManifestSchema(document); err != nil {
+		t.Fatalf("ValidateManifestSchema() unexpected error: %v", err)
 	}
 	return document
 }

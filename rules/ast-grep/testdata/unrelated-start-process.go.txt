@@ -1,9 +1,0 @@
-package fixture
-
-type processController struct{}
-
-func (processController) StartProcess() {}
-
-func allowed(controller processController) {
-	controller.StartProcess()
-}

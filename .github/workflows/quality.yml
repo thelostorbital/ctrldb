@@ -46,6 +46,9 @@ jobs:
           go test ./...
           go test -race ./...
 
+      - name: Enforce type-aware architecture boundaries
+        run: go run ./internal/archcheck
+
       - name: Run quality and security checks
         run: qlty check --all --no-fix --level=low --fail-level=low
 

@@ -29,6 +29,7 @@ security scanning, and maintainability checks.
 qlty fmt --all
 qlty check --all --no-fix --level=low --fail-level=low
 go test ./...
+go run ./internal/archcheck
 ```
 
 ## License

@@ -104,7 +104,6 @@ if [[ ! -d $test_helper_fixture_dir ]]; then
 fi
 
 assert_accepted "$fixture_source_dir/allowed.go.txt" "$architecture_fixture"
-assert_accepted "$fixture_source_dir/unrelated-start-process.go.txt" "$architecture_fixture"
 assert_accepted "$fixture_source_dir/test-infrastructure-import.go.txt" "$test_helper_fixture"
 
 assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
@@ -117,12 +116,6 @@ assert_rejected "$fixture_source_dir/raw-os-exec-import.go.txt" "$architecture_f
 assert_rejected "$fixture_source_dir/os-exec-import.go.txt" "$root_fixture" os-exec-import-boundary
 assert_rejected "$fixture_source_dir/os-exec-import.go.txt" "$adapter_fixture" os-exec-import-boundary
 assert_rejected "$fixture_source_dir/escaped-os-exec-import.go.txt" "$architecture_fixture" no-escaped-import-paths
-assert_rejected "$fixture_source_dir/os-start-process.go.txt" "$architecture_fixture" no-os-start-process
-assert_rejected "$fixture_source_dir/indirect-os-start-process.go.txt" "$architecture_fixture" no-os-start-process
-assert_rejected "$fixture_source_dir/aliased-os-start-process.go.txt" "$architecture_fixture" no-os-start-process
-assert_rejected "$fixture_source_dir/indirect-aliased-os-start-process.go.txt" "$architecture_fixture" no-os-start-process
-assert_rejected "$fixture_source_dir/raw-aliased-os-start-process.go.txt" "$architecture_fixture" no-os-start-process
-assert_rejected "$fixture_source_dir/indirect-raw-aliased-os-start-process.go.txt" "$architecture_fixture" no-os-start-process
 assert_rejected "$fixture_source_dir/aliased-syscall-import.go.txt" "$architecture_fixture" no-low-level-process-imports
 assert_rejected "$fixture_source_dir/raw-aliased-syscall-import.go.txt" "$architecture_fixture" no-low-level-process-imports
 assert_rejected "$fixture_source_dir/aliased-unix-import.go.txt" "$architecture_fixture" no-low-level-process-imports

@@ -1,5 +1,0 @@
-package fixture
-
-import system `os`
-
-var start = system.StartProcess

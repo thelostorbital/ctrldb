@@ -1,0 +1,5 @@
+package fixture
+
+import ux "golang.org/x/sys/unix"
+
+var _ = ux.Getpid

@@ -1,74 +1,117 @@
 #!/usr/bin/env bash
 
+# Copyright 2026 CtrlBoard.dev
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-fixture_dir="$repo_root/internal/architecture_rule_fixture"
-fixture_file="$fixture_dir/violations.go"
-allowed_fixture="$repo_root/rules/ast-grep/testdata/allowed.go.txt"
-violation_fixture="$repo_root/rules/ast-grep/testdata/violations.go.txt"
+fixture_source_dir="$repo_root/rules/ast-grep/testdata"
+architecture_fixture_dir="$repo_root/internal/architecture_rule_fixture"
+architecture_fixture="$architecture_fixture_dir/fixture.go"
+adapter_fixture_dir="$repo_root/internal/gcp"
+adapter_fixture="$adapter_fixture_dir/architecture_rule_fixture.go"
 qlty_bin="${QLTY_BIN:-qlty}"
+architecture_fixture_dir_created=false
+adapter_fixture_dir_created=false
 
 cleanup() {
-  rm -f "$fixture_file"
-  rmdir "$fixture_dir" 2>/dev/null || true
+  rm -f "$architecture_fixture" "$adapter_fixture"
+  if [[ $architecture_fixture_dir_created == true ]]; then
+    rmdir "$architecture_fixture_dir" 2>/dev/null || true
+  fi
+  if [[ $adapter_fixture_dir_created == true ]]; then
+    rmdir "$adapter_fixture_dir" 2>/dev/null || true
+  fi
 }
-trap cleanup EXIT
 
-if [[ -e $fixture_file ]]; then
-  echo "refusing to overwrite existing architecture rule fixture" >&2
-  exit 1
-fi
-
-mkdir -p "$fixture_dir"
-cp "$allowed_fixture" "$fixture_file"
-
-if ! QLTY_TELEMETRY=off "$qlty_bin" check \
-  --no-fix \
-  --no-cache \
-  --filter=ast-grep \
-  --level=low \
-  --fail-level=low \
-  "$fixture_file"; then
-  echo "architecture rules rejected safe non-import string literals" >&2
-  exit 1
-fi
-
-cp "$violation_fixture" "$fixture_file"
-
-set +e
-output=$(
+run_qlty() {
   QLTY_TELEMETRY=off "$qlty_bin" check \
     --no-fix \
     --no-cache \
     --filter=ast-grep \
     --level=low \
     --fail-level=low \
-    "$fixture_file" 2>&1
-)
-exit_code=$?
-set -e
+    "$1"
+}
 
-printf '%s\n' "$output"
+assert_accepted() {
+  local source_file=$1
+  local target_file=$2
 
-if [[ $exit_code -eq 0 ]]; then
-  echo "architecture rules accepted the violation fixture" >&2
-  exit 1
-fi
+  cp "$source_file" "$target_file"
+  if ! run_qlty "$target_file"; then
+    echo "architecture rules rejected safe fixture: $source_file" >&2
+    exit 1
+  fi
+  rm -f "$target_file"
+}
 
-expected_rules=(
-  bubble-tea-import-boundary
-  no-production-test-imports
-  no-raw-process-apis
-  no-shell-launchers
-  os-exec-import-boundary
-)
+assert_rejected() {
+  local source_file=$1
+  local target_file=$2
+  local expected_rule=$3
 
-for rule_id in "${expected_rules[@]}"; do
-  if ! grep -Fq "$rule_id" <<<"$output"; then
-    echo "architecture rule did not report: $rule_id" >&2
+  cp "$source_file" "$target_file"
+
+  set +e
+  output=$(run_qlty "$target_file" 2>&1)
+  exit_code=$?
+  set -e
+
+  rm -f "$target_file"
+
+  if [[ $exit_code -eq 0 ]]; then
+    echo "architecture rules accepted forbidden fixture: $source_file" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$expected_rule" <<<"$output"; then
+    printf '%s\n' "$output" >&2
+    echo "architecture rule did not report $expected_rule for $source_file" >&2
+    exit 1
+  fi
+
+  echo "verified $expected_rule rejects $(basename "$source_file")"
+}
+
+for target_file in "$architecture_fixture" "$adapter_fixture"; do
+  if [[ -e $target_file ]]; then
+    echo "refusing to overwrite existing architecture rule fixture: $target_file" >&2
     exit 1
   fi
 done
 
-echo "all architecture rules rejected their fixture violations"
+trap cleanup EXIT
+
+if [[ ! -d $architecture_fixture_dir ]]; then
+  mkdir "$architecture_fixture_dir"
+  architecture_fixture_dir_created=true
+fi
+if [[ ! -d $adapter_fixture_dir ]]; then
+  mkdir "$adapter_fixture_dir"
+  adapter_fixture_dir_created=true
+fi
+
+assert_accepted "$fixture_source_dir/allowed.go.txt" "$architecture_fixture"
+
+assert_rejected "$fixture_source_dir/bubble-tea-import.go.txt" "$architecture_fixture" bubble-tea-import-boundary
+assert_rejected "$fixture_source_dir/test-infrastructure-import.go.txt" "$architecture_fixture" no-production-test-imports
+assert_rejected "$fixture_source_dir/os-exec-import.go.txt" "$architecture_fixture" os-exec-import-boundary
+
+assert_rejected "$fixture_source_dir/shell-command-short.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-command-absolute-raw.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-command-windows.go.txt" "$adapter_fixture" no-shell-launchers
+assert_rejected "$fixture_source_dir/shell-command-context.go.txt" "$adapter_fixture" no-shell-launchers
+
+assert_rejected "$fixture_source_dir/os-start-process.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/syscall-exec.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/syscall-fork-exec.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/unix-exec.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/unix-fork-exec.go.txt" "$architecture_fixture" no-raw-process-apis
+assert_rejected "$fixture_source_dir/windows-create-process.go.txt" "$architecture_fixture" no-raw-process-apis
+
+assert_rejected "$fixture_source_dir/aliased-syscall-import.go.txt" "$architecture_fixture" no-low-level-process-imports
+assert_rejected "$fixture_source_dir/aliased-unix-import.go.txt" "$architecture_fixture" no-low-level-process-imports
+assert_rejected "$fixture_source_dir/aliased-windows-import.go.txt" "$architecture_fixture" no-low-level-process-imports
+
+echo "all architecture rule acceptance and rejection cases passed"

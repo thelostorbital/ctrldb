@@ -1,0 +1,13 @@
+id: no-low-level-process-imports
+language: Go
+severity: warning
+message: Low-level process packages are forbidden; use the validated runner adapter.
+files:
+  - cmd/**/*.go
+  - internal/**/*.go
+rule:
+  all:
+    - kind: interpreted_string_literal
+    - regex: ^"(syscall|golang\.org/x/sys/(unix|windows))"$
+    - inside:
+        kind: import_spec

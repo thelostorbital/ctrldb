@@ -1,0 +1,8 @@
+package gcp
+
+import (
+	"context"
+	"os/exec"
+)
+
+var _ = exec.CommandContext(context.Background(), "/usr/bin/zsh", "-c", "echo unsafe")

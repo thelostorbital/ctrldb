@@ -1,0 +1,5 @@
+package fixture
+
+import "golang.org/x/sys/unix"
+
+var _ = unix.Exec("tool", nil, nil)

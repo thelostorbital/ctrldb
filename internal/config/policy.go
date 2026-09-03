@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,6 +73,8 @@ func ValidateManifestPolicy(document ManifestDocument) error {
 	violations := make([]ManifestPolicyViolation, 0)
 	validateClassPolicy(manifest, &violations)
 	validateResidencyPolicy(manifest, &violations)
+	validateVerificationNetworkPolicy(manifest, &violations)
+	validateProtectionIdentityPolicy(manifest, &violations)
 	if len(violations) == 0 {
 		return nil
 	}
@@ -92,11 +95,15 @@ type manifestPolicyWire struct {
 	} `json:"metadata"`
 	Spec struct {
 		GCP struct {
-			Region string `json:"region"`
-			Zone   string `json:"zone"`
+			Project string `json:"project"`
+			Region  string `json:"region"`
+			Zone    string `json:"zone"`
+			Network string `json:"network"`
 		} `json:"gcp"`
 		Host struct {
-			Members []struct {
+			NetworkTag     string `json:"networkTag"`
+			ServiceAccount string `json:"serviceAccount"`
+			Members        []struct {
 				Zone string `json:"zone"`
 			} `json:"members"`
 			DataDisk struct {
@@ -115,9 +122,24 @@ type manifestPolicyWire struct {
 		} `json:"topology"`
 		PBM struct {
 			Replication struct {
-				Regions []string `json:"regions"`
+				Regions                []string `json:"regions"`
+				TransferServiceAccount string   `json:"transferServiceAccount"`
 			} `json:"replication"`
+			Verification struct {
+				Network struct {
+					VPC  string `json:"vpc"`
+					CIDR string `json:"cidr"`
+					Tag  string `json:"tag"`
+				} `json:"network"`
+			} `json:"verification"`
 		} `json:"pbm"`
+		Access struct {
+			Profiles []struct {
+				Sources []struct {
+					Value string `json:"value"`
+				} `json:"sources"`
+			} `json:"profiles"`
+		} `json:"access"`
 		Policy struct {
 			DataDestructiveCoolingOff string `json:"dataDestructiveCoolingOff"`
 			PlanValidity              string `json:"planValidity"`
@@ -126,6 +148,11 @@ type manifestPolicyWire struct {
 			} `json:"overrides"`
 			Residency []string `json:"residency"`
 		} `json:"policy"`
+		TestIsolation *struct {
+			Network struct {
+				CIDR string `json:"cidr"`
+			} `json:"network"`
+		} `json:"testIsolation"`
 	} `json:"spec"`
 }
 
@@ -188,6 +215,92 @@ func validateResidencyPolicy(manifest manifestPolicyWire, violations *[]Manifest
 	for index, region := range manifest.Spec.PBM.Replication.Regions {
 		requireRegion(allowed, region, indexedPath("/spec/pbm/replication/regions", index, ""), violations)
 	}
+}
+
+func validateVerificationNetworkPolicy(manifest manifestPolicyWire, violations *[]ManifestPolicyViolation) {
+	network := manifest.Spec.PBM.Verification.Network
+	if network.VPC != manifest.Spec.GCP.Network {
+		*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-16", Path: "/spec/pbm/verification/network/vpc"})
+	}
+	if network.Tag == manifest.Spec.Host.NetworkTag {
+		*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-16", Path: "/spec/pbm/verification/network/tag"})
+	}
+	for profileIndex, profile := range manifest.Spec.Access.Profiles {
+		for sourceIndex, source := range profile.Sources {
+			if source.Value == network.Tag {
+				path := indexedPath("/spec/access/profiles", profileIndex, "sources") + "/" + strconv.Itoa(sourceIndex) + "/value"
+				*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-16", Path: path})
+			}
+		}
+	}
+
+	verificationCIDR, ok := canonicalPrivateIPv4Prefix(network.CIDR)
+	if !ok {
+		*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-16", Path: "/spec/pbm/verification/network/cidr"})
+	}
+	if manifest.Spec.TestIsolation == nil {
+		return
+	}
+	testPath := "/spec/testIsolation/network/cidr"
+	testCIDR, testOK := canonicalPrivateIPv4Prefix(manifest.Spec.TestIsolation.Network.CIDR)
+	if !testOK {
+		*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-16", Path: testPath})
+	}
+	if ok && testOK && prefixesOverlap(verificationCIDR, testCIDR) {
+		*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-16", Path: testPath})
+	}
+}
+
+func validateProtectionIdentityPolicy(manifest manifestPolicyWire, violations *[]ManifestPolicyViolation) {
+	const hostPath = "/spec/host/serviceAccount"
+	const transferPath = "/spec/pbm/replication/transferServiceAccount"
+
+	hostAccount := manifest.Spec.Host.ServiceAccount
+	transferAccount := manifest.Spec.PBM.Replication.TransferServiceAccount
+	if !serviceAccountBelongsToProject(hostAccount, manifest.Spec.GCP.Project) {
+		*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-20", Path: hostPath})
+	}
+	if !serviceAccountBelongsToProject(transferAccount, manifest.Spec.GCP.Project) {
+		*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-20", Path: transferPath})
+	}
+	if hostAccount == transferAccount {
+		*violations = append(*violations, ManifestPolicyViolation{Rule: "CFG-20", Path: transferPath})
+	}
+}
+
+func canonicalPrivateIPv4Prefix(value string) (netip.Prefix, bool) {
+	prefix, err := netip.ParsePrefix(value)
+	if err != nil || !prefix.Addr().Is4() || prefix != prefix.Masked() {
+		return netip.Prefix{}, false
+	}
+	privateRanges := [...]netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("192.168.0.0/16"),
+	}
+	for _, privateRange := range privateRanges {
+		if prefix.Bits() >= privateRange.Bits() && privateRange.Contains(prefix.Addr()) {
+			return prefix, true
+		}
+	}
+	return netip.Prefix{}, false
+}
+
+func prefixesOverlap(first, second netip.Prefix) bool {
+	return first.Contains(second.Addr()) || second.Contains(first.Addr())
+}
+
+func serviceAccountBelongsToProject(account, project string) bool {
+	const suffix = ".iam.gserviceaccount.com"
+	at := strings.LastIndexByte(account, '@')
+	if at < 1 {
+		return false
+	}
+	domain := account[at+1:]
+	if !strings.HasSuffix(domain, suffix) {
+		return false
+	}
+	return strings.TrimSuffix(domain, suffix) == project
 }
 
 func requireRegion(allowed map[string]struct{}, region, path string, violations *[]ManifestPolicyViolation) {

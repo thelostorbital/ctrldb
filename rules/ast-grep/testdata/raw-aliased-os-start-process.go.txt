@@ -1,0 +1,5 @@
+package fixture
+
+import system `os`
+
+var _, _ = system.StartProcess("tool", nil, nil)

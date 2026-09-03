@@ -7,6 +7,6 @@ files:
 rule:
   all:
     - kind: interpreted_string_literal
-    - regex: '^"[^"\\]*\\[^"\\]*"$'
+    - regex: '^".*\\.*"$'
     - inside:
         kind: import_spec

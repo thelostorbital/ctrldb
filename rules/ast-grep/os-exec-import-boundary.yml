@@ -1,13 +1,9 @@
 id: os-exec-import-boundary
 language: Go
 severity: warning
-message: os/exec is restricted to internal/gcp, internal/remote, and internal/hostagent.
+message: os/exec is forbidden until an exact validated adapter boundary is introduced.
 files:
   - "**/*.go"
-ignores:
-  - internal/gcp/**/*.go
-  - internal/remote/**/*.go
-  - internal/hostagent/**/*.go
 rule:
   any:
     - all:

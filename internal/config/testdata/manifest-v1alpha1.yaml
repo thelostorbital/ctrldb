@@ -314,13 +314,13 @@ spec:
     publicDatabaseEndpoint: forbidden
     requireFreshBackupBeforeMutation: true
     destructiveOperations: interactive-only
-    dataDestructiveCoolingOff: 24h
+    dataDestructiveCoolingOff: 5m
     planValidity: 1h
     costCeilingUSDPerMonth: 300
     enforceCostCeiling: true
     maxPauseHours: 8
     overrides:
-      acknowledged: true
+      acknowledged: false
     rpoMinutes: 15
     regionalDisasterRpoMinutes: 60
     rtoMinutes: 60

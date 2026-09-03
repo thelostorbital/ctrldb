@@ -30,6 +30,7 @@ const (
 	OperationCompleteWithFailedVerification OperationState = "COMPLETE_WITH_FAILED_VERIFICATION"
 	OperationCompleteWithDocumentationError OperationState = "COMPLETE_WITH_DOCUMENTATION_ERROR"
 	OperationVerifiedRollback               OperationState = "VERIFIED_ROLLBACK"
+	OperationCancelled                      OperationState = "CANCELLED"
 	OperationFailed                         OperationState = "FAILED"
 	OperationFailedCleanup                  OperationState = "FAILED_CLEANUP"
 )
@@ -50,6 +51,7 @@ var operationStates = [...]OperationState{
 	OperationCompleteWithFailedVerification,
 	OperationCompleteWithDocumentationError,
 	OperationVerifiedRollback,
+	OperationCancelled,
 	OperationFailed,
 	OperationFailedCleanup,
 }
@@ -59,6 +61,7 @@ var terminalOperationStates = map[OperationState]struct{}{
 	OperationCompleteWithFailedVerification: {},
 	OperationCompleteWithDocumentationError: {},
 	OperationVerifiedRollback:               {},
+	OperationCancelled:                      {},
 	OperationFailed:                         {},
 	OperationFailedCleanup:                  {},
 }

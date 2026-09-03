@@ -17,25 +17,30 @@ var ErrInvalidTransition = errors.New("invalid operation transition")
 
 var transitions = map[domain.OperationState]map[domain.OperationState]struct{}{
 	domain.OperationDiscover: {
-		domain.OperationValidate: {},
-		domain.OperationFailed:   {},
+		domain.OperationValidate:  {},
+		domain.OperationCancelled: {},
+		domain.OperationFailed:    {},
 	},
 	domain.OperationValidate: {
-		domain.OperationPlan:   {},
-		domain.OperationFailed: {},
+		domain.OperationPlan:      {},
+		domain.OperationCancelled: {},
+		domain.OperationFailed:    {},
 	},
 	domain.OperationPlan: {
 		domain.OperationApprovedWaiting: {},
 		domain.OperationLock:            {},
+		domain.OperationCancelled:       {},
 		domain.OperationFailed:          {},
 	},
 	domain.OperationApprovedWaiting: {
-		domain.OperationLock: {},
+		domain.OperationLock:      {},
+		domain.OperationCancelled: {},
 	},
 	domain.OperationLock: {
-		domain.OperationProtect: {},
-		domain.OperationExecute: {},
-		domain.OperationFailed:  {},
+		domain.OperationProtect:   {},
+		domain.OperationExecute:   {},
+		domain.OperationCancelled: {},
+		domain.OperationFailed:    {},
 	},
 	domain.OperationProtect: {
 		domain.OperationExecute:  {},
@@ -65,6 +70,7 @@ var transitions = map[domain.OperationState]map[domain.OperationState]struct{}{
 	},
 	domain.OperationRollback: {
 		domain.OperationVerifiedRollback: {},
+		domain.OperationCancelled:        {},
 		domain.OperationFailedCleanup:    {},
 	},
 }

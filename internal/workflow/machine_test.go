@@ -84,6 +84,16 @@ func TestMachineFailureBranches(t *testing.T) {
 			path:  []domain.OperationState{domain.OperationFailedCleanup},
 		},
 		{
+			name:  "cancel after verified unwind",
+			start: domain.OperationRollback,
+			path:  []domain.OperationState{domain.OperationCancelled},
+		},
+		{
+			name:  "cancel before mutation",
+			start: domain.OperationLock,
+			path:  []domain.OperationState{domain.OperationCancelled},
+		},
+		{
 			name:  "failed verification",
 			start: domain.OperationVerify,
 			path:  []domain.OperationState{domain.OperationCompleteWithFailedVerification},
@@ -113,6 +123,7 @@ func TestTerminalStatesCannotTransition(t *testing.T) {
 		domain.OperationCompleteWithFailedVerification,
 		domain.OperationCompleteWithDocumentationError,
 		domain.OperationVerifiedRollback,
+		domain.OperationCancelled,
 		domain.OperationFailed,
 		domain.OperationFailedCleanup,
 	}

@@ -49,6 +49,9 @@ jobs:
       - name: Run quality and security checks
         run: qlty check --all --no-fix --level=low --fail-level=low
 
+      - name: Prove architecture rules reject violations
+        run: bash scripts/test-architecture-rules.sh
+
       - name: Report changed-code maintainability signals
         if: github.event_name == 'pull_request'
         continue-on-error: true

@@ -1,0 +1,27 @@
+id: no-raw-process-apis
+language: Go
+severity: warning
+message: Low-level process APIs are forbidden; use the validated runner adapter.
+files:
+  - cmd/**/*.go
+  - internal/**/*.go
+rule:
+  any:
+    - pattern:
+        context: func f() { $PKG.StartProcess($$$ARGS) }
+        selector: call_expression
+    - pattern:
+        context: func f() { syscall.Exec($$$ARGS) }
+        selector: call_expression
+    - pattern:
+        context: func f() { syscall.ForkExec($$$ARGS) }
+        selector: call_expression
+    - pattern:
+        context: func f() { unix.Exec($$$ARGS) }
+        selector: call_expression
+    - pattern:
+        context: func f() { unix.ForkExec($$$ARGS) }
+        selector: call_expression
+    - pattern:
+        context: func f() { windows.CreateProcess($$$ARGS) }
+        selector: call_expression

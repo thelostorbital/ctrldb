@@ -1,6 +1,6 @@
 id: no-shell-launchers
 language: Go
-severity: error
+severity: warning
 message: Shell processes are forbidden; invoke programs with structured arguments.
 files:
   - cmd/**/*.go
@@ -15,4 +15,4 @@ rule:
         selector: call_expression
 constraints:
   SHELL:
-    regex: ^"(sh|bash|zsh|fish|cmd|cmd\.exe|powershell|pwsh)"$
+    regex: '(?i)^"([^"/\\]*[/\\])*(bash|cmd|cmd\.exe|csh|dash|env|fish|ksh|powershell|powershell\.exe|pwsh|sh|tcsh|zsh)"$'

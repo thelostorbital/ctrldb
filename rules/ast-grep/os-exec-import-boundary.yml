@@ -1,6 +1,6 @@
 id: os-exec-import-boundary
 language: Go
-severity: error
+severity: warning
 message: os/exec is restricted to internal/gcp, internal/remote, and internal/hostagent.
 files:
   - cmd/**/*.go
@@ -10,5 +10,8 @@ ignores:
   - internal/remote/**/*.go
   - internal/hostagent/**/*.go
 rule:
-  kind: interpreted_string_literal
-  regex: ^"os/exec"$
+  all:
+    - kind: interpreted_string_literal
+    - regex: ^"os/exec"$
+    - inside:
+        kind: import_spec

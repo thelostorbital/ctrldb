@@ -1,6 +1,6 @@
 id: no-production-test-imports
 language: Go
-severity: error
+severity: warning
 message: Production code must not import test-only or fake infrastructure.
 files:
   - cmd/**/*.go
@@ -8,5 +8,8 @@ files:
 ignores:
   - "**/*_test.go"
 rule:
-  kind: interpreted_string_literal
-  regex: ^"[^"]*/(test|tests|testutil|testutils|fake|fakes)(/[^"]*)?"$
+  all:
+    - kind: interpreted_string_literal
+    - regex: ^"[^"]*/(test|tests|testutil|testutils|fake|fakes)(/[^"]*)?"$
+    - inside:
+        kind: import_spec

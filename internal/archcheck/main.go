@@ -289,7 +289,8 @@ func forbiddenProcessImportMessage(importPath string) (string, bool) {
 	if message, forbidden := forbiddenProcessImports[importPath]; forbidden {
 		return message, true
 	}
-	if strings.HasPrefix(importPath, "golang.org/x/sys/unix/") ||
+	if strings.HasPrefix(importPath, "syscall/") ||
+		strings.HasPrefix(importPath, "golang.org/x/sys/unix/") ||
 		strings.HasPrefix(importPath, "golang.org/x/sys/windows/") ||
 		strings.HasPrefix(importPath, "golang.org/x/tools/go/packages/") {
 		return "low-level process packages are forbidden; use the validated runner adapter", true

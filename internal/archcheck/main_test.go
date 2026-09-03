@@ -99,6 +99,16 @@ func TestFindArchitectureViolations(t *testing.T) {
 			want:   1,
 		},
 		{
+			name: "syscall js import in WebAssembly source",
+			source: `//go:build js && wasm
+
+package fixture
+
+import _ "syscall/js"
+`,
+			want: 1,
+		},
+		{
 			name:   "execabs import",
 			source: "package fixture\nimport _ \"golang.org/x/sys/execabs\"\n",
 			want:   1,

@@ -1,0 +1,18 @@
+id: no-shell-launchers
+language: Go
+severity: error
+message: Shell processes are forbidden; invoke programs with structured arguments.
+files:
+  - cmd/**/*.go
+  - internal/**/*.go
+rule:
+  any:
+    - pattern:
+        context: func f() { $PKG.Command($SHELL, $$$ARGS) }
+        selector: call_expression
+    - pattern:
+        context: func f() { $PKG.CommandContext($CTX, $SHELL, $$$ARGS) }
+        selector: call_expression
+constraints:
+  SHELL:
+    regex: ^"(sh|bash|zsh|fish|cmd|cmd\.exe|powershell|pwsh)"$

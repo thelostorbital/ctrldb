@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  QLTY_TELEMETRY: "off"
+
 jobs:
   quality:
     name: Test and analyze
@@ -19,6 +26,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
@@ -30,14 +38,20 @@ jobs:
       - name: Install Qlty
         uses: qltysh/qlty-action/install@782ebe01413b63470fe8c3d481de77cef79e1486 # v2.1.0
 
+      - name: Verify module files are tidy
+        run: go mod tidy -diff
+
       - name: Run tests
-        shell: bash
         run: |
-          if find . -type f -name '*.go' -print -quit | grep -q .; then
-            go test ./...
-          else
-            echo "No Go packages yet; skipping tests."
-          fi
+          go test ./...
+          go test -race ./...
 
       - name: Run quality and security checks
         run: qlty check --all --no-fix --level=low --fail-level=low
+
+      - name: Report changed-code maintainability signals
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          QLTY_UPSTREAM: origin/${{ github.base_ref }}
+        run: qlty smells --upstream "$QLTY_UPSTREAM" --no-snippets

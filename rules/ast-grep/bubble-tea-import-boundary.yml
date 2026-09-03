@@ -1,0 +1,12 @@
+id: bubble-tea-import-boundary
+language: Go
+severity: error
+message: Bubble Tea is restricted to internal/tui.
+files:
+  - cmd/**/*.go
+  - internal/**/*.go
+ignores:
+  - internal/tui/**/*.go
+rule:
+  kind: interpreted_string_literal
+  regex: ^"charm\.land/bubbletea/v2"$

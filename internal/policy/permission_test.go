@@ -364,6 +364,53 @@ func TestExecutionGateBindsTrustedExposureRequirement(t *testing.T) {
 	), policy.BlockerContract)
 }
 
+func TestExecutionGateAcceptsTrustedPrivateAndTunnelTLSRequirements(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name           string
+		exposure       domain.ExposureDelta
+		profile        domain.ExposureProfile
+		source         domain.PlanExposureSource
+		authentication domain.ExposureAuthentication
+	}{
+		{
+			name: "private", exposure: domain.ExposurePrivate, profile: domain.ExposureProfileACC04,
+			source:         domain.PlanExposureSource{Kind: domain.ExposureSourcePrivateRange, Value: "10.20.0.0/16"},
+			authentication: domain.ExposureAuthVPN,
+		},
+		{
+			name: "tunnel", exposure: domain.ExposureTunnel, profile: domain.ExposureProfileACC03,
+			source:         domain.PlanExposureSource{Kind: domain.ExposureSourceIAP, Value: "35.235.240.0/20"},
+			authentication: domain.ExposureAuthIAP,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			plan := validPlan()
+			plan.ApprovalClass = domain.ApprovalSecuritySensitive
+			plan.Exposure = test.exposure
+			plan.ExposureControls = validExposureControls(plan)
+			plan.ExposureControls.Profile = test.profile
+			plan.ExposureControls.Sources = []domain.PlanExposureSource{test.source}
+			plan.ExposureControls.Authentication = test.authentication
+			plan.ExposureControls.TLS.Trust = domain.ExposureTrustPrivate
+			plan, err := policy.SealPlan(plan)
+			if err != nil {
+				t.Fatalf("SealPlan() returned an error: %v", err)
+			}
+			contract := executionContractForPlan(t, plan, domain.ApprovalSecuritySensitive, false, false)
+			checkedAt := plan.CreatedAt.Add(10 * time.Minute)
+			if err := policy.ValidatePlanForExecution(
+				plan, validExecutionEvidence(plan, checkedAt), contract,
+			); err != nil {
+				t.Fatalf("ValidatePlanForExecution() returned an error: %v", err)
+			}
+		})
+	}
+}
+
 func TestExecutionGateRevalidatesExposureLifetime(t *testing.T) {
 	t.Parallel()
 

@@ -441,6 +441,7 @@ func planMatchesExposureRequirement(
 		plan.ExposureControls.Profile != requirement.Profile ||
 		plan.ExposureControls.InternetWide != requirement.InternetWide ||
 		plan.ExposureControls.SimulationPreconditionID != requirement.SimulationPreconditionID ||
+		!validExposureTLS(requirement.Delta, plan.ExposureControls.TLS) ||
 		len(plan.ExposureControls.Targets) != len(expectedTargets) {
 		return false
 	}

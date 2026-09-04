@@ -88,7 +88,8 @@ func TestCancellationRoutesPreMutationDirectlyToCancelled(t *testing.T) {
 
 	var controller workflow.CancellationController
 	machine := machineAt(t, domain.OperationLock)
-	next, decision, err := controller.Request(machine, validCancellationRequest(), domain.ExecutionContract{}, nil)
+	request, contract, journal := preMutationCancellationContext(t, domain.OperationLock)
+	next, decision, err := controller.Request(machine, request, contract, journal)
 	if err != nil {
 		t.Fatalf("Request() returned an error: %v", err)
 	}
@@ -102,7 +103,8 @@ func TestMachineAppliesOnlyStateBoundCancellationDecisions(t *testing.T) {
 
 	var controller workflow.CancellationController
 	machine := machineAt(t, domain.OperationLock)
-	_, cancelDecision, err := controller.Request(machine, validCancellationRequest(), domain.ExecutionContract{}, nil)
+	request, contract, journal := preMutationCancellationContext(t, domain.OperationLock)
+	_, cancelDecision, err := controller.Request(machine, request, contract, journal)
 	if err != nil {
 		t.Fatalf("Request() returned an error: %v", err)
 	}
@@ -117,9 +119,9 @@ func TestMachineAppliesOnlyStateBoundCancellationDecisions(t *testing.T) {
 	}
 
 	machine = machineAt(t, domain.OperationPaused)
-	contract := cancellationContract(t, "stop-instance", false)
-	journal := pausedCancellationJournal(contract, true)
-	request := validCancellationRequest()
+	contract = cancellationContract(t, "stop-instance", false)
+	journal = pausedCancellationJournal(contract, true)
+	request = validCancellationRequest()
 	request.Sequence = uint64(len(journal) + 1)
 	request.RequestedAt = journal[len(journal)-1].RecordedAt.Add(time.Second)
 	_, rollbackDecision, err := controller.Request(machine, request, contract, journal)
@@ -142,7 +144,8 @@ func TestMachineAppliesOnlyStateBoundCancellationDecisions(t *testing.T) {
 	}
 
 	boundMachine := machineAt(t, domain.OperationLock)
-	_, boundDecision, err := controller.Request(boundMachine, validCancellationRequest(), domain.ExecutionContract{}, nil)
+	request, contract, journal = preMutationCancellationContext(t, domain.OperationLock)
+	_, boundDecision, err := controller.Request(boundMachine, request, contract, journal)
 	if err != nil {
 		t.Fatalf("Request(bound) returned an error: %v", err)
 	}
@@ -167,7 +170,8 @@ func TestCancellationDecisionIsSingleUseAcrossCopies(t *testing.T) {
 
 	var controller workflow.CancellationController
 	machine := machineAt(t, domain.OperationLock)
-	_, decision, err := controller.Request(machine, validCancellationRequest(), domain.ExecutionContract{}, nil)
+	request, contract, journal := preMutationCancellationContext(t, domain.OperationLock)
+	_, decision, err := controller.Request(machine, request, contract, journal)
 	if err != nil {
 		t.Fatalf("Request() returned an error: %v", err)
 	}
@@ -225,11 +229,57 @@ func TestCancellationRequestValidatesIdentityAtSafeBoundary(t *testing.T) {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			request := validCancellationRequest()
+			request, contract, journal := preMutationCancellationContext(t, domain.OperationLock)
 			test.mutate(&request)
 			var controller workflow.CancellationController
 			if _, _, err := controller.Request(
-				machineAt(t, domain.OperationLock), request, domain.ExecutionContract{}, nil,
+				machineAt(t, domain.OperationLock), request, contract, journal,
+			); !errors.Is(err, workflow.ErrInvalidCancellation) {
+				t.Fatalf("Request() error = %v, want ErrInvalidCancellation", err)
+			}
+		})
+	}
+}
+
+func TestPreMutationCancellationRequiresTrustedContractAndCurrentJournal(t *testing.T) {
+	t.Parallel()
+
+	request, contract, journal := preMutationCancellationContext(t, domain.OperationLock)
+	for name, mutate := range map[string]func(*workflow.CancellationRequest, *domain.ExecutionContract, *[]domain.JournalEntry){
+		"nil journal": func(_ *workflow.CancellationRequest, _ *domain.ExecutionContract, entries *[]domain.JournalEntry) {
+			*entries = nil
+		},
+		"empty journal": func(_ *workflow.CancellationRequest, _ *domain.ExecutionContract, entries *[]domain.JournalEntry) {
+			*entries = []domain.JournalEntry{}
+		},
+		"zero contract": func(_ *workflow.CancellationRequest, value *domain.ExecutionContract, _ *[]domain.JournalEntry) {
+			*value = domain.ExecutionContract{}
+		},
+		"initial contract mismatch": func(_ *workflow.CancellationRequest, _ *domain.ExecutionContract, entries *[]domain.JournalEntry) {
+			copyOfEntries := append([]domain.JournalEntry(nil), (*entries)...)
+			copyOfEntries[0].ContractHash = strings.Repeat("f", 64)
+			*entries = copyOfEntries
+		},
+		"final state mismatch": func(_ *workflow.CancellationRequest, _ *domain.ExecutionContract, entries *[]domain.JournalEntry) {
+			*entries = append([]domain.JournalEntry(nil), (*entries)[:len(*entries)-1]...)
+		},
+		"sequence does not extend": func(value *workflow.CancellationRequest, _ *domain.ExecutionContract, _ *[]domain.JournalEntry) {
+			value.Sequence--
+		},
+		"time does not extend": func(value *workflow.CancellationRequest, _ *domain.ExecutionContract, entries *[]domain.JournalEntry) {
+			value.RequestedAt = (*entries)[len(*entries)-1].RecordedAt
+		},
+	} {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			candidateRequest := request
+			candidateContract := contract
+			candidateJournal := append([]domain.JournalEntry(nil), journal...)
+			mutate(&candidateRequest, &candidateContract, &candidateJournal)
+			var controller workflow.CancellationController
+			if _, _, err := controller.Request(
+				machineAt(t, domain.OperationLock), candidateRequest, candidateContract, candidateJournal,
 			); !errors.Is(err, workflow.ErrInvalidCancellation) {
 				t.Fatalf("Request() error = %v, want ErrInvalidCancellation", err)
 			}
@@ -692,6 +742,34 @@ func validCancellationRequest() workflow.CancellationRequest {
 		Sequence:    6,
 		RequestedAt: time.Date(2026, 9, 3, 12, 0, 5, 0, time.UTC),
 	}
+}
+
+func preMutationCancellationContext(
+	t *testing.T,
+	state domain.OperationState,
+) (workflow.CancellationRequest, domain.ExecutionContract, []domain.JournalEntry) {
+	t.Helper()
+	contract := cancellationContract(t, "stop-instance", false)
+	lengths := map[domain.OperationState]int{
+		domain.OperationDiscover:        1,
+		domain.OperationValidate:        2,
+		domain.OperationPlan:            3,
+		domain.OperationApprovedWaiting: 4,
+		domain.OperationLock:            4,
+	}
+	length, exists := lengths[state]
+	if !exists {
+		t.Fatalf("state %s is not structurally pre-mutation", state)
+	}
+	journal := journalBoundToContract(validJournal()[:length], contract)
+	if state == domain.OperationApprovedWaiting {
+		journal[len(journal)-1].OperationState = state
+	}
+	request := validCancellationRequest()
+	request.Sequence = journal[len(journal)-1].Sequence + 1
+	request.RequestedAt = journal[len(journal)-1].RecordedAt.Add(time.Second)
+
+	return request, contract, journal
 }
 
 func cancellationContract(t *testing.T, stepID string, cancelSafe bool) domain.ExecutionContract {

@@ -809,7 +809,7 @@ func validateRecoveryAssets(plan domain.Plan) error {
 	targetedResources := make(map[string]struct{})
 	for _, step := range plan.Steps {
 		for _, target := range step.Targets {
-			targetedResources[planResourceKey(target)] = struct{}{}
+			targetedResources[stablePlanResourceKey(target)] = struct{}{}
 		}
 	}
 	for index, asset := range assets {
@@ -823,7 +823,7 @@ func validateRecoveryAssets(plan domain.Plan) error {
 			return invalid(path, "duplicates a recovery asset")
 		}
 		seen[key] = struct{}{}
-		if _, targeted := targetedResources[planResourceKey(asset.Resource)]; targeted {
+		if _, targeted := targetedResources[stablePlanResourceKey(asset.Resource)]; targeted {
 			return invalid(path+".resource", "must not be a target of the same plan")
 		}
 		if len(asset.Protects) == 0 || len(asset.Protects) > maxExposureTargets {
@@ -831,7 +831,7 @@ func validateRecoveryAssets(plan domain.Plan) error {
 		}
 		seenProtected := make(map[string]struct{}, len(asset.Protects))
 		for _, protected := range asset.Protects {
-			if protected == asset.Resource {
+			if stablePlanResourceKey(protected) == stablePlanResourceKey(asset.Resource) {
 				return invalid(path+".protects", "must not claim that a recovery asset protects itself")
 			}
 			protectedKey := planResourceKey(protected)
@@ -953,9 +953,8 @@ func validateExposureControls(plan domain.Plan) error {
 	if !validExposureAuthentication(plan.Exposure, *controls) {
 		return invalid("exposureControls.authentication", "does not match the exposure path")
 	}
-	if plan.Exposure == domain.ExposureExternal &&
-		(!controls.TLS.Required || !controls.TLS.HostnameVerification || controls.TLS.Trust != domain.ExposureTrustPublic) {
-		return invalid("exposureControls.tls", "external access requires public TLS with hostname verification")
+	if !validExposureTLS(plan.Exposure, controls.TLS) {
+		return invalid("exposureControls.tls", "access requires trusted TLS with hostname verification")
 	}
 	if !controls.AuditLogging || controls.RevocationWorkflowID != "WF-ACC-04" {
 		return invalid("exposureControls", "requires audit logging and the kill-switch revocation workflow")
@@ -1327,6 +1326,19 @@ func validatePermissions(
 
 func planResourceKey(resource domain.PlanResource) string {
 	return resource.Scope + "\x00" + resource.Kind + "\x00" + resource.Name + "\x00" + resource.Fingerprint
+}
+
+func stablePlanResourceKey(resource domain.PlanResource) string {
+	return resource.Scope + "\x00" + resource.Kind + "\x00" + resource.Name
+}
+
+func validExposureTLS(exposure domain.ExposureDelta, tls domain.PlanExposureTLS) bool {
+	if exposure == domain.ExposureNone || !tls.Required || !tls.HostnameVerification ||
+		tls.Trust == domain.ExposureTrustNone {
+		return false
+	}
+
+	return exposure != domain.ExposureExternal || tls.Trust == domain.ExposureTrustPublic
 }
 
 func validateCost(cost domain.PlanCost) error {

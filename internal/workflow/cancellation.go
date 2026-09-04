@@ -4,6 +4,8 @@
 package workflow
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -48,6 +50,7 @@ type cancellationBinding struct {
 	operationID  string
 	planID       string
 	contractHash string
+	journalHash  string
 	sequence     uint64
 	requestedAt  time.Time
 	stepID       string
@@ -123,15 +126,20 @@ func (controller CancellationController) Request(
 	if err := validateCancellationRequest(request); err != nil {
 		return controller, CancellationDecision{}, err
 	}
-	if controller.queued {
-		return controller, CancellationDecision{}, fmt.Errorf("%w: cancellation request already recorded", ErrInvalidCancellation)
-	}
 	if !current.Valid() || current.Terminal() {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q cannot accept cancellation", ErrInvalidCancellation, current)
 	}
+	journalHash, err := validateCancellationFoundation(machine, request, contract, entries)
+	if err != nil {
+		return controller, CancellationDecision{}, err
+	}
+	if controller.queued {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: cancellation request already recorded", ErrInvalidCancellation)
+	}
 	binding := cancellationBinding{
 		operationID: request.OperationID, planID: request.PlanID,
-		contractHash: contract.Digest(), sequence: request.Sequence, requestedAt: request.RequestedAt,
+		contractHash: contract.Digest(), journalHash: journalHash,
+		sequence: request.Sequence, requestedAt: request.RequestedAt,
 	}
 	if cancellationStateIsStructurallyPreMutation(current) {
 		return routeCancellationTo(controller, machine, domain.OperationCancelled, binding)
@@ -213,6 +221,8 @@ func (machine *Machine) ApplyCancellation(decision CancellationDecision) error {
 	if machine == nil || decision.authorization == nil || decision.authorization.machine != machine ||
 		decision.authorization.target != decision.Target ||
 		!decision.authorization.binding.matchesMachine(machine) ||
+		!contractDigestPattern.MatchString(decision.authorization.binding.contractHash) ||
+		!contractDigestPattern.MatchString(decision.authorization.binding.journalHash) ||
 		decision.authorization.binding.sequence == 0 || decision.authorization.binding.requestedAt.IsZero() ||
 		!cancellationActionMatchesTarget(decision.Action, decision.Target) {
 		return fmt.Errorf("%w: missing or mismatched authorization", ErrInvalidCancellation)
@@ -306,6 +316,10 @@ func RestoreCancellationController(
 			}
 		}
 		if entry.Kind == domain.JournalEntryCancellationRequest {
+			journalHash, err := cancellationJournalHash(entries[:entry.Sequence])
+			if err != nil {
+				return CancellationController{}, fmt.Errorf("%w: cannot bind the durable journal", ErrInvalidCancellation)
+			}
 			if entry.Cancellation.ExecutionContractHash != contract.Digest() {
 				return CancellationController{}, fmt.Errorf(
 					"%w: cancellation request does not match the execution contract", ErrInvalidCancellation,
@@ -320,6 +334,7 @@ func RestoreCancellationController(
 				operationID:  entry.OperationID,
 				planID:       entry.PlanID,
 				contractHash: entry.Cancellation.ExecutionContractHash,
+				journalHash:  journalHash,
 				sequence:     entry.Sequence,
 				requestedAt:  entry.Cancellation.RequestedAt,
 				stepID:       step.ID,
@@ -359,33 +374,69 @@ func validateCancellationRequest(request CancellationRequest) error {
 	return nil
 }
 
+func validateCancellationFoundation(
+	machine *Machine,
+	request CancellationRequest,
+	contract domain.ExecutionContract,
+	entries []domain.JournalEntry,
+) (string, error) {
+	if err := ValidateJournal(entries); err != nil || len(entries) == 0 {
+		return "", fmt.Errorf("%w: invalid durable journal", ErrInvalidCancellation)
+	}
+	contractHash := contract.Digest()
+	if !contractDigestPattern.MatchString(contractHash) || contract.WorkflowID() == "" || len(contract.Steps()) == 0 {
+		return "", fmt.Errorf("%w: invalid execution contract", ErrInvalidCancellation)
+	}
+	first := entries[0]
+	last := entries[len(entries)-1]
+	if first.Sequence != 1 || first.OperationID != machine.operationID || first.PlanID != machine.planID ||
+		first.ContractHash != contractHash {
+		return "", fmt.Errorf("%w: initial journal entry does not bind the operation, plan, and contract", ErrInvalidCancellation)
+	}
+	if last.OperationState != machine.State() || request.Sequence != last.Sequence+1 ||
+		!request.RequestedAt.After(last.RecordedAt) {
+		return "", fmt.Errorf("%w: request does not extend the current machine journal", ErrInvalidCancellation)
+	}
+	if _, err := RestoreCancellationController(entries, machine.operationID, machine.planID, contract); err != nil {
+		return "", fmt.Errorf("%w: durable journal contradicts the execution contract", ErrInvalidCancellation)
+	}
+	journalHash, err := cancellationJournalHash(entries)
+	if err != nil {
+		return "", fmt.Errorf("%w: cannot bind the durable journal", ErrInvalidCancellation)
+	}
+
+	return journalHash, nil
+}
+
+func cancellationJournalHash(entries []domain.JournalEntry) (string, error) {
+	digest := sha256.New()
+	var size [8]byte
+	for _, entry := range entries {
+		encoded, err := EncodeJournalEntry(entry)
+		if err != nil {
+			return "", err
+		}
+		binary.BigEndian.PutUint64(size[:], uint64(len(encoded)))
+		_, _ = digest.Write(size[:])
+		_, _ = digest.Write(encoded)
+	}
+
+	return fmt.Sprintf("%x", digest.Sum(nil)), nil
+}
+
 func cancellationContext(
 	machine *Machine,
 	contract domain.ExecutionContract,
 	entries []domain.JournalEntry,
 	request CancellationRequest,
 ) (domain.ExecutionStepContract, domain.MutationObservation, error) {
-	if err := ValidateJournal(entries); err != nil || len(entries) == 0 {
-		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: invalid durable journal", ErrInvalidCancellation)
-	}
-	if !contractDigestPattern.MatchString(contract.Digest()) {
-		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: invalid execution contract", ErrInvalidCancellation)
-	}
-	if entries[0].ContractHash != contract.Digest() {
-		return domain.ExecutionStepContract{}, "", fmt.Errorf(
-			"%w: durable journal does not match the execution contract", ErrInvalidCancellation,
-		)
+	if _, err := validateCancellationFoundation(machine, request, contract, entries); err != nil {
+		return domain.ExecutionStepContract{}, "", err
 	}
 	if pointOfNoReturnReached(contract, entries) {
 		return domain.ExecutionStepContract{}, "", fmt.Errorf(
 			"%w: point of no return has been reached", ErrInvalidCancellation,
 		)
-	}
-	last := entries[len(entries)-1]
-	if entries[0].OperationID != machine.operationID || entries[0].PlanID != machine.planID ||
-		last.OperationState != machine.State() || request.Sequence != last.Sequence+1 ||
-		request.RequestedAt.Before(last.RecordedAt) {
-		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: journal does not match the current machine boundary", ErrInvalidCancellation)
 	}
 
 	steps := contract.Steps()

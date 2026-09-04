@@ -982,10 +982,27 @@ func TestPlanRecoveryAssetsAreTypedFreshAndRiskBound(t *testing.T) {
 			permission.Permission = "compute.snapshots.delete"
 			plan.Permissions = append(plan.Permissions, permission)
 		},
+		"recovery asset targets same stable resource at another fingerprint": func(plan *domain.Plan) {
+			asset := plan.Rollback.Assets[0].Resource
+			target := asset
+			target.Fingerprint = "generation-replaced"
+			plan.Resources = append(plan.Resources, target)
+			plan.Steps[0].Targets = append(plan.Steps[0].Targets, target)
+			permission := plan.Permissions[0]
+			permission.Resource = target
+			permission.Permission = "compute.snapshots.delete"
+			plan.Permissions = append(plan.Permissions, permission)
+		},
 		"recovery asset claims self-protection": func(plan *domain.Plan) {
 			asset := plan.Rollback.Assets[0].Resource
 			plan.Resources = append(plan.Resources, asset)
 			plan.Rollback.Assets[0].Protects = []domain.PlanResource{asset}
+		},
+		"recovery asset claims same stable resource at another fingerprint": func(plan *domain.Plan) {
+			protected := plan.Rollback.Assets[0].Resource
+			protected.Fingerprint = "generation-replaced"
+			plan.Resources = append(plan.Resources, protected)
+			plan.Rollback.Assets[0].Protects = []domain.PlanResource{protected}
 		},
 		"PBM missing restoreTo": func(plan *domain.Plan) {
 			validPBM(plan)
@@ -1182,6 +1199,58 @@ func TestPlanExposureControlsAreClosedScopedAndExceptional(t *testing.T) {
 		}
 		if _, err := policy.SealPlan(plan); err != nil {
 			t.Fatalf("SealPlan(internet-wide permanent=%t) returned an error: %v", permanent, err)
+		}
+	}
+}
+
+func TestPlanEveryMongoDBExposureRequiresTrustedTLSAndHostnameVerification(t *testing.T) {
+	t.Parallel()
+
+	build := func(exposure domain.ExposureDelta) domain.Plan {
+		plan := validPlan()
+		plan.ApprovalClass = domain.ApprovalSecuritySensitive
+		plan.Exposure = exposure
+		plan.ExposureControls = validExposureControls(plan)
+		plan.ExposureControls.TLS.Trust = domain.ExposureTrustPrivate
+		switch exposure {
+		case domain.ExposurePrivate:
+			plan.ExposureControls.Profile = domain.ExposureProfileACC04
+			plan.ExposureControls.Sources = []domain.PlanExposureSource{{
+				Kind: domain.ExposureSourcePrivateRange, Value: "10.20.0.0/16",
+			}}
+			plan.ExposureControls.Authentication = domain.ExposureAuthVPN
+		case domain.ExposureTunnel:
+			plan.ExposureControls.Profile = domain.ExposureProfileACC03
+			plan.ExposureControls.Sources = []domain.PlanExposureSource{{
+				Kind: domain.ExposureSourceIAP, Value: "35.235.240.0/20",
+			}}
+			plan.ExposureControls.Authentication = domain.ExposureAuthIAP
+		}
+
+		return plan
+	}
+	for _, exposure := range []domain.ExposureDelta{domain.ExposurePrivate, domain.ExposureTunnel} {
+		exposure := exposure
+		t.Run(string(exposure)+" accepts private trust", func(t *testing.T) {
+			t.Parallel()
+			if _, err := policy.SealPlan(build(exposure)); err != nil {
+				t.Fatalf("SealPlan() returned an error: %v", err)
+			}
+		})
+		for name, mutate := range map[string]func(*domain.PlanExposureTLS){
+			"TLS disabled":          func(value *domain.PlanExposureTLS) { value.Required = false },
+			"hostname not verified": func(value *domain.PlanExposureTLS) { value.HostnameVerification = false },
+			"no trust anchor":       func(value *domain.PlanExposureTLS) { value.Trust = domain.ExposureTrustNone },
+		} {
+			name, mutate := name, mutate
+			t.Run(string(exposure)+" rejects "+name, func(t *testing.T) {
+				t.Parallel()
+				plan := build(exposure)
+				mutate(&plan.ExposureControls.TLS)
+				if _, err := policy.SealPlan(plan); !errors.Is(err, policy.ErrInvalidPlan) {
+					t.Fatalf("SealPlan() error = %v, want ErrInvalidPlan", err)
+				}
+			})
 		}
 	}
 }

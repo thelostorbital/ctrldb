@@ -6,7 +6,7 @@ package secret_test
 import (
 	"encoding/json"
 	"fmt"
-	"slices"
+	"reflect"
 	"testing"
 
 	"github.com/thelostorbital/ctrldb/internal/secret"
@@ -49,29 +49,6 @@ func TestValueNeverFormatsOrSerializesItsSecret(t *testing.T) {
 	}
 }
 
-func TestValueOwnsInputAndRevealReturnsACopy(t *testing.T) {
-	t.Parallel()
-
-	input := []byte("SECRET_MARKER_COPY_2")
-	value := secret.New(input)
-	t.Cleanup(value.Zero)
-
-	input[0] = 'X'
-	revealed := value.Reveal()
-	t.Cleanup(func() { clear(revealed) })
-
-	if string(revealed) != "SECRET_MARKER_COPY_2" {
-		t.Fatalf("Reveal() = %q, want the original copied value", revealed)
-	}
-
-	revealed[0] = 'Y'
-	second := value.Reveal()
-	t.Cleanup(func() { clear(second) })
-	if string(second) != "SECRET_MARKER_COPY_2" {
-		t.Fatal("mutating revealed bytes changed the owned secret")
-	}
-}
-
 func TestValueZeroIsIdempotent(t *testing.T) {
 	t.Parallel()
 
@@ -81,9 +58,6 @@ func TestValueZeroIsIdempotent(t *testing.T) {
 
 	if !value.Empty() {
 		t.Fatal("Value.Empty() = false after Zero()")
-	}
-	if revealed := value.Reveal(); revealed != nil {
-		t.Fatalf("Value.Reveal() after Zero() = %v, want nil", revealed)
 	}
 }
 
@@ -95,10 +69,22 @@ func TestNilValueIsSafe(t *testing.T) {
 	if !value.Empty() {
 		t.Fatal("nil Value.Empty() = false, want true")
 	}
-	if !slices.Equal(value.Reveal(), nil) {
-		t.Fatal("nil Value.Reveal() did not return nil")
-	}
 	if fmt.Sprint(value) != "[redacted]" {
 		t.Fatal("nil Value formatting did not return [redacted]")
+	}
+}
+
+func TestValuePublicMethodSurfaceIsRedactingOrNonRevealing(t *testing.T) {
+	t.Parallel()
+
+	valueType := reflect.TypeOf((*secret.Value)(nil))
+	want := []string{"Empty", "Format", "GoString", "MarshalJSON", "MarshalText", "String", "Zero"}
+	if valueType.NumMethod() != len(want) {
+		t.Fatalf("public method count = %d, want %d", valueType.NumMethod(), len(want))
+	}
+	for index, name := range want {
+		if method := valueType.Method(index); method.Name != name {
+			t.Fatalf("public method %d = %q, want %q", index, method.Name, name)
+		}
 	}
 }

@@ -7,10 +7,12 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 go_licenses_bin="${GO_LICENSES_BIN:-go-licenses}"
-report=$(mktemp "${TMPDIR:-/tmp}/ctrldb-go-licenses.XXXXXX")
+combined_report=$(mktemp "${TMPDIR:-/tmp}/ctrldb-go-licenses-combined.XXXXXX")
+temporary_reports=()
+license_targets=(linux/amd64 linux/arm64 darwin/amd64 darwin/arm64)
 
 cleanup() {
-  rm -f "$report"
+  rm -f "$combined_report" "${temporary_reports[@]}"
 }
 trap cleanup EXIT
 
@@ -53,6 +55,15 @@ check_report() {
   fi
 }
 
+append_report() {
+  local source=$1
+  local line
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    printf '%s\n' "$line" >> "$combined_report"
+  done < "$source"
+}
+
 assert_rejected() {
   local fixture=$1
   local expected=$2
@@ -75,8 +86,23 @@ assert_rejected() {
 }
 
 cd "$repo_root"
-"$go_licenses_bin" report --include_tests ./... > "$report"
-check_report "$report"
+for target in "${license_targets[@]}"; do
+  IFS=/ read -r goos goarch <<< "$target"
+  target_report=$(mktemp "${TMPDIR:-/tmp}/ctrldb-go-licenses-${goos}-${goarch}.XXXXXX")
+  temporary_reports+=("$target_report")
+  if ! env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 GOWORK=off \
+    "$go_licenses_bin" report --include_tests ./... > "$target_report"; then
+    echo "go-licenses failed for $target" >&2
+    exit 1
+  fi
+  if [[ ! -s $target_report ]]; then
+    echo "go-licenses produced an empty report for $target" >&2
+    exit 1
+  fi
+  check_report "$target_report"
+  append_report "$target_report"
+done
+check_report "$combined_report"
 
 fixture_root="$repo_root/test/license-fixtures"
 check_report "$fixture_root/allowed.csv"
@@ -86,4 +112,10 @@ assert_rejected "$fixture_root/unknown.csv" "unknown license"
 assert_rejected "$fixture_root/future-bsd.csv" "BSD-4-Clause"
 assert_rejected "$fixture_root/malformed.csv" "malformed"
 
-echo "Go dependency licenses satisfy the D-084 allowlist; rejection fixtures passed"
+: > "$combined_report"
+for target in "${license_targets[@]}"; do
+  append_report "$fixture_root/targets/${target//\//-}.csv"
+done
+assert_rejected "$combined_report" "GPL-3.0-only"
+
+echo "Go dependency licenses satisfy the D-084 allowlist for linux/darwin amd64/arm64; rejection fixtures passed"

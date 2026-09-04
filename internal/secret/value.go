@@ -29,19 +29,6 @@ func New(value []byte) *Value {
 	return &Value{bytes: owned}
 }
 
-// Reveal returns a caller-owned copy of the secret. The caller must overwrite
-// that copy after use. Calling Reveal after Zero returns nil.
-func (value *Value) Reveal() []byte {
-	if value == nil || value.bytes == nil {
-		return nil
-	}
-
-	revealed := make([]byte, len(value.bytes))
-	copy(revealed, value.bytes)
-
-	return revealed
-}
-
 // Zero overwrites the owned bytes and releases the slice. It is idempotent.
 func (value *Value) Zero() {
 	if value == nil {

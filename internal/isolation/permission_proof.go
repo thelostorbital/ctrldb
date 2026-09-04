@@ -4,8 +4,12 @@
 package isolation
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -18,7 +22,11 @@ var (
 	ErrForbiddenPermission = errors.New("forbidden test identity permission")
 )
 
-var permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+$`)
+var (
+	permissionPattern          = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+$`)
+	permissionInventoryID      = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	permissionInventoryVersion = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+)
 
 // PermissionObservation is one exact testIamPermissions-style observation.
 // Expected and observed slices use the same tuple shape so callers, rather
@@ -30,17 +38,41 @@ type PermissionObservation struct {
 	Granted    bool
 }
 
+// PermissionInventory identifies the authoritative, externally owned
+// permission inventory. Fingerprint is the SHA-256 fingerprint returned by
+// PermissionInventoryFingerprint for the complete Expected slice.
+type PermissionInventory struct {
+	ID          string
+	Version     string
+	Fingerprint string
+}
+
+// PermissionProofInput binds exact observations to a named and versioned
+// caller-supplied inventory. This package deliberately does not compile role
+// definitions; the future bootstrap policy owner must pin the inventory
+// identity and fingerprint it supplies here.
+type PermissionProofInput struct {
+	Inventory PermissionInventory
+	Expected  []PermissionObservation
+	Observed  []PermissionObservation
+}
+
 // ValidatePermissionProof proves that observations are an exact, complete
 // match for caller-supplied expectations. No missing, duplicate, or unexpected
 // tuple is tolerated. Independently, a granted Monitoring, Scheduler, or Cloud
 // Run write is always rejected even if an expectation incorrectly permits it.
-func ValidatePermissionProof(expected, observed []PermissionObservation) error {
-	if len(expected) == 0 {
+func ValidatePermissionProof(input PermissionProofInput) error {
+	if !permissionInventoryID.MatchString(input.Inventory.ID) ||
+		!permissionInventoryVersion.MatchString(input.Inventory.Version) ||
+		!isSHA256Fingerprint(input.Inventory.Fingerprint) {
+		return guardError(ErrPermissionProof, "inventory", "must have a canonical ID, version, and SHA-256 fingerprint")
+	}
+	if len(input.Expected) == 0 {
 		return guardError(ErrPermissionProof, "expected", "must not be empty")
 	}
 
-	expectedByKey := make(map[permissionObservationKey]PermissionObservation, len(expected))
-	for index, item := range expected {
+	expectedByKey := make(map[permissionObservationKey]PermissionObservation, len(input.Expected))
+	for index, item := range input.Expected {
 		path := indexedField("expected", index)
 		if err := validatePermissionObservation(path, item); err != nil {
 			return err
@@ -55,8 +87,16 @@ func ValidatePermissionProof(expected, observed []PermissionObservation) error {
 		expectedByKey[key] = item
 	}
 
-	seen := make(map[permissionObservationKey]struct{}, len(observed))
-	for index, item := range observed {
+	fingerprint, err := PermissionInventoryFingerprint(input.Expected)
+	if err != nil {
+		return err
+	}
+	if fingerprint != input.Inventory.Fingerprint {
+		return guardError(ErrPermissionProof, "inventory.fingerprint", "does not match the expected tuple inventory")
+	}
+
+	seen := make(map[permissionObservationKey]struct{}, len(input.Observed))
+	for index, item := range input.Observed {
 		path := indexedField("observed", index)
 		if err := validatePermissionObservation(path, item); err != nil {
 			return err
@@ -81,6 +121,42 @@ func ValidatePermissionProof(expected, observed []PermissionObservation) error {
 		return guardError(ErrPermissionProof, "observed", "is missing an expected tuple")
 	}
 	return nil
+}
+
+// PermissionInventoryFingerprint returns the deterministic SHA-256 identity
+// of an expected tuple inventory. It does not assert that the inventory is the
+// policy-authoritative one; callers must separately pin ID, version, and the
+// returned fingerprint in their policy boundary.
+func PermissionInventoryFingerprint(expected []PermissionObservation) (string, error) {
+	if len(expected) == 0 {
+		return "", guardError(ErrPermissionProof, "expected", "must not be empty")
+	}
+	canonical := append([]PermissionObservation(nil), expected...)
+	for index, item := range canonical {
+		if err := validatePermissionObservation(indexedField("expected", index), item); err != nil {
+			return "", err
+		}
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		first := newPermissionObservationKey(canonical[i])
+		second := newPermissionObservationKey(canonical[j])
+		if first.identity != second.identity {
+			return first.identity < second.identity
+		}
+		if first.resource != second.resource {
+			return first.resource < second.resource
+		}
+		if first.permission != second.permission {
+			return first.permission < second.permission
+		}
+		return !canonical[i].Granted && canonical[j].Granted
+	})
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return "", guardError(ErrPermissionProof, "expected", "could not be fingerprinted")
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func validatePermissionObservation(path string, item PermissionObservation) error {
@@ -125,4 +201,12 @@ func permissionServiceAndAction(permission string) (string, string, bool) {
 		return "", "", false
 	}
 	return parts[0], parts[len(parts)-1], true
+}
+
+func isSHA256Fingerprint(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }

@@ -72,8 +72,9 @@ func TestValidateRunRequestRejectsMalformedInput(t *testing.T) {
 
 	validLimits := defaultLimits()
 	validRequest := isolation.RunRequest{
-		Machine:  isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024},
-		Lifetime: time.Hour,
+		Machine:   isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024},
+		Instances: 1,
+		Lifetime:  time.Hour,
 	}
 	tests := []struct {
 		name    string
@@ -99,6 +100,11 @@ func TestValidateRunRequestRejectsMalformedInput(t *testing.T) {
 		{name: "negative instances", limits: validLimits, request: func() isolation.RunRequest {
 			request := validRequest
 			request.Instances = -1
+			return request
+		}()},
+		{name: "zero instances", limits: validLimits, request: func() isolation.RunRequest {
+			request := validRequest
+			request.Instances = 0
 			return request
 		}()},
 		{name: "zero lifetime", limits: validLimits, request: func() isolation.RunRequest {
@@ -127,27 +133,31 @@ func TestValidateRunRequestRejectsMalformedInput(t *testing.T) {
 func TestValidateCleanupTargetsRequiresPrefixAndAllLabels(t *testing.T) {
 	t.Parallel()
 
-	valid := testResource("ctrldb-test-run1-vm")
-	if err := isolation.ValidateCleanupTargets([]config.GeneratedResource{valid}); err != nil {
+	valid := testTarget("ctrldb-test-run1-vm", "run1")
+	if err := isolation.ValidateCleanupTargets([]isolation.MutationTarget{valid}); err != nil {
 		t.Fatalf("ValidateCleanupTargets() unexpected error: %v", err)
 	}
 
 	tests := []struct {
 		name     string
-		resource config.GeneratedResource
+		resource isolation.MutationTarget
 	}{
-		{name: "production prefix", resource: config.GeneratedResource{Name: "ctrldb-production-vm", Labels: valid.Labels}},
-		{name: "missing labels", resource: config.GeneratedResource{Name: valid.Name, Labels: map[string]string{}}},
-		{name: "production label", resource: config.GeneratedResource{Name: valid.Name, Labels: map[string]string{
-			config.LabelManagedBy: config.LabelManagedByValue, config.LabelEnvironment: "production", config.LabelPurpose: config.TestResourcePurposeLabel,
-		}}},
+		{name: "production prefix", resource: targetWithName(valid, "ctrldb-production-vm")},
+		{name: "missing labels", resource: func() isolation.MutationTarget { value := valid; value.Labels = map[string]string{}; return value }()},
+		{name: "production label", resource: func() isolation.MutationTarget {
+			value := valid
+			value.Labels = map[string]string{
+				config.LabelManagedBy: config.LabelManagedByValue, config.LabelEnvironment: "production", config.LabelPurpose: config.TestResourcePurposeLabel,
+			}
+			return value
+		}()},
 	}
 	for _, test := range tests {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := isolation.ValidateCleanupTargets([]config.GeneratedResource{test.resource})
+			err := isolation.ValidateCleanupTargets([]isolation.MutationTarget{test.resource})
 			if !errors.Is(err, isolation.ErrUnsafeTarget) {
 				t.Fatalf("ValidateCleanupTargets() error = %v; want ErrUnsafeTarget", err)
 			}
@@ -158,15 +168,15 @@ func TestValidateCleanupTargetsRequiresPrefixAndAllLabels(t *testing.T) {
 func TestTESTISO02RunScopedMutationSelectorIsStrictAndDetached(t *testing.T) {
 	t.Parallel()
 
-	resources := []config.GeneratedResource{
-		testResource("ctrldb-test-run-42-z"),
-		testResource("ctrldb-test-run-42-a"),
+	resources := []isolation.MutationTarget{
+		testTarget("ctrldb-test-run-42-z", "run-42"),
+		testTarget("ctrldb-test-run-42-a", "run-42"),
 	}
 	selected, err := isolation.SelectRunMutationTargets("run-42", resources)
 	if err != nil {
 		t.Fatalf("SelectRunMutationTargets() unexpected error: %v", err)
 	}
-	if got, want := []string{selected[0].Name, selected[1].Name}, []string{"ctrldb-test-run-42-a", "ctrldb-test-run-42-z"}; !reflect.DeepEqual(got, want) {
+	if got, want := []string{selected[0].Identity.Name, selected[1].Identity.Name}, []string{"ctrldb-test-run-42-a", "ctrldb-test-run-42-z"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("SelectRunMutationTargets() names = %v; want %v", got, want)
 	}
 	selected[0].Labels[config.LabelPurpose] = "changed"
@@ -185,6 +195,47 @@ func TestTESTISO02RunScopedMutationSelectorIsStrictAndDetached(t *testing.T) {
 	if _, err := isolation.SelectRunMutationTargets("run-42", append(resources, resources[0])); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("SelectRunMutationTargets(duplicate) error = %v; want ErrInvalidGuardInput", err)
 	}
+	crossRun := testTarget("ctrldb-test-run-42-vm", "run-42")
+	if _, err := isolation.SelectRunMutationTargets("run", []isolation.MutationTarget{crossRun}); !errors.Is(err, isolation.ErrUnsafeTarget) {
+		t.Fatalf("SelectRunMutationTargets(cross-run prefix) error = %v; want ErrUnsafeTarget", err)
+	}
+}
+
+func TestRunMutationTargetsBindCompleteCrossProjectIdentity(t *testing.T) {
+	t.Parallel()
+
+	first := testTarget("ctrldb-test-run1-vm", "run1")
+	second := testTarget("ctrldb-test-run1-vm", "run1")
+	second.Identity.Project = "another-test-project"
+	second.Identity.FullName = mustCanonicalTargetName(second.Identity)
+	selected, err := isolation.SelectRunMutationTargets("run1", []isolation.MutationTarget{second, first})
+	if err != nil {
+		t.Fatalf("SelectRunMutationTargets(cross-project names) unexpected error: %v", err)
+	}
+	if selected[0].Identity.FullName == selected[1].Identity.FullName {
+		t.Fatal("cross-project targets collapsed to one identity")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*isolation.MutationTarget)
+	}{
+		{name: "missing project", mutate: func(target *isolation.MutationTarget) { target.Identity.Project = "" }},
+		{name: "ambient location", mutate: func(target *isolation.MutationTarget) { target.Identity.Location = "" }},
+		{name: "scope mismatch", mutate: func(target *isolation.MutationTarget) { target.Identity.Scope = isolation.ResourceScopeGlobal }},
+		{name: "swapped full name", mutate: func(target *isolation.MutationTarget) { target.Identity.FullName = second.Identity.FullName }},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			target := first
+			test.mutate(&target)
+			if _, err := isolation.SelectRunMutationTargets("run1", []isolation.MutationTarget{target}); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+				t.Fatalf("SelectRunMutationTargets() error = %v; want ErrInvalidGuardInput", err)
+			}
+		})
+	}
 }
 
 func TestSelectExpiredTargetsFailsClosedAndReturnsDetachedSortedResults(t *testing.T) {
@@ -192,27 +243,31 @@ func TestSelectExpiredTargetsFailsClosedAndReturnsDetachedSortedResults(t *testi
 
 	now := time.Date(2026, 9, 3, 8, 0, 0, 0, time.UTC)
 	candidates := []isolation.ExpirableTarget{
-		{Resource: testResource("ctrldb-test-run1-z"), CreatedAt: now.Add(-7 * time.Hour)},
-		{Resource: testResource("ctrldb-test-run1-young"), CreatedAt: now.Add(-time.Hour)},
-		{Resource: testResource("ctrldb-test-run1-a"), CreatedAt: now.Add(-6 * time.Hour)},
+		{Target: testTarget("ctrldb-test-run1-z", "run1"), CreatedAt: now.Add(-7 * time.Hour)},
+		{Target: testTarget("ctrldb-test-run1-young", "run1"), CreatedAt: now.Add(-time.Hour)},
+		{Target: testTarget("ctrldb-test-run1-a", "run1"), CreatedAt: now.Add(-6 * time.Hour)},
 	}
 	selected, err := isolation.SelectExpiredTargets(candidates, now, 6*time.Hour)
 	if err != nil {
 		t.Fatalf("SelectExpiredTargets() unexpected error: %v", err)
 	}
 	wantNames := []string{"ctrldb-test-run1-a", "ctrldb-test-run1-z"}
-	gotNames := []string{selected[0].Resource.Name, selected[1].Resource.Name}
+	gotNames := []string{selected[0].Target.Identity.Name, selected[1].Target.Identity.Name}
 	if !reflect.DeepEqual(gotNames, wantNames) {
 		t.Fatalf("SelectExpiredTargets() names = %v; want %v", gotNames, wantNames)
 	}
 
-	selected[0].Resource.Labels[config.LabelPurpose] = "changed"
-	if got := candidates[2].Resource.Labels[config.LabelPurpose]; got != config.TestResourcePurposeLabel {
+	selected[0].Target.Labels[config.LabelPurpose] = "changed"
+	if got := candidates[2].Target.Labels[config.LabelPurpose]; got != config.TestResourcePurposeLabel {
 		t.Fatalf("SelectExpiredTargets() result aliases caller labels: got %q", got)
 	}
 
 	unsafeYoung := []isolation.ExpirableTarget{{
-		Resource:  config.GeneratedResource{Name: "ctrldb-test-run2-young", Labels: map[string]string{}},
+		Target: func() isolation.MutationTarget {
+			value := testTarget("ctrldb-test-run2-young", "run2")
+			value.Labels = nil
+			return value
+		}(),
 		CreatedAt: now.Add(-time.Minute),
 	}}
 	if _, err := isolation.SelectExpiredTargets(unsafeYoung, now, 6*time.Hour); !errors.Is(err, isolation.ErrUnsafeTarget) {
@@ -224,14 +279,14 @@ func TestSelectExpiredTargetsRejectsInvalidTimeBoundaries(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 9, 3, 8, 0, 0, 0, time.UTC)
-	valid := []isolation.ExpirableTarget{{Resource: testResource("ctrldb-test-run1-vm"), CreatedAt: now.Add(-time.Hour)}}
+	valid := []isolation.ExpirableTarget{{Target: testTarget("ctrldb-test-run1-vm", "run1"), CreatedAt: now.Add(-time.Hour)}}
 	if _, err := isolation.SelectExpiredTargets(valid, time.Time{}, time.Hour); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("SelectExpiredTargets(zero now) error = %v; want ErrInvalidGuardInput", err)
 	}
 	if _, err := isolation.SelectExpiredTargets(valid, now, 0); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("SelectExpiredTargets(zero lifetime) error = %v; want ErrInvalidGuardInput", err)
 	}
-	future := []isolation.ExpirableTarget{{Resource: testResource("ctrldb-test-run1-vm"), CreatedAt: now.Add(time.Second)}}
+	future := []isolation.ExpirableTarget{{Target: testTarget("ctrldb-test-run1-vm", "run1"), CreatedAt: now.Add(time.Second)}}
 	if _, err := isolation.SelectExpiredTargets(future, now, time.Hour); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("SelectExpiredTargets(future target) error = %v; want ErrInvalidGuardInput", err)
 	}
@@ -311,49 +366,53 @@ func TestValidateNetworkCIDRRejectsPublicOverlapAndMalformedDiscovery(t *testing
 	}
 }
 
-func TestValidateHarnessLocksRejectsHarnessHeldNonDisposableLock(t *testing.T) {
+func TestValidateHarnessLocksRequiresExactCompleteSetAndRunOwnership(t *testing.T) {
 	t.Parallel()
 
-	const harness = "test-runner"
-	for _, class := range []domain.EnvironmentClass{
-		domain.EnvironmentProduction,
-		domain.EnvironmentStaging,
-		domain.EnvironmentRehearsal,
-	} {
-		err := isolation.ValidateHarnessLocks([]isolation.EnvironmentLock{{
-			Environment: string(class), Class: class, Holder: harness,
-		}}, harness)
-		if !errors.Is(err, isolation.ErrNonDisposableLock) {
-			t.Errorf("ValidateHarnessLocks(%s) error = %v; want ErrNonDisposableLock", class, err)
-		}
-	}
-}
-
-func TestValidateHarnessLocksAllowsDisposableOrOtherHolder(t *testing.T) {
-	t.Parallel()
-
-	locks := []isolation.EnvironmentLock{
-		{Environment: "production", Class: domain.EnvironmentProduction, Holder: "operator"},
-		{Environment: "test", Class: domain.EnvironmentDisposable, Holder: "test-runner"},
-	}
-	if err := isolation.ValidateHarnessLocks(locks, "test-runner"); err != nil {
+	locks, expected := validLockProof()
+	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", "test-runner"); err != nil {
 		t.Fatalf("ValidateHarnessLocks() unexpected error: %v", err)
 	}
-
-	if err := isolation.ValidateHarnessLocks(locks, ""); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", ""); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(empty holder) error = %v; want ErrInvalidGuardInput", err)
 	}
-	duplicate := append(locks, isolation.EnvironmentLock{Environment: "production", Class: domain.EnvironmentProduction})
-	if err := isolation.ValidateHarnessLocks(duplicate, "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	badHolder := append([]isolation.EnvironmentLock(nil), locks...)
+	badHolder[0].Holder = " operator "
+	if err := isolation.ValidateHarnessLocks(badHolder, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateHarnessLocks(noncanonical holder) error = %v; want ErrInvalidGuardInput", err)
+	}
+	duplicate := append(append([]isolation.EnvironmentLock(nil), locks...), locks[0])
+	if err := isolation.ValidateHarnessLocks(duplicate, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(duplicate) error = %v; want ErrInvalidGuardInput", err)
 	}
-	for _, invalid := range []isolation.EnvironmentLock{
-		{Class: domain.EnvironmentProduction},
-		{Environment: "unknown", Class: "unknown"},
-	} {
-		if err := isolation.ValidateHarnessLocks([]isolation.EnvironmentLock{invalid}, "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
-			t.Fatalf("ValidateHarnessLocks(invalid lock) error = %v; want ErrInvalidGuardInput", err)
-		}
+	if err := isolation.ValidateHarnessLocks(locks[:1], expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrRunLockNotHeld) {
+		t.Fatalf("ValidateHarnessLocks(missing run lock) error = %v; want ErrRunLockNotHeld", err)
+	}
+	lost := append([]isolation.EnvironmentLock(nil), locks...)
+	lost[1].Holder = "other-runner"
+	if err := isolation.ValidateHarnessLocks(lost, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrRunLockNotHeld) {
+		t.Fatalf("ValidateHarnessLocks(lock loss) error = %v; want ErrRunLockNotHeld", err)
+	}
+	missingProduction := []isolation.EnvironmentLock{locks[1]}
+	if err := isolation.ValidateHarnessLocks(missingProduction, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateHarnessLocks(missing environment) error = %v; want ErrInvalidGuardInput", err)
+	}
+	unexpected := append(append([]isolation.EnvironmentLock(nil), locks...), isolation.EnvironmentLock{
+		Environment: "staging", Class: domain.EnvironmentStaging, Holder: "operator",
+	})
+	if err := isolation.ValidateHarnessLocks(unexpected, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateHarnessLocks(unexpected environment) error = %v; want ErrInvalidGuardInput", err)
+	}
+	heldProduction := append([]isolation.EnvironmentLock(nil), locks...)
+	heldProduction[0].Holder = "test-runner"
+	if err := isolation.ValidateHarnessLocks(heldProduction, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrNonDisposableLock) {
+		t.Fatalf("ValidateHarnessLocks(non-disposable holder) error = %v; want ErrNonDisposableLock", err)
+	}
+	ambiguousExpected := append(append([]isolation.EnvironmentIdentity(nil), expected...), isolation.EnvironmentIdentity{
+		Environment: "production", Class: domain.EnvironmentStaging,
+	})
+	if err := isolation.ValidateHarnessLocks(locks, ambiguousExpected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateHarnessLocks(ambiguous expectation) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
 
@@ -365,9 +424,13 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
 	}
-	decision.Targets[0].Labels[config.LabelPurpose] = "changed"
+	targets, err := isolation.RevalidatePreMutation(decision, freshPreMutationInput())
+	if err != nil {
+		t.Fatalf("RevalidatePreMutation() unexpected error: %v", err)
+	}
+	targets[0].Labels[config.LabelPurpose] = "changed"
 	if input.Targets[0].Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
-		t.Fatal("AuthorizePreMutation() decision aliases caller input")
+		t.Fatal("RevalidatePreMutation() targets alias authorization input")
 	}
 
 	tests := []struct {
@@ -376,11 +439,12 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 		kind   error
 	}{
 		{name: "selector proof", mutate: func(value *isolation.PreMutationInput) { value.RunID = "different" }, kind: isolation.ErrUnsafeTarget},
-		{name: "capacity proof", mutate: func(value *isolation.PreMutationInput) { value.Request.Instances = 3 }, kind: isolation.ErrCapacityExceeded},
+		{name: "capacity proof", mutate: func(value *isolation.PreMutationInput) { value.Capacity.Request.Instances = 3 }, kind: isolation.ErrCapacityExceeded},
 		{name: "network proof", mutate: func(value *isolation.PreMutationInput) { value.TestCIDR = "10.80.1.0/24" }, kind: isolation.ErrNetworkOverlap},
 		{name: "lock proof", mutate: func(value *isolation.PreMutationInput) { value.Locks[0].Holder = value.HarnessHolder }, kind: isolation.ErrNonDisposableLock},
-		{name: "permission proof", mutate: func(value *isolation.PreMutationInput) { value.ObservedPermissions = nil }, kind: isolation.ErrPermissionProof},
+		{name: "permission proof", mutate: func(value *isolation.PreMutationInput) { value.Permissions.Observed = nil }, kind: isolation.ErrPermissionProof},
 		{name: "firewall proof", mutate: func(value *isolation.PreMutationInput) { value.FirewallRules = value.FirewallRules[:1] }, kind: isolation.ErrUnsafeFirewall},
+		{name: "freshness proof", mutate: func(value *isolation.PreMutationInput) { value.Freshness.ValidUntil = value.Freshness.ObservedAt }, kind: isolation.ErrStaleProof},
 	}
 	for _, test := range tests {
 		test := test
@@ -395,18 +459,58 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 	}
 }
 
+func TestPreMutationCapacityClaimMatchesExactInstanceTargets(t *testing.T) {
+	t.Parallel()
+
+	for _, instances := range []int{0, 2} {
+		input := validPreMutationInput()
+		input.Capacity.Request.Instances = instances
+		if _, err := isolation.AuthorizePreMutation(input); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+			t.Errorf("AuthorizePreMutation(instances=%d) error = %v; want ErrInvalidGuardInput", instances, err)
+		}
+	}
+}
+
+func TestPreMutationDecisionRejectsStaleSwappedAndExpiredEvidence(t *testing.T) {
+	t.Parallel()
+
+	decision, err := isolation.AuthorizePreMutation(validPreMutationInput())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	if _, err := isolation.RevalidatePreMutation(decision, validPreMutationInput()); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(reused observation) error = %v; want ErrStaleProof", err)
+	}
+	expired := freshPreMutationInput()
+	expired.Freshness.CheckedAt = validPreMutationInput().Freshness.ValidUntil
+	if _, err := isolation.RevalidatePreMutation(decision, expired); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(expired) error = %v; want ErrStaleProof", err)
+	}
+	swapped := freshPreMutationInput()
+	swapped.Targets[0].Identity.Project = "another-test-project"
+	swapped.Targets[0].Identity.FullName = mustCanonicalTargetName(swapped.Targets[0].Identity)
+	if _, err := isolation.RevalidatePreMutation(decision, swapped); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(swapped target) error = %v; want ErrProofMismatch", err)
+	}
+	drifted := freshPreMutationInput()
+	drifted.Freshness.Revision = strings.Repeat("c", 64)
+	if _, err := isolation.RevalidatePreMutation(decision, drifted); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(drift) error = %v; want ErrProofMismatch", err)
+	}
+	inventorySwap := freshPreMutationInput()
+	inventorySwap.Permissions.Inventory.Version = "v2"
+	if _, err := isolation.RevalidatePreMutation(decision, inventorySwap); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(inventory swap) error = %v; want ErrProofMismatch", err)
+	}
+}
+
 func TestGuardErrorsDoNotRenderDiscoveredValues(t *testing.T) {
 	t.Parallel()
 
 	const marker = "sensitive-resource-name"
-	resource := config.GeneratedResource{
-		Name: "ctrldb-" + marker,
-		Labels: map[string]string{
-			config.LabelManagedBy:   config.LabelManagedByValue,
-			config.LabelEnvironment: "production",
-		},
-	}
-	err := isolation.ValidateCleanupTargets([]config.GeneratedResource{resource})
+	resource := testTarget("ctrldb-"+marker, "run1")
+	resource.Labels[config.LabelEnvironment] = "production"
+	err := isolation.ValidateCleanupTargets([]isolation.MutationTarget{resource})
 	if !errors.Is(err, isolation.ErrUnsafeTarget) {
 		t.Fatalf("ValidateCleanupTargets() error = %v; want ErrUnsafeTarget", err)
 	}
@@ -425,33 +529,77 @@ func defaultLimits() isolation.RunLimits {
 	}
 }
 
-func testResource(name string) config.GeneratedResource {
-	return config.GeneratedResource{
-		Name: name,
-		Labels: map[string]string{
-			config.LabelManagedBy:   config.LabelManagedByValue,
-			config.LabelEnvironment: config.TestEnvironmentLabel,
-			config.LabelPurpose:     config.TestResourcePurposeLabel,
+func validPreMutationInput() isolation.PreMutationInput {
+	permissions := validPermissionProofInput()
+	locks, expectedEnvironments := validLockProof()
+	observedAt := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	return isolation.PreMutationInput{
+		RunID:   "run1",
+		Targets: []isolation.MutationTarget{testTarget("ctrldb-test-run1-vm", "run1")},
+		Capacity: isolation.CapacityProofInput{
+			PlanFingerprint: strings.Repeat("a", 64),
+			Limits:          defaultLimits(),
+			Request: isolation.RunRequest{
+				Machine: isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024}, DiskGiB: 100,
+				Instances: 1, Lifetime: time.Hour, EstimatedCostMicros: 1_000_000,
+			},
+		},
+		TestCIDR:                          "10.20.0.0/24",
+		ProductionCIDRs:                   []string{"10.80.0.0/16"},
+		ExpectedNonDisposableEnvironments: expectedEnvironments,
+		Locks:                             locks,
+		HarnessHolder:                     "test-runner",
+		Permissions:                       permissions,
+		FirewallRules:                     validFirewallRules(),
+		Freshness: isolation.EvidenceFreshness{
+			Revision: strings.Repeat("b", 64), ObservedAt: observedAt,
+			ValidUntil: observedAt.Add(4 * time.Minute), CheckedAt: observedAt,
 		},
 	}
 }
 
-func validPreMutationInput() isolation.PreMutationInput {
-	permissions := validPermissionExpectations()
-	return isolation.PreMutationInput{
-		RunID:   "run1",
-		Targets: []config.GeneratedResource{testResource("ctrldb-test-run1-vm")},
-		Limits:  defaultLimits(),
-		Request: isolation.RunRequest{
-			Machine: isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024}, DiskGiB: 100,
-			Instances: 1, Lifetime: time.Hour, EstimatedCostMicros: 1_000_000,
-		},
-		TestCIDR:            "10.20.0.0/24",
-		ProductionCIDRs:     []string{"10.80.0.0/16"},
-		Locks:               []isolation.EnvironmentLock{{Environment: "production", Class: domain.EnvironmentProduction, Holder: "operator"}},
-		HarnessHolder:       "test-runner",
-		ExpectedPermissions: append([]isolation.PermissionObservation(nil), permissions...),
-		ObservedPermissions: append([]isolation.PermissionObservation(nil), permissions...),
-		FirewallRules:       validFirewallRules(),
+func freshPreMutationInput() isolation.PreMutationInput {
+	input := validPreMutationInput()
+	input.Freshness.ObservedAt = input.Freshness.ObservedAt.Add(time.Second)
+	input.Freshness.CheckedAt = input.Freshness.ObservedAt
+	return input
+}
+
+func testTarget(name, runID string) isolation.MutationTarget {
+	identity := isolation.MutationTargetIdentity{
+		Project: "example-test-project", Service: isolation.ComputeServiceName,
+		Kind: isolation.ComputeInstanceKind, Scope: isolation.ResourceScopeZone,
+		Location: "asia-south1-a", Name: name,
 	}
+	identity.FullName = mustCanonicalTargetName(identity)
+	return isolation.MutationTarget{
+		Identity: identity,
+		Labels: map[string]string{
+			config.LabelManagedBy: config.LabelManagedByValue, config.LabelEnvironment: config.TestEnvironmentLabel,
+			config.LabelPurpose: config.TestResourcePurposeLabel, isolation.LabelRunID: runID,
+		},
+	}
+}
+
+func targetWithName(target isolation.MutationTarget, name string) isolation.MutationTarget {
+	target.Identity.Name = name
+	target.Identity.FullName = mustCanonicalTargetName(target.Identity)
+	return target
+}
+
+func mustCanonicalTargetName(identity isolation.MutationTargetIdentity) string {
+	name, err := isolation.CanonicalMutationTargetName(identity)
+	if err != nil {
+		panic(err)
+	}
+	return name
+}
+
+func validLockProof() ([]isolation.EnvironmentLock, []isolation.EnvironmentIdentity) {
+	expected := []isolation.EnvironmentIdentity{{Environment: "production", Class: domain.EnvironmentProduction}}
+	locks := []isolation.EnvironmentLock{
+		{Environment: "production", Class: domain.EnvironmentProduction, Holder: "operator"},
+		{Environment: config.TestEnvironmentLabel, Class: domain.EnvironmentDisposable, RunID: "run1", Holder: "test-runner"},
+	}
+	return locks, expected
 }

@@ -334,7 +334,7 @@ func TestValidateFirewallTagsAllowsOnlyReservedTestTags(t *testing.T) {
 func TestValidateNetworkCIDRAcceptsPrivateNonOverlappingRanges(t *testing.T) {
 	t.Parallel()
 
-	for _, cidr := range []string{"10.20.0.0/24", "172.16.0.0/16", "192.168.50.0/24"} {
+	for _, cidr := range []string{"10.20.0.0/24", "172.16.0.0/16", "192.168.50.0/24", "10.30.0.0/29"} {
 		if err := isolation.ValidateNetworkCIDR(cidr, []string{"10.10.0.0/16", "172.20.0.0/16"}); err != nil {
 			t.Errorf("ValidateNetworkCIDR(%q) unexpected error: %v", cidr, err)
 		}
@@ -353,6 +353,9 @@ func TestValidateNetworkCIDRRejectsPublicOverlapAndMalformedDiscovery(t *testing
 		{name: "public", testCIDR: "203.0.113.0/24", kind: isolation.ErrNetworkOverlap},
 		{name: "IPv6", testCIDR: "fd00::/64", kind: isolation.ErrInvalidGuardInput},
 		{name: "host bits", testCIDR: "10.20.0.1/24", kind: isolation.ErrInvalidGuardInput},
+		{name: "prefix 30", testCIDR: "10.20.0.0/30", kind: isolation.ErrInvalidGuardInput},
+		{name: "prefix 31", testCIDR: "10.20.0.0/31", kind: isolation.ErrInvalidGuardInput},
+		{name: "prefix 32", testCIDR: "10.20.0.1/32", kind: isolation.ErrInvalidGuardInput},
 		{name: "invalid", testCIDR: "not-a-cidr", kind: isolation.ErrInvalidGuardInput},
 		{name: "test contains existing", testCIDR: "10.20.0.0/16", forbidden: []string{"10.20.1.0/24"}, kind: isolation.ErrNetworkOverlap},
 		{name: "existing contains test", testCIDR: "10.20.1.0/24", forbidden: []string{"10.20.0.0/16"}, kind: isolation.ErrNetworkOverlap},

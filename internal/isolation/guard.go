@@ -64,6 +64,7 @@ const (
 	maxRunIDLength              = 32
 	LabelRunID                  = "run-id"
 	MaxPreMutationProofLifetime = 5 * time.Minute
+	maxGCPSubnetPrefixBits      = 29
 )
 
 // MachineShape is the live numeric shape resolved for a GCP machine type.
@@ -351,6 +352,9 @@ func ValidateNetworkCIDR(testCIDR string, forbiddenCIDRs []string) error {
 	testNetwork, err := parseCanonicalIPv4Prefix(testCIDR)
 	if err != nil {
 		return guardError(ErrInvalidGuardInput, "testCIDR", "must be a canonical IPv4 prefix")
+	}
+	if testNetwork.Bits() > maxGCPSubnetPrefixBits {
+		return guardError(ErrInvalidGuardInput, "testCIDR", "must be a provider-valid subnet prefix")
 	}
 	if !isPrivateIPv4Prefix(testNetwork) {
 		return guardError(ErrNetworkOverlap, "testCIDR", "must be contained in an RFC 1918 range")

@@ -56,6 +56,7 @@ var (
 	regionPattern                = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+[0-9]+$`)
 	zonePattern                  = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+[0-9]+-[a-z]$`)
 	resourceNamePattern          = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$`)
+	computeResourceNamePattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	environmentNamePattern       = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	userSubjectPattern           = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
 	serviceAccountSubjectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$`)
@@ -263,6 +264,9 @@ func CanonicalTargetKey(identity ResourceIdentity) (string, error) {
 	}
 	if !resourceNamePattern.MatchString(identity.Name) {
 		return "", guardError(ErrInvalidGuardInput, "target.identity.name", "must be a canonical resource name")
+	}
+	if identity.Service == ComputeServiceName && !computeResourceNamePattern.MatchString(identity.Name) {
+		return "", guardError(ErrInvalidGuardInput, "target.identity.name", "must be a 1-63 character lowercase alphanumeric or hyphen Compute resource name with alphanumeric endpoints")
 	}
 	return "ctrldb-target-key:v1|" + identity.Project + "|" + string(identity.Service) + "|" + scopePath + "|" + string(identity.Kind) + "|" + identity.Name, nil
 }

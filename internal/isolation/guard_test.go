@@ -267,6 +267,95 @@ func TestResourceIdentityAcceptsDiscoveredMultiDigitRegionsAndKnownComputeScopes
 	}
 }
 
+func TestComputeResourceIdentityEnforcesProviderNameGrammar(t *testing.T) {
+	t.Parallel()
+
+	type computeIdentityShape struct {
+		kind     isolation.ResourceKind
+		scope    isolation.ResourceScope
+		location string
+	}
+	shapes := []computeIdentityShape{
+		{kind: isolation.ComputeInstanceKind, scope: isolation.ResourceScopeZone, location: "asia-south1-a"},
+		{kind: isolation.ComputeDiskKind, scope: isolation.ResourceScopeRegion, location: "asia-south1"},
+		{kind: isolation.ComputeFirewallKind, scope: isolation.ResourceScopeGlobal, location: "global"},
+		{kind: isolation.ComputeNetworkKind, scope: isolation.ResourceScopeGlobal, location: "global"},
+		{kind: "snapshots", scope: isolation.ResourceScopeGlobal, location: "global"},
+	}
+	validNames := []string{"a", "1", "a-" + strings.Repeat("b", 60) + "9"}
+	for _, shape := range shapes {
+		for _, name := range validNames {
+			identity := isolation.ResourceIdentity{
+				Project: "example-test-project", Service: isolation.ComputeServiceName,
+				Kind: shape.kind, Scope: shape.scope, Location: shape.location, Name: name,
+			}
+			if _, err := isolation.CanonicalTargetKey(identity); err != nil {
+				t.Errorf("CanonicalTargetKey(%s, %d-character name) unexpected error: %v", shape.kind, len(name), err)
+			}
+		}
+	}
+
+	invalidNames := []string{
+		"ctrldb-test-run1_vm",
+		"CtrlDB-test-run1-vm",
+		"-ctrldb-test-run1-vm",
+		"ctrldb-test-run1-vm-",
+		strings.Repeat("a", 64),
+	}
+	for _, shape := range shapes {
+		for _, name := range invalidNames {
+			identity := isolation.ResourceIdentity{
+				Project: "example-test-project", Service: isolation.ComputeServiceName,
+				Kind: shape.kind, Scope: shape.scope, Location: shape.location, Name: name,
+			}
+			if _, err := isolation.CanonicalTargetKey(identity); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+				t.Errorf("CanonicalTargetKey(%s, invalid name %q) error = %v; want ErrInvalidGuardInput", shape.kind, name, err)
+			}
+		}
+	}
+
+	nonCompute := isolation.ResourceIdentity{
+		Project: "example-test-project", Service: "example.googleapis.com", Kind: "widgets",
+		Scope: isolation.ResourceScopeGlobal, Location: "global", Name: "provider_name.with-dot",
+	}
+	if _, err := isolation.CanonicalTargetKey(nonCompute); err != nil {
+		t.Fatalf("CanonicalTargetKey(non-Compute provider grammar) unexpected error: %v", err)
+	}
+}
+
+func TestMaxLengthRunIDProducesValidComputeNamesAndTags(t *testing.T) {
+	t.Parallel()
+
+	runID := strings.Repeat("a", 32)
+	for _, purpose := range []isolation.FirewallPurpose{isolation.FirewallPurposeIAPSSH, isolation.FirewallPurposeInternalMongo} {
+		name, err := isolation.RunFirewallRuleName(runID, purpose)
+		if err != nil {
+			t.Fatalf("RunFirewallRuleName(%q) unexpected error: %v", purpose, err)
+		}
+		if len(name) > 63 {
+			t.Fatalf("RunFirewallRuleName(%q) length = %d; want at most 63", purpose, len(name))
+		}
+		identity := isolation.ResourceIdentity{
+			Project: "example-test-project", Service: isolation.ComputeServiceName,
+			Kind: isolation.ComputeFirewallKind, Scope: isolation.ResourceScopeGlobal, Location: "global", Name: name,
+		}
+		if _, err := isolation.CanonicalTargetKey(identity); err != nil {
+			t.Fatalf("CanonicalTargetKey(generated firewall name) unexpected error: %v", err)
+		}
+	}
+
+	tag, err := isolation.RunNodeTag(runID)
+	if err != nil {
+		t.Fatalf("RunNodeTag() unexpected error: %v", err)
+	}
+	if len(tag) > 63 {
+		t.Fatalf("RunNodeTag() length = %d; want at most 63", len(tag))
+	}
+	if err := isolation.ValidateFirewallTags([]string{tag}, []string{tag}); err != nil {
+		t.Fatalf("ValidateFirewallTags(generated tag) unexpected error: %v", err)
+	}
+}
+
 func TestSelectExpiredTargetsFailsClosedAndReturnsDetachedSortedResults(t *testing.T) {
 	t.Parallel()
 
@@ -498,6 +587,12 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 		{name: "operation ID proof", mutate: func(value *isolation.PreMutationInput) { value.Operation.OperationID = "Operation 1" }, kind: isolation.ErrInvalidGuardInput},
 		{name: "step ID proof", mutate: func(value *isolation.PreMutationInput) { value.Operation.StepID = "create/test" }, kind: isolation.ErrInvalidGuardInput},
 		{name: "selector proof", mutate: func(value *isolation.PreMutationInput) { value.RunID = "different" }, kind: isolation.ErrUnsafeTarget},
+		{name: "Compute target underscore", mutate: func(value *isolation.PreMutationInput) {
+			value.Targets[0].Identity.Name = "ctrldb-test-run1_vm"
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "Compute target overlong", mutate: func(value *isolation.PreMutationInput) {
+			value.Targets[0].Identity.Name = "ctrldb-test-run1-" + strings.Repeat("a", 47)
+		}, kind: isolation.ErrInvalidGuardInput},
 		{name: "capacity proof", mutate: func(value *isolation.PreMutationInput) {
 			value.Capacity.Instances[0].Machine.VCPUs = 8
 			refreshCapacityFingerprint(&value.Capacity)

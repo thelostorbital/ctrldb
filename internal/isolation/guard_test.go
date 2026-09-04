@@ -5,6 +5,7 @@ package isolation_test
 
 import (
 	"errors"
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
@@ -574,9 +575,13 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RevalidatePreMutation() unexpected error: %v", err)
 	}
-	boundary.Targets[0].Labels[config.LabelPurpose] = "changed"
-	if input.Targets[0].Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
-		t.Fatal("RevalidatePreMutation() targets alias authorization input")
+	boundaryIntents := boundary.Intents()
+	boundaryTarget := boundaryIntents[0].Target()
+	boundaryTarget.Labels[config.LabelPurpose] = "changed"
+	for _, target := range input.Targets {
+		if target.Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
+			t.Fatal("RevalidatePreMutation() intents alias authorization input")
+		}
 	}
 
 	tests := []struct {
@@ -609,6 +614,7 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 		{name: "permission proof", mutate: func(value *isolation.PreMutationInput) { value.Permissions.Observed = nil }, kind: isolation.ErrPermissionProof},
 		{name: "mutation principal proof", mutate: func(value *isolation.PreMutationInput) { value.MutationPrincipal = value.HarnessPrincipal }, kind: isolation.ErrPermissionProof},
 		{name: "firewall proof", mutate: func(value *isolation.PreMutationInput) { value.FirewallRules = value.FirewallRules[:1] }, kind: isolation.ErrUnsafeFirewall},
+		{name: "disabled firewall proof", mutate: func(value *isolation.PreMutationInput) { value.FirewallRules[0].Enabled = false }, kind: isolation.ErrUnsafeFirewall},
 		{name: "freshness proof", mutate: func(value *isolation.PreMutationInput) { value.Freshness.ValidUntil = value.Freshness.ObservedAt }, kind: isolation.ErrStaleProof},
 	}
 	for _, test := range tests {
@@ -621,6 +627,249 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 				t.Fatalf("AuthorizePreMutation() error = %v; want %v", err, test.kind)
 			}
 		})
+	}
+}
+
+func TestPreMutationAcceptsOnlyCompleteTypedCreateIntents(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*isolation.PreMutationInput)
+	}{
+		{name: "missing intent", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents = value.MutationIntents[:len(value.MutationIntents)-1]
+		}},
+		{name: "extra intent", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents = append(value.MutationIntents, value.MutationIntents[0])
+		}},
+		{name: "duplicate target", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[1] = value.MutationIntents[0]
+		}},
+		{name: "update action", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[0].Action = "update"
+		}},
+		{name: "delete action", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[0].Action = "delete"
+		}},
+		{name: "destructive role on create", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[0].RequiredPrincipalRole = isolation.TestPrincipalRoleDestructive
+		}},
+		{name: "mismatched target", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[0].Target = cloneMutationTargetForTest(value.Targets[1])
+		}},
+		{name: "instance state missing", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[0].Create.Instance = nil
+		}},
+		{name: "instance state has second union member", mutate: func(value *isolation.PreMutationInput) {
+			firewall := cloneFirewallRule(value.FirewallRules[0])
+			value.MutationIntents[0].Create.Firewall = &firewall
+		}},
+		{name: "instance state differs from capacity", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[0].Create.Instance.Machine.MemoryMB++
+		}},
+		{name: "instance state identity differs from target", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[0].Create.Instance.Identity = value.Capacity.Disks[0].Identity
+		}},
+		{name: "firewall state missing", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[1].Create.Firewall = nil
+		}},
+		{name: "firewall state differs from proof", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[1].Create.Firewall.Ports[0] = 443
+		}},
+		{name: "firewall state identity differs from target", mutate: func(value *isolation.PreMutationInput) {
+			value.MutationIntents[1].Create.Firewall.Identity = value.FirewallRules[1].Identity
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			input := validPreMutationInput()
+			test.mutate(&input)
+			if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), input, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) && !errors.Is(err, isolation.ErrPermissionProof) {
+				t.Fatalf("AuthorizePreMutation() error = %v; want a fail-closed intent or principal error", err)
+			}
+		})
+	}
+}
+
+func TestPreMutationIntentAndDesiredStateAreFingerprintBound(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	decision, err := isolation.AuthorizePreMutation(policy, validPreMutationInput(), authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+
+	changedAction := freshPreMutationInput()
+	changedAction.MutationIntents[0].Action = "delete"
+	if _, err := isolation.RevalidatePreMutation(decision, policy, changedAction, revalidationNow()); err == nil {
+		t.Fatal("RevalidatePreMutation() accepted a delete derived from create authorization")
+	}
+
+	changedState := freshPreMutationInput()
+	changedState.Capacity.Instances[0].Machine.MemoryMB++
+	refreshCapacityFingerprint(&changedState.Capacity)
+	changedState.MutationIntents = validMutationIntents(changedState)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, changedState, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(changed desired state) error = %v; want ErrProofMismatch", err)
+	}
+}
+
+func TestMutationBoundarySealsAndDetachesProviderRequests(t *testing.T) {
+	t.Parallel()
+
+	input := validPreMutationInput()
+	policy := validPreMutationPolicy()
+	decision, err := isolation.AuthorizePreMutation(policy, input, authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	fresh := freshPreMutationInput()
+	boundary, err := isolation.RevalidatePreMutation(decision, policy, fresh, revalidationNow())
+	if err != nil {
+		t.Fatalf("RevalidatePreMutation() unexpected error: %v", err)
+	}
+	if boundary.Operation() != fresh.Operation || boundary.Principal() != operatorPrincipal() {
+		t.Fatal("MutationBoundary did not carry the validated operation and configured operator")
+	}
+
+	intents := boundary.Intents()
+	if len(intents) != len(fresh.Targets) {
+		t.Fatalf("MutationBoundary intent count = %d; want %d", len(intents), len(fresh.Targets))
+	}
+	for _, intent := range intents {
+		if intent.Action() != isolation.MutationActionCreate || intent.RequiredPrincipalRole() != isolation.TestPrincipalRoleOperator {
+			t.Fatal("MutationBoundary exposed a non-create or non-operator request")
+		}
+	}
+
+	firstTarget := intents[0].Target()
+	firstTarget.Labels[config.LabelPurpose] = "changed"
+	for _, intent := range boundary.Intents() {
+		if intent.Target().Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
+			t.Fatal("MutationBoundary target labels alias an earlier accessor result")
+		}
+	}
+
+	for _, intent := range intents {
+		firewall, ok := intent.FirewallCreateState()
+		if !ok {
+			continue
+		}
+		firewall.Ports[0] = 443
+		if len(firewall.SourceCIDRs) > 0 {
+			firewall.SourceCIDRs[0] = "10.99.0.0/24"
+		}
+		if len(firewall.SourceTags) > 0 {
+			firewall.SourceTags[0] = "changed"
+		}
+		firewall.TargetTags[0] = "changed"
+	}
+	fresh.MutationIntents[0].Target.Labels[config.LabelPurpose] = "changed"
+	for _, intent := range fresh.MutationIntents {
+		if intent.Create.Firewall != nil {
+			intent.Create.Firewall.Ports[0] = 443
+			if len(intent.Create.Firewall.SourceCIDRs) > 0 {
+				intent.Create.Firewall.SourceCIDRs[0] = "10.99.0.0/24"
+			}
+			if len(intent.Create.Firewall.SourceTags) > 0 {
+				intent.Create.Firewall.SourceTags[0] = "changed"
+			}
+			intent.Create.Firewall.TargetTags[0] = "changed"
+		}
+	}
+	for _, intent := range boundary.Intents() {
+		target := intent.Target()
+		if target.Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
+			t.Fatal("MutationBoundary target aliases revalidation input")
+		}
+		if firewall, ok := intent.FirewallCreateState(); ok {
+			if firewall.Ports[0] == 443 || firewall.TargetTags[0] == "changed" ||
+				(len(firewall.SourceCIDRs) > 0 && firewall.SourceCIDRs[0] == "10.99.0.0/24") ||
+				(len(firewall.SourceTags) > 0 && firewall.SourceTags[0] == "changed") {
+				t.Fatal("MutationBoundary firewall state aliases an input or accessor result")
+			}
+		}
+	}
+}
+
+func TestPreMutationPolicyPinsDistinctConfiguredTestPrincipals(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	input := validPreMutationInput()
+	if _, err := isolation.AuthorizePreMutation(policy, input, authorizationNow()); err != nil {
+		t.Fatalf("AuthorizePreMutation(configured operator) unexpected error: %v", err)
+	}
+
+	invalidPolicies := []struct {
+		name   string
+		mutate func(*isolation.PreMutationPolicy)
+	}{
+		{name: "user operator", mutate: func(value *isolation.PreMutationPolicy) {
+			value.TestOperatorPrincipal = isolation.Principal{Kind: isolation.PrincipalKindUser, Subject: "operator@example.test"}
+		}},
+		{name: "missing destructive principal", mutate: func(value *isolation.PreMutationPolicy) {
+			value.TestDestructivePrincipal = isolation.Principal{}
+		}},
+		{name: "same principals", mutate: func(value *isolation.PreMutationPolicy) {
+			value.TestDestructivePrincipal = value.TestOperatorPrincipal
+		}},
+	}
+	for _, test := range invalidPolicies {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			invalid := validPreMutationPolicy()
+			test.mutate(&invalid)
+			if _, err := isolation.AuthorizePreMutation(invalid, validPreMutationInput(), authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+				t.Fatalf("AuthorizePreMutation() error = %v; want ErrInvalidGuardInput", err)
+			}
+		})
+	}
+
+	for _, alternate := range []isolation.Principal{
+		destructivePrincipal(),
+		{Kind: isolation.PrincipalKindServiceAccount, Subject: "other-operator@example-test-project.iam.gserviceaccount.com"},
+	} {
+		alternate := alternate
+		t.Run(alternate.Subject, func(t *testing.T) {
+			t.Parallel()
+			input := validPreMutationInput()
+			input.MutationPrincipal = alternate
+			for index := range input.Permissions.Expected {
+				input.Permissions.Expected[index].Identity = alternate
+				input.Permissions.Observed[index].Identity = alternate
+			}
+			policy := validPreMutationPolicy()
+			refreshPermissionInventory(&policy, input.Permissions.Expected)
+			if _, err := isolation.AuthorizePreMutation(policy, input, authorizationNow()); !errors.Is(err, isolation.ErrPermissionProof) {
+				t.Fatalf("AuthorizePreMutation(self-consistent alternate principal) error = %v; want ErrPermissionProof", err)
+			}
+		})
+	}
+
+	alternate := isolation.Principal{
+		Kind: isolation.PrincipalKindServiceAccount, Subject: "other-operator@example-test-project.iam.gserviceaccount.com",
+	}
+	decision, err := isolation.AuthorizePreMutation(policy, validPreMutationInput(), authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	fresh := freshPreMutationInput()
+	fresh.MutationPrincipal = alternate
+	for index := range fresh.Permissions.Expected {
+		fresh.Permissions.Expected[index].Identity = alternate
+		fresh.Permissions.Observed[index].Identity = alternate
+	}
+	changedPolicy := validPreMutationPolicy()
+	changedPolicy.TestOperatorPrincipal = alternate
+	refreshPermissionInventory(&changedPolicy, fresh.Permissions.Expected)
+	if _, err := isolation.RevalidatePreMutation(decision, changedPolicy, fresh, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(changed configured principal) error = %v; want ErrProofMismatch", err)
 	}
 }
 
@@ -665,6 +914,7 @@ func TestPreMutationCapacityProofUsesTheFullPlannedInventory(t *testing.T) {
 
 	input := validPreMutationInput()
 	input.Targets = firewallTargets("run1")
+	input.MutationIntents = validMutationIntents(input)
 	if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), input, authorizationNow()); err != nil {
 		t.Fatalf("AuthorizePreMutation(firewall-only mutation with planned instance capacity) unexpected error: %v", err)
 	}
@@ -946,7 +1196,7 @@ func TestPreMutationBindsDurableAttemptButRequiresExternalAtomicConsumption(t *t
 		if err != nil {
 			t.Fatalf("RevalidatePreMutation() unexpected error: %v", err)
 		}
-		if boundary.Operation != validPreMutationInput().Operation {
+		if boundary.Operation() != validPreMutationInput().Operation {
 			t.Fatal("RevalidatePreMutation() returned the wrong durable attempt binding")
 		}
 	}
@@ -1091,6 +1341,7 @@ func TestPreMutationDecisionRejectsStaleSwappedAndExpiredEvidence(t *testing.T) 
 	swapped.Targets[0].Identity.CanonicalKey = mustCanonicalTargetKey(swapped.Targets[0].Identity)
 	swapped.Capacity.Instances[0].Identity = swapped.Targets[0].Identity
 	refreshCapacityFingerprint(&swapped.Capacity)
+	swapped.MutationIntents = validMutationIntents(swapped)
 	if _, err := isolation.RevalidatePreMutation(decision, policy, swapped, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(swapped target) error = %v; want ErrProofMismatch", err)
 	}
@@ -1175,6 +1426,7 @@ func validPreMutationInput() isolation.PreMutationInput {
 		},
 	}
 	refreshCapacityFingerprint(&input.Capacity)
+	input.MutationIntents = validMutationIntents(input)
 	return input
 }
 
@@ -1207,10 +1459,12 @@ func validPreMutationPolicy() isolation.PreMutationPolicy {
 		panic(err)
 	}
 	return isolation.PreMutationPolicy{
-		ProjectID:           "example-test-project",
-		RunLimits:           defaultLimits(),
-		TestCIDR:            input.TestCIDR,
-		PermissionInventory: isolation.PolicyInventoryPin{ID: "permission-inventory", Version: "v1", Fingerprint: permissions},
+		ProjectID:                "example-test-project",
+		RunLimits:                defaultLimits(),
+		TestCIDR:                 input.TestCIDR,
+		TestOperatorPrincipal:    operatorPrincipal(),
+		TestDestructivePrincipal: destructivePrincipal(),
+		PermissionInventory:      isolation.PolicyInventoryPin{ID: "permission-inventory", Version: "v1", Fingerprint: permissions},
 		NonDisposableEnvironmentInventory: isolation.PolicyInventoryPin{
 			ID: "environment-inventory", Version: "v1", Fingerprint: environments,
 		},
@@ -1242,6 +1496,47 @@ func refreshRunLifetimeFingerprint(input *isolation.PreMutationInput) {
 	for index := range input.FirewallRules {
 		input.FirewallRules[index].LifetimeContractFingerprint = fingerprint
 	}
+	for index := range input.MutationIntents {
+		if input.MutationIntents[index].Create.Firewall != nil {
+			input.MutationIntents[index].Create.Firewall.LifetimeContractFingerprint = fingerprint
+		}
+	}
+}
+
+func validMutationIntents(input isolation.PreMutationInput) []isolation.MutationIntent {
+	intents := make([]isolation.MutationIntent, 0, len(input.Targets))
+	for _, target := range input.Targets {
+		intent := isolation.MutationIntent{
+			Action:                isolation.MutationActionCreate,
+			Target:                cloneMutationTargetForTest(target),
+			RequiredPrincipalRole: isolation.TestPrincipalRoleOperator,
+		}
+		switch target.Identity.Kind {
+		case isolation.ComputeInstanceKind:
+			for _, instance := range input.Capacity.Instances {
+				if instance.Identity.CanonicalKey == target.Identity.CanonicalKey {
+					instance := instance
+					intent.Create.Instance = &instance
+					break
+				}
+			}
+		case isolation.ComputeFirewallKind:
+			for _, firewall := range input.FirewallRules {
+				if firewall.Identity.CanonicalKey == target.Identity.CanonicalKey {
+					firewall := cloneFirewallRule(firewall)
+					intent.Create.Firewall = &firewall
+					break
+				}
+			}
+		}
+		intents = append(intents, intent)
+	}
+	return intents
+}
+
+func cloneMutationTargetForTest(target isolation.MutationTarget) isolation.MutationTarget {
+	target.Labels = maps.Clone(target.Labels)
+	return target
 }
 
 func cloneFirewallRulesForTest(rules []isolation.FirewallRule) []isolation.FirewallRule {
@@ -1278,6 +1573,7 @@ func moveAllResourceProjects(input *isolation.PreMutationInput, project string) 
 		moveResourceProject(&input.Permissions.Observed[index].Resource, project)
 	}
 	refreshCapacityFingerprint(&input.Capacity)
+	input.MutationIntents = validMutationIntents(*input)
 }
 
 func testTarget(name, runID string) isolation.MutationTarget {
@@ -1333,5 +1629,13 @@ func harnessPrincipal() isolation.Principal {
 }
 
 func operatorPrincipal() isolation.Principal {
-	return isolation.Principal{Kind: isolation.PrincipalKindUser, Subject: "operator@example.test"}
+	return isolation.Principal{
+		Kind: isolation.PrincipalKindServiceAccount, Subject: "test-operator@example-test-project.iam.gserviceaccount.com",
+	}
+}
+
+func destructivePrincipal() isolation.Principal {
+	return isolation.Principal{
+		Kind: isolation.PrincipalKindServiceAccount, Subject: "test-destructive@example-test-project.iam.gserviceaccount.com",
+	}
 }

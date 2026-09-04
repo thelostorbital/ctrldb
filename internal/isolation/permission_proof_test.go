@@ -85,11 +85,37 @@ func TestTESTISO09PermissionProofRejectsForbiddenServiceWrites(t *testing.T) {
 
 	reads := []isolation.PermissionObservation{
 		{Identity: operatorPrincipal(), Resource: permissionResource("production-policy"), Permission: "monitoring.alertPolicies.get", Granted: true},
+		{Identity: operatorPrincipal(), Resource: permissionResource("production-metrics"), Permission: "monitoring.timeSeries.query", Granted: true},
 		{Identity: operatorPrincipal(), Resource: permissionResource("production-job"), Permission: "cloudscheduler.jobs.list", Granted: true},
+		{Identity: operatorPrincipal(), Resource: permissionResource("production-job-view"), Permission: "cloudscheduler.jobs.fullView", Granted: true},
 		{Identity: operatorPrincipal(), Resource: permissionResource("production-service"), Permission: "run.services.get", Granted: true},
 	}
 	if err := isolation.ValidatePermissionProof(permissionPin(reads), permissionProofInput(reads, reads), operatorPrincipal()); err != nil {
 		t.Fatalf("ValidatePermissionProof(reads) unexpected error: %v", err)
+	}
+
+	lookalikes := []string{
+		"monitoring.alertPolicies.query",
+		"monitoring.timeSeries.fullView",
+		"cloudscheduler.jobs.query",
+		"cloudscheduler.locations.fullView",
+		"run.timeSeries.query",
+		"run.jobs.fullView",
+		"monitoring.timeSeries.read",
+	}
+	for _, permission := range lookalikes {
+		permission := permission
+		t.Run("reject "+permission, func(t *testing.T) {
+			t.Parallel()
+			observation := isolation.PermissionObservation{
+				Identity: operatorPrincipal(), Resource: permissionResource("production-resource"), Permission: permission, Granted: true,
+			}
+			if err := isolation.ValidatePermissionProof(permissionPin([]isolation.PermissionObservation{observation}), permissionProofInput(
+				[]isolation.PermissionObservation{observation}, []isolation.PermissionObservation{observation},
+			), operatorPrincipal()); !errors.Is(err, isolation.ErrForbiddenPermission) {
+				t.Fatalf("ValidatePermissionProof() error = %v; want ErrForbiddenPermission", err)
+			}
+		})
 	}
 }
 

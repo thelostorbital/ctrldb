@@ -12,8 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -502,6 +504,81 @@ type OperationBinding struct {
 	Attempt     uint32
 }
 
+// MutationAction is a closed provider verb admitted by the test-isolation
+// boundary. M-0 proves creation only; update and delete require their own
+// future proof families and cannot be represented by this type.
+type MutationAction string
+
+const MutationActionCreate MutationAction = "create"
+
+// TestPrincipalRole selects one exact trusted test identity. Creation is
+// operator-only; the destructive role is reserved for a future exhaustively
+// validated cleanup intent.
+type TestPrincipalRole string
+
+const (
+	TestPrincipalRoleOperator    TestPrincipalRole = "operator"
+	TestPrincipalRoleDestructive TestPrincipalRole = "destructive"
+)
+
+// CreateDesiredState is a closed typed union. Exactly one member must be set
+// and its identity and values must equal the independently validated capacity
+// or firewall proof for the target.
+type CreateDesiredState struct {
+	Instance *PlannedInstance
+	Firewall *FirewallRule
+}
+
+// MutationIntent is the proposed, untrusted request that binds one exact
+// create verb, selected target, typed desired state, and required identity.
+type MutationIntent struct {
+	Action                MutationAction
+	Target                MutationTarget
+	RequiredPrincipalRole TestPrincipalRole
+	Create                CreateDesiredState
+}
+
+// AuthorizedMutationIntent is the sealed, detached provider request returned
+// only after immediate revalidation. Accessors return values or deep copies so
+// callers cannot turn a validated create into another action or desired state.
+type AuthorizedMutationIntent struct {
+	action                MutationAction
+	target                MutationTarget
+	requiredPrincipalRole TestPrincipalRole
+	create                CreateDesiredState
+}
+
+// Action returns the exact validated provider verb.
+func (intent AuthorizedMutationIntent) Action() MutationAction { return intent.action }
+
+// Target returns a detached copy of the exact validated resource target.
+func (intent AuthorizedMutationIntent) Target() MutationTarget {
+	return cloneMutationTarget(intent.target)
+}
+
+// RequiredPrincipalRole returns the trusted identity class required by Action.
+func (intent AuthorizedMutationIntent) RequiredPrincipalRole() TestPrincipalRole {
+	return intent.requiredPrincipalRole
+}
+
+// InstanceCreateState returns the validated instance state when this is an
+// instance-create intent.
+func (intent AuthorizedMutationIntent) InstanceCreateState() (PlannedInstance, bool) {
+	if intent.create.Instance == nil {
+		return PlannedInstance{}, false
+	}
+	return *intent.create.Instance, true
+}
+
+// FirewallCreateState returns a detached copy of the validated firewall state
+// when this is a firewall-create intent.
+func (intent AuthorizedMutationIntent) FirewallCreateState() (FirewallRule, bool) {
+	if intent.create.Firewall == nil {
+		return FirewallRule{}, false
+	}
+	return cloneFirewallRules([]FirewallRule{*intent.create.Firewall})[0], true
+}
+
 // PolicyInventoryPin is a policy-owned name, version, and expected content
 // fingerprint. It is passed separately from discovered proof values so the
 // mutation boundary can source it from a trusted configuration boundary.
@@ -520,6 +597,8 @@ type PreMutationPolicy struct {
 	ProjectID                         string
 	RunLimits                         RunLimits
 	TestCIDR                          string
+	TestOperatorPrincipal             Principal
+	TestDestructivePrincipal          Principal
 	PermissionInventory               PolicyInventoryPin
 	NonDisposableEnvironmentInventory PolicyInventoryPin
 	ProductionCIDRInventory           PolicyInventoryPin
@@ -538,6 +617,7 @@ type PreMutationInput struct {
 	Locks                             []EnvironmentLock
 	HarnessPrincipal                  Principal
 	MutationPrincipal                 Principal
+	MutationIntents                   []MutationIntent
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
 	// RunLifetime is the currently discovered immutable lifetime-record
@@ -556,12 +636,27 @@ type PreMutationDecision struct {
 	validUntil   time.Time
 }
 
-// MutationBoundary is the detached result for immediate provider-boundary
-// use. The caller must atomically claim Operation in its durable journal before
-// using Targets; repeated pure validation is not atomic consumption.
+// MutationBoundary is the detached result for immediate provider-boundary use.
+// The caller must atomically claim Operation in its durable journal, then a
+// future provider adapter must execute each typed Intent verbatim as Principal;
+// repeated pure validation is not atomic consumption.
 type MutationBoundary struct {
-	Operation OperationBinding
-	Targets   []MutationTarget
+	operation OperationBinding
+	principal Principal
+	intents   []AuthorizedMutationIntent
+}
+
+// Operation returns the exact durable operation attempt bound to this result.
+func (boundary MutationBoundary) Operation() OperationBinding { return boundary.operation }
+
+// Principal returns the exact configured service account authorized to execute
+// the boundary's intents.
+func (boundary MutationBoundary) Principal() Principal { return boundary.principal }
+
+// Intents returns detached provider requests. A future adapter must consume
+// their actions, targets, and desired states verbatim.
+func (boundary MutationBoundary) Intents() []AuthorizedMutationIntent {
+	return cloneAuthorizedMutationIntents(boundary.intents)
 }
 
 // AuthorizePreMutation evaluates every local isolation proof and returns an
@@ -582,8 +677,8 @@ func AuthorizePreMutation(policy PreMutationPolicy, input PreMutationInput, now 
 }
 
 // RevalidatePreMutation reevaluates fresh input at the mutation boundary and
-// returns detached exact targets only when no semantic evidence changed. The
-// returned targets are for immediate provider-boundary consumption only. The
+// returns detached typed intents only when no semantic evidence changed. The
+// returned intents are for immediate provider-boundary consumption only. The
 // fresh observation must be strictly newer than the authorization boundary
 // and retain the original fixed expiry. The caller must independently sample
 // now at this boundary; that clock cannot move backward from authorization.
@@ -595,17 +690,21 @@ func RevalidatePreMutation(decision PreMutationDecision, policy PreMutationPolic
 		!fresh.Freshness.ObservedAt.After(decision.authorizedAt) || !fresh.Freshness.ValidUntil.Equal(decision.validUntil) {
 		return MutationBoundary{}, guardError(ErrStaleProof, "freshness", "does not satisfy immediate revalidation")
 	}
-	targets, fingerprint, err := evaluatePreMutation(policy, fresh, now)
+	intents, fingerprint, err := evaluatePreMutation(policy, fresh, now)
 	if err != nil {
 		return MutationBoundary{}, err
 	}
 	if fingerprint != decision.fingerprint || fresh.Operation != decision.operation {
 		return MutationBoundary{}, guardError(ErrProofMismatch, "evidence", "changed since authorization")
 	}
-	return MutationBoundary{Operation: fresh.Operation, Targets: targets}, nil
+	return MutationBoundary{
+		operation: fresh.Operation,
+		principal: fresh.MutationPrincipal,
+		intents:   authorizeMutationIntents(intents),
+	}, nil
 }
 
-func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now time.Time) ([]MutationTarget, [sha256.Size]byte, error) {
+func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now time.Time) ([]MutationIntent, [sha256.Size]byte, error) {
 	var zero [sha256.Size]byte
 	if len(input.Targets) == 0 {
 		return nil, zero, guardError(ErrInvalidGuardInput, "targets", "must not be empty")
@@ -645,11 +744,15 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	}); err != nil {
 		return nil, zero, err
 	}
-	fingerprint, err := preMutationFingerprint(policy, input, targets)
+	intents, err := validateMutationIntents(policy, input, targets)
 	if err != nil {
 		return nil, zero, err
 	}
-	return targets, fingerprint, nil
+	fingerprint, err := preMutationFingerprint(policy, input, targets, intents)
+	if err != nil {
+		return nil, zero, err
+	}
+	return intents, fingerprint, nil
 }
 
 func validateCapacityProof(capacity CapacityProofInput, limits RunLimits, runID string, targets []MutationTarget) error {
@@ -734,6 +837,93 @@ func validateCapacityProof(capacity CapacityProofInput, limits RunLimits, runID 
 		EstimatedCostMicros: capacity.EstimatedCostMicros,
 	}
 	return ValidateRunRequest(limits, request)
+}
+
+func validateMutationIntents(policy PreMutationPolicy, input PreMutationInput, targets []MutationTarget) ([]MutationIntent, error) {
+	if len(input.MutationIntents) != len(targets) {
+		return nil, guardError(ErrInvalidGuardInput, "mutationIntents", "must contain exactly one intent per selected target")
+	}
+	if input.MutationPrincipal != policy.TestOperatorPrincipal {
+		return nil, guardError(ErrPermissionProof, "mutationPrincipal", "does not match the configured test operator")
+	}
+
+	targetsByKey := make(map[string]MutationTarget, len(targets))
+	for _, target := range targets {
+		targetsByKey[target.Identity.CanonicalKey] = target
+	}
+	instancesByKey := make(map[string]PlannedInstance, len(input.Capacity.Instances))
+	for _, instance := range input.Capacity.Instances {
+		instancesByKey[instance.Identity.CanonicalKey] = instance
+	}
+	firewallsByKey := make(map[string]FirewallRule, len(input.FirewallRules))
+	for _, firewall := range input.FirewallRules {
+		firewallsByKey[firewall.Identity.CanonicalKey] = firewall
+	}
+
+	seen := make(map[string]struct{}, len(input.MutationIntents))
+	validated := make([]MutationIntent, 0, len(input.MutationIntents))
+	for index, intent := range input.MutationIntents {
+		path := indexedField("mutationIntents", index)
+		if intent.Action != MutationActionCreate {
+			return nil, guardError(ErrInvalidGuardInput, path+".action", "is not an admitted provider action")
+		}
+		if intent.RequiredPrincipalRole != TestPrincipalRoleOperator {
+			return nil, guardError(ErrPermissionProof, path+".requiredPrincipalRole", "does not select the configured test operator")
+		}
+		if err := validateMutationTarget(intent.Target); err != nil {
+			return nil, guardError(err, path+".target", "is not a valid disposable target")
+		}
+		wantTarget, exists := targetsByKey[intent.Target.Identity.CanonicalKey]
+		if !exists || !equalMutationTarget(intent.Target, wantTarget) {
+			return nil, guardError(ErrInvalidGuardInput, path+".target", "does not match one selected target")
+		}
+		if _, exists := seen[intent.Target.Identity.CanonicalKey]; exists {
+			return nil, guardError(ErrInvalidGuardInput, path+".target", "duplicates an earlier intent")
+		}
+
+		switch {
+		case intent.Target.Identity.Service == ComputeServiceName && intent.Target.Identity.Kind == ComputeInstanceKind:
+			if intent.Create.Instance == nil || intent.Create.Firewall != nil {
+				return nil, guardError(ErrInvalidGuardInput, path+".create", "must contain only typed instance state")
+			}
+			want, exists := instancesByKey[intent.Target.Identity.CanonicalKey]
+			if !exists || *intent.Create.Instance != want {
+				return nil, guardError(ErrInvalidGuardInput, path+".create.instance", "does not match the validated capacity proof")
+			}
+		case intent.Target.Identity.Service == ComputeServiceName && intent.Target.Identity.Kind == ComputeFirewallKind:
+			if intent.Create.Firewall == nil || intent.Create.Instance != nil {
+				return nil, guardError(ErrInvalidGuardInput, path+".create", "must contain only typed firewall state")
+			}
+			want, exists := firewallsByKey[intent.Target.Identity.CanonicalKey]
+			if !exists || !equalFirewallRule(*intent.Create.Firewall, want) {
+				return nil, guardError(ErrInvalidGuardInput, path+".create.firewall", "does not match the validated firewall proof")
+			}
+		default:
+			return nil, guardError(ErrInvalidGuardInput, path+".target", "has no admitted typed create state")
+		}
+
+		seen[intent.Target.Identity.CanonicalKey] = struct{}{}
+		validated = append(validated, cloneMutationIntent(intent))
+	}
+	if len(seen) != len(targetsByKey) {
+		return nil, guardError(ErrInvalidGuardInput, "mutationIntents", "is missing a selected target")
+	}
+	sort.Slice(validated, func(i, j int) bool {
+		return validated[i].Target.Identity.CanonicalKey < validated[j].Target.Identity.CanonicalKey
+	})
+	return validated, nil
+}
+
+func equalMutationTarget(first, second MutationTarget) bool {
+	return first.Identity == second.Identity && maps.Equal(first.Labels, second.Labels)
+}
+
+func equalFirewallRule(first, second FirewallRule) bool {
+	return first.Identity == second.Identity && first.Network == second.Network && first.RunID == second.RunID &&
+		first.Purpose == second.Purpose && first.Enabled == second.Enabled && first.Protocol == second.Protocol &&
+		slices.Equal(first.Ports, second.Ports) && slices.Equal(first.SourceCIDRs, second.SourceCIDRs) &&
+		slices.Equal(first.SourceTags, second.SourceTags) && slices.Equal(first.TargetTags, second.TargetTags) &&
+		first.LifetimeContractFingerprint == second.LifetimeContractFingerprint
 }
 
 // CapacitySnapshotFingerprint returns the deterministic identity of the
@@ -898,6 +1088,20 @@ func validatePreMutationPolicy(policy PreMutationPolicy, input PreMutationInput)
 	if err := validateRunLimits(policy.RunLimits); err != nil {
 		return err
 	}
+	for _, principal := range []struct {
+		path  string
+		value Principal
+	}{
+		{path: "policy.testOperatorPrincipal", value: policy.TestOperatorPrincipal},
+		{path: "policy.testDestructivePrincipal", value: policy.TestDestructivePrincipal},
+	} {
+		if principal.value.Kind != PrincipalKindServiceAccount || !validPrincipal(principal.value) {
+			return guardError(ErrInvalidGuardInput, principal.path, "must identify one configured service account")
+		}
+	}
+	if policy.TestOperatorPrincipal == policy.TestDestructivePrincipal {
+		return guardError(ErrInvalidGuardInput, "policy.testPrincipals", "must identify distinct operator and destructive service accounts")
+	}
 	if policy.TestCIDR != input.TestCIDR {
 		return guardError(ErrInvalidGuardInput, "testCIDR", "does not match the configured test-isolation network")
 	}
@@ -1049,13 +1253,19 @@ type preMutationPayload struct {
 	Locks                             []EnvironmentLock
 	HarnessPrincipal                  Principal
 	MutationPrincipal                 Principal
+	MutationIntents                   []MutationIntent
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
 	RunLifetime                       RunLifetimeContract
 	EvidenceRevision                  string
 }
 
-func preMutationFingerprint(policy PreMutationPolicy, input PreMutationInput, targets []MutationTarget) ([sha256.Size]byte, error) {
+func preMutationFingerprint(
+	policy PreMutationPolicy,
+	input PreMutationInput,
+	targets []MutationTarget,
+	intents []MutationIntent,
+) ([sha256.Size]byte, error) {
 	payload := preMutationPayload{
 		Policy:                            policy,
 		Operation:                         input.Operation,
@@ -1068,6 +1278,7 @@ func preMutationFingerprint(policy PreMutationPolicy, input PreMutationInput, ta
 		Locks:                             append([]EnvironmentLock(nil), input.Locks...),
 		HarnessPrincipal:                  input.HarnessPrincipal,
 		MutationPrincipal:                 input.MutationPrincipal,
+		MutationIntents:                   cloneMutationIntents(intents),
 		Permissions: PermissionProofInput{
 			Expected: append([]PermissionObservation(nil), input.Permissions.Expected...),
 			Observed: append([]PermissionObservation(nil), input.Permissions.Observed...),
@@ -1101,6 +1312,9 @@ func preMutationFingerprint(policy PreMutationPolicy, input PreMutationInput, ta
 	})
 	sortPermissionObservations(payload.Permissions.Expected)
 	sortPermissionObservations(payload.Permissions.Observed)
+	sort.Slice(payload.MutationIntents, func(i, j int) bool {
+		return payload.MutationIntents[i].Target.Identity.CanonicalKey < payload.MutationIntents[j].Target.Identity.CanonicalKey
+	})
 	sort.Slice(payload.FirewallRules, func(i, j int) bool {
 		return payload.FirewallRules[i].Purpose < payload.FirewallRules[j].Purpose
 	})
@@ -1138,6 +1352,56 @@ func cloneFirewallRules(rules []FirewallRule) []FirewallRule {
 		rule.SourceTags = append([]string(nil), rule.SourceTags...)
 		rule.TargetTags = append([]string(nil), rule.TargetTags...)
 		cloned[index] = rule
+	}
+	return cloned
+}
+
+func cloneMutationIntents(intents []MutationIntent) []MutationIntent {
+	cloned := make([]MutationIntent, len(intents))
+	for index, intent := range intents {
+		cloned[index] = cloneMutationIntent(intent)
+	}
+	return cloned
+}
+
+func cloneMutationIntent(intent MutationIntent) MutationIntent {
+	intent.Target = cloneMutationTarget(intent.Target)
+	if intent.Create.Instance != nil {
+		instance := *intent.Create.Instance
+		intent.Create.Instance = &instance
+	}
+	if intent.Create.Firewall != nil {
+		firewall := cloneFirewallRules([]FirewallRule{*intent.Create.Firewall})[0]
+		intent.Create.Firewall = &firewall
+	}
+	return intent
+}
+
+func authorizeMutationIntents(intents []MutationIntent) []AuthorizedMutationIntent {
+	authorized := make([]AuthorizedMutationIntent, len(intents))
+	for index, intent := range intents {
+		cloned := cloneMutationIntent(intent)
+		authorized[index] = AuthorizedMutationIntent{
+			action:                cloned.Action,
+			target:                cloned.Target,
+			requiredPrincipalRole: cloned.RequiredPrincipalRole,
+			create:                cloned.Create,
+		}
+	}
+	return authorized
+}
+
+func cloneAuthorizedMutationIntents(intents []AuthorizedMutationIntent) []AuthorizedMutationIntent {
+	cloned := make([]AuthorizedMutationIntent, len(intents))
+	for index, intent := range intents {
+		proposed := MutationIntent{
+			Action:                intent.action,
+			Target:                intent.target,
+			RequiredPrincipalRole: intent.requiredPrincipalRole,
+			Create:                intent.create,
+		}
+		detached := authorizeMutationIntents([]MutationIntent{proposed})[0]
+		cloned[index] = detached
 	}
 	return cloned
 }

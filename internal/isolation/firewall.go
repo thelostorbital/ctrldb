@@ -49,6 +49,7 @@ type FirewallRule struct {
 	Network                     ResourceIdentity
 	RunID                       string
 	Purpose                     FirewallPurpose
+	Enabled                     bool
 	Protocol                    string
 	Ports                       []uint16
 	SourceCIDRs                 []string
@@ -256,6 +257,9 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 	}
 	if rule.RunID != runID {
 		return guardError(ErrUnsafeFirewall, "runID", "does not match the owning run")
+	}
+	if !rule.Enabled {
+		return guardError(ErrUnsafeFirewall, "enabled", "must be enabled")
 	}
 	if err := validateResourceIdentity(rule.Identity); err != nil {
 		return guardError(ErrUnsafeFirewall, "identity", "must be a complete canonical firewall identity")

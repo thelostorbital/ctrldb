@@ -185,7 +185,10 @@ func isForbiddenServiceWrite(permission string) bool {
 	}
 	switch service {
 	case "monitoring", "cloudscheduler", "run":
-		return action != "get" && action != "list" && action != "getIamPolicy"
+		if action == "get" || action == "list" || action == "getIamPolicy" {
+			return false
+		}
+		return permission != "monitoring.timeSeries.query" && permission != "cloudscheduler.jobs.fullView"
 	default:
 		return false
 	}

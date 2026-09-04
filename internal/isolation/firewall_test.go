@@ -33,6 +33,7 @@ func TestTESTISO04FirewallPurposeShapesAreExact(t *testing.T) {
 		}},
 		{name: "malformed rule identity", mutate: func(rule *isolation.FirewallRule) { rule.Identity.Project = "" }},
 		{name: "unknown purpose", mutate: func(rule *isolation.FirewallRule) { rule.Purpose = "other" }},
+		{name: "disabled", mutate: func(rule *isolation.FirewallRule) { rule.Enabled = false }},
 		{name: "wrong protocol", mutate: func(rule *isolation.FirewallRule) { rule.Protocol = "udp" }},
 		{name: "extra port", mutate: func(rule *isolation.FirewallRule) { rule.Ports = append(rule.Ports, 443) }},
 		{name: "production target tag", mutate: func(rule *isolation.FirewallRule) { rule.TargetTags = []string{"production-db"} }},
@@ -68,6 +69,7 @@ func TestTESTISO04InternalMongoDBRuleRequiresMatchingTestTags(t *testing.T) {
 		kind   error
 	}{
 		{name: "wrong port", mutate: func(rule *isolation.FirewallRule) { rule.Ports = []uint16{22} }, kind: isolation.ErrUnsafeFirewall},
+		{name: "disabled", mutate: func(rule *isolation.FirewallRule) { rule.Enabled = false }, kind: isolation.ErrUnsafeFirewall},
 		{name: "CIDR source", mutate: func(rule *isolation.FirewallRule) { rule.SourceCIDRs = []string{"10.20.0.0/24"} }, kind: isolation.ErrUnsafeFirewall},
 		{name: "missing source tag", mutate: func(rule *isolation.FirewallRule) { rule.SourceTags = nil }, kind: isolation.ErrInvalidGuardInput},
 		{name: "different source tag", mutate: func(rule *isolation.FirewallRule) { rule.SourceTags = []string{"ctrldb-test-client"} }, kind: isolation.ErrUnsafeFirewall},
@@ -252,13 +254,13 @@ func firewallRulesForRun(runID string) []isolation.FirewallRule {
 	return []isolation.FirewallRule{
 		{
 			Identity: testResourceIdentity(iapName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"), Network: network, RunID: runID,
-			Purpose: isolation.FirewallPurposeIAPSSH, Protocol: isolation.FirewallProtocolTCP,
+			Purpose: isolation.FirewallPurposeIAPSSH, Enabled: true, Protocol: isolation.FirewallProtocolTCP,
 			Ports: []uint16{isolation.FirewallPortSSH}, SourceCIDRs: []string{isolation.IAPTCPSourceCIDR},
 			TargetTags: []string{nodeTag}, LifetimeContractFingerprint: validLifetimeFingerprint(runID),
 		},
 		{
 			Identity: testResourceIdentity(mongoName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"), Network: network, RunID: runID,
-			Purpose: isolation.FirewallPurposeInternalMongo, Protocol: isolation.FirewallProtocolTCP,
+			Purpose: isolation.FirewallPurposeInternalMongo, Enabled: true, Protocol: isolation.FirewallProtocolTCP,
 			Ports: []uint16{isolation.FirewallPortMongo}, SourceTags: []string{nodeTag},
 			TargetTags: []string{nodeTag}, LifetimeContractFingerprint: validLifetimeFingerprint(runID),
 		},

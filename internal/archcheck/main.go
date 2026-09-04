@@ -162,6 +162,13 @@ func scan(root string) ([]finding, error) {
 			})
 			return nil
 		}
+		matches, matchErr := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+		if matchErr != nil {
+			return fmt.Errorf("evaluate build constraints for %s: %w", path, matchErr)
+		}
+		if !matches {
+			return nil
+		}
 
 		contents, err := os.ReadFile(path)
 		if err != nil {
@@ -229,7 +236,8 @@ func findPackageSecretViolations(sources []sourceFile, packageImporter *architec
 		uses := make(map[*ast.Ident]types.Object)
 		definitions := make(map[*ast.Ident]types.Object)
 		expressionTypes := make(map[ast.Expr]types.TypeAndValue)
-		information := &types.Info{Defs: definitions, Types: expressionTypes, Uses: uses}
+		selections := make(map[*ast.SelectorExpr]*types.Selection)
+		information := &types.Info{Defs: definitions, Selections: selections, Types: expressionTypes, Uses: uses}
 		configuration := types.Config{
 			Importer:                 packageImporter,
 			DisableUnusedImportCheck: true,
@@ -348,6 +356,7 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 	uses := make(map[*ast.Ident]types.Object)
 	definitions := make(map[*ast.Ident]types.Object)
 	expressionTypes := make(map[ast.Expr]types.TypeAndValue)
+	selections := make(map[*ast.SelectorExpr]*types.Selection)
 	packageImporter := newArchitectureImporter("")
 	configuration := types.Config{
 		Importer:                 packageImporter,
@@ -356,9 +365,10 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 	}
 	checkedPackagePath := modulePath + "/.archcheck/" + parsed.Name.Name
 	typeInformation := &types.Info{
-		Defs:  definitions,
-		Types: expressionTypes,
-		Uses:  uses,
+		Defs:       definitions,
+		Selections: selections,
+		Types:      expressionTypes,
+		Uses:       uses,
 	}
 	checkedPackage, _ := configuration.Check(checkedPackagePath, files, []*ast.File{parsed}, typeInformation)
 	facts := findFlowFacts([]*ast.File{parsed}, typeInformation, checkedPackage, packageImporter.summaries, nil)
@@ -574,7 +584,8 @@ func (loader *architectureImporter) importRepositoryPackage(importPath string) (
 	uses := make(map[*ast.Ident]types.Object)
 	definitions := make(map[*ast.Ident]types.Object)
 	expressionTypes := make(map[ast.Expr]types.TypeAndValue)
-	information := &types.Info{Defs: definitions, Types: expressionTypes, Uses: uses}
+	selections := make(map[*ast.SelectorExpr]*types.Selection)
+	information := &types.Info{Defs: definitions, Selections: selections, Types: expressionTypes, Uses: uses}
 	configuration := types.Config{
 		Importer:                 loader,
 		DisableUnusedImportCheck: true,
@@ -641,6 +652,12 @@ func (loader *architectureImporter) summarizeRepositoryPackage(parsedFiles []*as
 	for changed := true; changed; {
 		changed = false
 		symbolic := findFlowFacts(parsedFiles, information, imported, loader.summaries, parameters)
+		for object := range symbolic.formatterReturns {
+			if object.Pkg() == imported && !loader.summaries.formatterReturns[object] {
+				loader.summaries.formatterReturns[object] = true
+				changed = true
+			}
+		}
 		for _, parsed := range parsedFiles {
 			for _, declaration := range parsed.Decls {
 				function, ok := declaration.(*ast.FuncDecl)
@@ -730,7 +747,7 @@ func policyForSource(relativePath string) sourcePolicy {
 		allowRedactionAssertion: normalized == "internal/secret/value_test.go",
 		allowSourceImporter:     normalized == "internal/archcheck/main.go",
 		allowTestInfrastructure: strings.HasSuffix(normalized, "_test.go"),
-		enforceVerifierBoundary: strings.HasPrefix(normalized, "internal/verify/"),
+		enforceVerifierBoundary: strings.HasPrefix(normalized, "internal/verify/") || strings.HasPrefix(normalized, "internal/observation/"),
 	}
 	if policy.allowTestInfrastructure {
 		return policy
@@ -751,9 +768,12 @@ func forbiddenVerifierImportMessage(importPath string) (string, bool) {
 		return "", false
 	}
 	if internalPath, internal := strings.CutPrefix(importPath, modulePath+"/internal/"); internal {
+		if internalPath == "observation" {
+			return "", false
+		}
 		component := strings.Split(internalPath, "/")[0]
 		switch component {
-		case "domain", "observation", "verify":
+		case "domain", "verify":
 			return "", false
 		}
 	}
@@ -778,12 +798,17 @@ type flowFacts struct {
 	secretReturns           map[types.Object]bool
 	formatterReturns        map[types.Object]bool
 	functionParameters      map[types.Object][]types.Object
+	functionReceivers       map[types.Object]types.Object
 	methodParameters        map[string][][]types.Object
+	methodReceivers         map[string][]types.Object
 	aliases                 map[types.Object]map[types.Object]bool
 	functionLiterals        map[types.Object]map[*ast.FuncLit]bool
+	functionLiteralReturns  map[types.Object]map[*ast.FuncLit]bool
 	literalParameters       map[*ast.FuncLit][]types.Object
 	literalSecretReturns    map[*ast.FuncLit]bool
 	literalFormatterReturns map[*ast.FuncLit]bool
+	literalLiteralReturns   map[*ast.FuncLit]map[*ast.FuncLit]bool
+	formatterLiterals       map[*ast.FuncLit]bool
 	literals                []*ast.FuncLit
 }
 
@@ -810,12 +835,17 @@ func newFlowFacts(summaries *flowSummaries) *flowFacts {
 		secretReturns:           make(map[types.Object]bool),
 		formatterReturns:        make(map[types.Object]bool),
 		functionParameters:      make(map[types.Object][]types.Object),
+		functionReceivers:       make(map[types.Object]types.Object),
 		methodParameters:        make(map[string][][]types.Object),
+		methodReceivers:         make(map[string][]types.Object),
 		aliases:                 make(map[types.Object]map[types.Object]bool),
 		functionLiterals:        make(map[types.Object]map[*ast.FuncLit]bool),
+		functionLiteralReturns:  make(map[types.Object]map[*ast.FuncLit]bool),
 		literalParameters:       make(map[*ast.FuncLit][]types.Object),
 		literalSecretReturns:    make(map[*ast.FuncLit]bool),
 		literalFormatterReturns: make(map[*ast.FuncLit]bool),
+		literalLiteralReturns:   make(map[*ast.FuncLit]map[*ast.FuncLit]bool),
+		formatterLiterals:       make(map[*ast.FuncLit]bool),
 	}
 	if summaries == nil {
 		return facts
@@ -850,6 +880,11 @@ func findFlowFacts(parsedFiles []*ast.File, information *types.Info, checkedPack
 			parameters := parameterObjects(function.Type.Params, information)
 			facts.functionParameters[object] = parameters
 			if function.Recv != nil {
+				receivers := parameterObjects(function.Recv, information)
+				if len(receivers) != 0 {
+					facts.functionReceivers[object] = receivers[0]
+					facts.methodReceivers[function.Name.Name] = append(facts.methodReceivers[function.Name.Name], receivers[0])
+				}
 				facts.methodParameters[function.Name.Name] = append(facts.methodParameters[function.Name.Name], parameters)
 			}
 		}
@@ -918,7 +953,11 @@ func findFlowFacts(parsedFiles []*ast.File, information *types.Info, checkedPack
 						if expressionContainsSecret(result, information, facts) && markObject(object, facts.secretReturns) {
 							changed = true
 						}
-						if expressionIsFormatter(result, information, facts) && markObject(object, facts.formatterReturns) {
+						if (expressionIsFormatter(result, information, facts) || expressionContainsFormatterClosure(result, information, facts)) &&
+							markObject(object, facts.formatterReturns) {
+							changed = true
+						}
+						if markReturnedFunctionLiterals(object, expressionFunctionLiterals(result, information, facts), facts.functionLiteralReturns) {
 							changed = true
 						}
 					}
@@ -927,6 +966,10 @@ func findFlowFacts(parsedFiles []*ast.File, information *types.Info, checkedPack
 			}
 		}
 		for _, literal := range facts.literals {
+			if functionBodyFormatsSecret(literal.Body, information, facts) && !facts.formatterLiterals[literal] {
+				facts.formatterLiterals[literal] = true
+				changed = true
+			}
 			ast.Inspect(literal.Body, func(node ast.Node) bool {
 				if nested, ok := node.(*ast.FuncLit); ok && nested != literal {
 					return false
@@ -940,8 +983,12 @@ func findFlowFacts(parsedFiles []*ast.File, information *types.Info, checkedPack
 						facts.literalSecretReturns[literal] = true
 						changed = true
 					}
-					if expressionIsFormatter(result, information, facts) && !facts.literalFormatterReturns[literal] {
+					if (expressionIsFormatter(result, information, facts) || expressionContainsFormatterClosure(result, information, facts)) &&
+						!facts.literalFormatterReturns[literal] {
 						facts.literalFormatterReturns[literal] = true
+						changed = true
+					}
+					if markLiteralFunctionLiterals(literal, expressionFunctionLiterals(result, information, facts), facts.literalLiteralReturns) {
 						changed = true
 					}
 				}
@@ -985,6 +1032,7 @@ func propagateAssignments(left, right []ast.Expr, information *types.Info, facts
 	tuple, _ := rightType.(*types.Tuple)
 	secretResult := expressionContainsSecret(right[0], information, facts)
 	formatterResult := expressionIsFormatter(right[0], information, facts)
+	functionLiterals := expressionFunctionLiterals(right[0], information, facts)
 	changed := false
 	for index, target := range left {
 		secretAtIndex := secretResult
@@ -997,13 +1045,14 @@ func propagateAssignments(left, right []ast.Expr, information *types.Info, facts
 		if formatterResult {
 			changed = markFlowTarget(target, information, facts.formatterObjects, facts.aliases) || changed
 		}
+		changed = linkFunctionLiteralsToObject(flowRootObject(target, information), functionLiterals, facts) || changed
 	}
 	return changed
 }
 
 func propagateAssignment(left, right ast.Expr, information *types.Info, facts *flowFacts) bool {
 	changed := linkFlowAliases(left, right, information, facts)
-	changed = linkFunctionLiteral(left, right, information, facts) || changed
+	changed = linkFunctionLiteralsToTarget(left, right, information, facts) || changed
 	if expressionContainsSecret(right, information, facts) {
 		changed = markFlowTarget(left, information, facts.secretObjects, facts.aliases) || changed
 	}
@@ -1019,24 +1068,63 @@ func propagateAssignment(left, right ast.Expr, information *types.Info, facts *f
 func propagateCallArguments(call *ast.CallExpr, information *types.Info, checkedPackage *types.Package, facts *flowFacts) bool {
 	changed := false
 	functions := calledFunctionCandidates(call.Fun, information, facts)
+	receiverExpression, explicitArguments := callReceiverAndArguments(call, information)
 	for _, function := range functions {
 		if function.Pkg() == nil || checkedPackage == nil || function.Pkg() != checkedPackage {
 			continue
 		}
-		changed = propagateParameters(facts.functionParameters[function], call.Args, information, facts) || changed
+		if receiver := facts.functionReceivers[function]; receiver != nil && receiverExpression != nil {
+			changed = propagateReceiver(receiver, receiverExpression, information, facts) || changed
+		}
+		changed = propagateParameters(facts.functionParameters[function], explicitArguments, information, facts) || changed
 	}
 
 	if len(functions) == 1 && checkedPackage != nil && functions[0].Pkg() == checkedPackage && facts.functionParameters[functions[0]] == nil {
 		if _, selectorCall := call.Fun.(*ast.SelectorExpr); selectorCall {
-			for _, parameters := range facts.methodParameters[functions[0].Name()] {
-				if len(parameters) == len(call.Args) {
-					changed = propagateParameters(parameters, call.Args, information, facts) || changed
+			for index, parameters := range facts.methodParameters[functions[0].Name()] {
+				if len(parameters) == len(explicitArguments) {
+					changed = propagateParameters(parameters, explicitArguments, information, facts) || changed
+					if receiverExpression != nil && index < len(facts.methodReceivers[functions[0].Name()]) {
+						changed = propagateReceiver(facts.methodReceivers[functions[0].Name()][index], receiverExpression, information, facts) || changed
+					}
 				}
 			}
 		}
 	}
 	for _, literal := range calledFunctionLiterals(call.Fun, information, facts) {
 		changed = propagateParameters(facts.literalParameters[literal], call.Args, information, facts) || changed
+	}
+	return changed
+}
+
+func callReceiverAndArguments(call *ast.CallExpr, information *types.Info) (ast.Expr, []ast.Expr) {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil, call.Args
+	}
+	selection := information.Selections[selector]
+	if selection == nil {
+		return nil, call.Args
+	}
+	switch selection.Kind() {
+	case types.MethodVal:
+		return selector.X, call.Args
+	case types.MethodExpr:
+		if len(call.Args) != 0 {
+			return call.Args[0], call.Args[1:]
+		}
+	}
+	return nil, call.Args
+}
+
+func propagateReceiver(receiver types.Object, expression ast.Expr, information *types.Info, facts *flowFacts) bool {
+	changed := linkObjects(receiver, flowRootObject(expression, information), facts)
+	changed = linkFunctionLiteralsToObject(receiver, expressionFunctionLiterals(expression, information, facts), facts) || changed
+	if expressionContainsSecret(expression, information, facts) {
+		changed = markObjectWithAliases(receiver, facts.secretObjects, facts.aliases) || changed
+	}
+	if expressionIsFormatter(expression, information, facts) {
+		changed = markObjectWithAliases(receiver, facts.formatterObjects, facts.aliases) || changed
 	}
 	return changed
 }
@@ -1127,20 +1215,51 @@ func linkFlowAliases(left, right ast.Expr, information *types.Info, facts *flowF
 	return linkObjects(flowRootObject(left, information), flowRootObject(right, information), facts)
 }
 
-func linkFunctionLiteral(left, right ast.Expr, information *types.Info, facts *flowFacts) bool {
-	literal := directFunctionLiteral(right)
-	object := flowRootObject(left, information)
-	if literal == nil || object == nil {
+func linkFunctionLiteralsToTarget(left, right ast.Expr, information *types.Info, facts *flowFacts) bool {
+	return linkFunctionLiteralsToObject(
+		flowRootObject(left, information),
+		expressionFunctionLiterals(right, information, facts),
+		facts,
+	)
+}
+
+func linkFunctionLiteralsToObject(object types.Object, literals []*ast.FuncLit, facts *flowFacts) bool {
+	if object == nil {
 		return false
 	}
 	if facts.functionLiterals[object] == nil {
 		facts.functionLiterals[object] = make(map[*ast.FuncLit]bool)
 	}
-	if facts.functionLiterals[object][literal] {
+	return addFunctionLiterals(facts.functionLiterals[object], literals)
+}
+
+func markReturnedFunctionLiterals(object types.Object, literals []*ast.FuncLit, returned map[types.Object]map[*ast.FuncLit]bool) bool {
+	if object == nil {
 		return false
 	}
-	facts.functionLiterals[object][literal] = true
-	return true
+	if returned[object] == nil {
+		returned[object] = make(map[*ast.FuncLit]bool)
+	}
+	return addFunctionLiterals(returned[object], literals)
+}
+
+func markLiteralFunctionLiterals(literal *ast.FuncLit, returnedLiterals []*ast.FuncLit, returned map[*ast.FuncLit]map[*ast.FuncLit]bool) bool {
+	if returned[literal] == nil {
+		returned[literal] = make(map[*ast.FuncLit]bool)
+	}
+	return addFunctionLiterals(returned[literal], returnedLiterals)
+}
+
+func addFunctionLiterals(destination map[*ast.FuncLit]bool, literals []*ast.FuncLit) bool {
+	changed := false
+	for _, literal := range literals {
+		if literal == nil || destination[literal] {
+			continue
+		}
+		destination[literal] = true
+		changed = true
+	}
+	return changed
 }
 
 func directFunctionLiteral(expression ast.Expr) *ast.FuncLit {
@@ -1155,10 +1274,11 @@ func directFunctionLiteral(expression ast.Expr) *ast.FuncLit {
 }
 
 func linkObjectToExpression(object types.Object, expression ast.Expr, information *types.Info, facts *flowFacts) bool {
-	if !isReferenceLike(information.TypeOf(expression)) {
-		return false
+	changed := linkFunctionLiteralsToObject(object, expressionFunctionLiterals(expression, information, facts), facts)
+	if isReferenceLike(information.TypeOf(expression)) {
+		changed = linkObjects(object, flowRootObject(expression, information), facts) || changed
 	}
-	return linkObjects(object, flowRootObject(expression, information), facts)
+	return changed
 }
 
 func linkObjects(left, right types.Object, facts *flowFacts) bool {
@@ -1280,6 +1400,15 @@ func expressionIsFormatter(expression ast.Expr, information *types.Info, facts *
 	return false
 }
 
+func expressionContainsFormatterClosure(expression ast.Expr, information *types.Info, facts *flowFacts) bool {
+	for _, literal := range expressionFunctionLiterals(expression, information, facts) {
+		if facts.formatterLiterals[literal] {
+			return true
+		}
+	}
+	return false
+}
+
 func expressionContainsSecret(expression ast.Expr, information *types.Info, facts *flowFacts) bool {
 	if object := expressionObject(expression, information); object != nil && facts.secretObjects[object] {
 		return true
@@ -1313,6 +1442,8 @@ func expressionContainsSecret(expression ast.Expr, information *types.Info, fact
 		return expressionContainsSecret(value.X, information, facts)
 	case *ast.TypeAssertExpr:
 		return expressionContainsSecret(value.X, information, facts)
+	case *ast.FuncLit:
+		return facts.literalSecretReturns[value]
 	case *ast.CallExpr:
 		if isExplicitRedactedStringCall(value, information) {
 			return false
@@ -1324,6 +1455,9 @@ func expressionContainsSecret(expression ast.Expr, information *types.Info, fact
 			if facts.literalSecretReturns[literal] {
 				return true
 			}
+		}
+		if expressionContainsSecret(value.Fun, information, facts) {
+			return true
 		}
 		if selector, ok := value.Fun.(*ast.SelectorExpr); ok && expressionContainsSecret(selector.X, information, facts) {
 			return true
@@ -1382,16 +1516,55 @@ func calledFunctionCandidates(expression ast.Expr, information *types.Info, fact
 }
 
 func calledFunctionLiterals(expression ast.Expr, information *types.Info, facts *flowFacts) []*ast.FuncLit {
-	if literal := directFunctionLiteral(expression); literal != nil {
-		return []*ast.FuncLit{literal}
+	return expressionFunctionLiterals(expression, information, facts)
+}
+
+func expressionFunctionLiterals(expression ast.Expr, information *types.Info, facts *flowFacts) []*ast.FuncLit {
+	found := make(map[*ast.FuncLit]bool)
+	collectExpressionFunctionLiterals(expression, information, facts, found)
+	literals := make([]*ast.FuncLit, 0, len(found))
+	for literal := range found {
+		literals = append(literals, literal)
 	}
-	root := flowRootObject(expression, information)
-	if root == nil {
-		return nil
+	return literals
+}
+
+func collectExpressionFunctionLiterals(expression ast.Expr, information *types.Info, facts *flowFacts, found map[*ast.FuncLit]bool) {
+	switch value := expression.(type) {
+	case *ast.FuncLit:
+		found[value] = true
+		return
+	case *ast.ParenExpr:
+		collectExpressionFunctionLiterals(value.X, information, facts, found)
+		return
+	case *ast.KeyValueExpr:
+		collectExpressionFunctionLiterals(value.Value, information, facts, found)
+		return
+	case *ast.CompositeLit:
+		for _, element := range value.Elts {
+			collectExpressionFunctionLiterals(element, information, facts, found)
+		}
+		return
+	case *ast.CallExpr:
+		for _, function := range calledFunctionCandidates(value.Fun, information, facts) {
+			for literal := range facts.functionLiteralReturns[function] {
+				found[literal] = true
+			}
+		}
+		for _, calledLiteral := range expressionFunctionLiterals(value.Fun, information, facts) {
+			for returnedLiteral := range facts.literalLiteralReturns[calledLiteral] {
+				found[returnedLiteral] = true
+			}
+		}
+		return
 	}
-	var literals []*ast.FuncLit
+
+	collectObjectFunctionLiterals(expressionObject(expression, information), facts, found)
+	collectObjectFunctionLiterals(flowRootObject(expression, information), facts, found)
+}
+
+func collectObjectFunctionLiterals(root types.Object, facts *flowFacts, found map[*ast.FuncLit]bool) {
 	seenObjects := make(map[types.Object]bool)
-	seenLiterals := make(map[*ast.FuncLit]bool)
 	pending := []types.Object{root}
 	for len(pending) != 0 {
 		object := pending[len(pending)-1]
@@ -1401,16 +1574,12 @@ func calledFunctionLiterals(expression ast.Expr, information *types.Info, facts 
 		}
 		seenObjects[object] = true
 		for literal := range facts.functionLiterals[object] {
-			if !seenLiterals[literal] {
-				seenLiterals[literal] = true
-				literals = append(literals, literal)
-			}
+			found[literal] = true
 		}
 		for alias := range facts.aliases[object] {
 			pending = append(pending, alias)
 		}
 	}
-	return literals
 }
 
 func isMonitoredFormattingFunction(object types.Object) bool {

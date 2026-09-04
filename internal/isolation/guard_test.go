@@ -803,7 +803,7 @@ func TestMutationBoundarySealsAndDetachesProviderRequests(t *testing.T) {
 	}
 }
 
-func TestPreMutationPolicyPinsDistinctConfiguredTestPrincipals(t *testing.T) {
+func TestPreMutationPolicyPinsConfiguredTestPrincipals(t *testing.T) {
 	t.Parallel()
 
 	policy := validPreMutationPolicy()
@@ -816,6 +816,12 @@ func TestPreMutationPolicyPinsDistinctConfiguredTestPrincipals(t *testing.T) {
 		name   string
 		mutate func(*isolation.PreMutationPolicy)
 	}{
+		{name: "missing harness principal", mutate: func(value *isolation.PreMutationPolicy) {
+			value.TestHarnessPrincipal = isolation.Principal{}
+		}},
+		{name: "non-canonical harness principal", mutate: func(value *isolation.PreMutationPolicy) {
+			value.TestHarnessPrincipal.Subject = "Test-Runner@example-test-project.iam.gserviceaccount.com"
+		}},
 		{name: "user operator", mutate: func(value *isolation.PreMutationPolicy) {
 			value.TestOperatorPrincipal = isolation.Principal{Kind: isolation.PrincipalKindUser, Subject: "operator@example.test"}
 		}},
@@ -877,6 +883,34 @@ func TestPreMutationPolicyPinsDistinctConfiguredTestPrincipals(t *testing.T) {
 	refreshPermissionInventory(&changedPolicy, fresh.Permissions.Expected)
 	if _, err := isolation.RevalidatePreMutation(decision, changedPolicy, fresh, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(changed configured principal) error = %v; want ErrProofMismatch", err)
+	}
+}
+
+func TestPreMutationPolicyPinsTheHarnessPrincipal(t *testing.T) {
+	t.Parallel()
+
+	alternate := isolation.Principal{
+		Kind: isolation.PrincipalKindServiceAccount, Subject: "alternate-runner@example-test-project.iam.gserviceaccount.com",
+	}
+	input := validPreMutationInput()
+	input.HarnessPrincipal = alternate
+	input.Locks[1].Holder = alternate
+	if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), input, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(self-consistent alternate harness) error = %v; want ErrInvalidGuardInput", err)
+	}
+
+	policy := validPreMutationPolicy()
+	decision, err := isolation.AuthorizePreMutation(policy, validPreMutationInput(), authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	fresh := freshPreMutationInput()
+	fresh.HarnessPrincipal = alternate
+	fresh.Locks[1].Holder = alternate
+	changedPolicy := policy
+	changedPolicy.TestHarnessPrincipal = alternate
+	if _, err := isolation.RevalidatePreMutation(decision, changedPolicy, fresh, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(self-consistent alternate harness) error = %v; want ErrProofMismatch", err)
 	}
 }
 
@@ -1465,6 +1499,7 @@ func validPreMutationPolicy() isolation.PreMutationPolicy {
 		ProjectID:                "example-test-project",
 		RunLimits:                defaultLimits(),
 		TestCIDR:                 input.TestCIDR,
+		TestHarnessPrincipal:     harnessPrincipal(),
 		TestOperatorPrincipal:    operatorPrincipal(),
 		TestDestructivePrincipal: destructivePrincipal(),
 		PermissionInventory:      isolation.PolicyInventoryPin{ID: "permission-inventory", Version: "v1", Fingerprint: permissions},

@@ -20,7 +20,7 @@ var (
 )
 
 var (
-	permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+$`)
+	permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
 )
 
 // PermissionObservation is one exact testIamPermissions-style observation.

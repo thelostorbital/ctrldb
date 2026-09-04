@@ -119,6 +119,25 @@ func TestTESTISO09PermissionProofRejectsForbiddenServiceWrites(t *testing.T) {
 	}
 }
 
+func TestPermissionProofRejectsTwoComponentProtectedServicePermissions(t *testing.T) {
+	t.Parallel()
+
+	for _, permission := range []string{"monitoring.create", "cloudscheduler.update", "run.delete"} {
+		permission := permission
+		t.Run(permission, func(t *testing.T) {
+			t.Parallel()
+			observation := isolation.PermissionObservation{
+				Identity: operatorPrincipal(), Resource: permissionResource("production-resource"), Permission: permission, Granted: true,
+			}
+			if err := isolation.ValidatePermissionProof(permissionPin([]isolation.PermissionObservation{observation}), permissionProofInput(
+				[]isolation.PermissionObservation{observation}, []isolation.PermissionObservation{observation},
+			), operatorPrincipal()); !errors.Is(err, isolation.ErrPermissionProof) {
+				t.Fatalf("ValidatePermissionProof() error = %v; want ErrPermissionProof", err)
+			}
+		})
+	}
+}
+
 func TestPermissionProofErrorsDoNotExposeObservedValues(t *testing.T) {
 	t.Parallel()
 

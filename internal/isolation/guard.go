@@ -580,14 +580,15 @@ type PolicyInventoryPin struct {
 }
 
 // PreMutationPolicy contains the trusted project boundary, resolved caps, the
-// exact configured test CIDR, and three independent complete-inventory pins.
-// The decision fingerprint binds ProjectID alongside the immutable plan
-// identity and every resource observation. This pure type does not itself
-// prove the caller sourced those policy values authoritatively.
+// exact configured test CIDR and principals, and three independent complete-
+// inventory pins. The decision fingerprint binds the complete policy alongside
+// the immutable plan identity and every resource observation. This pure type
+// does not itself prove the caller sourced those policy values authoritatively.
 type PreMutationPolicy struct {
 	ProjectID                         string
 	RunLimits                         RunLimits
 	TestCIDR                          string
+	TestHarnessPrincipal              Principal
 	TestOperatorPrincipal             Principal
 	TestDestructivePrincipal          Principal
 	PermissionInventory               PolicyInventoryPin
@@ -1083,6 +1084,12 @@ func validatePreMutationPolicy(policy PreMutationPolicy, input PreMutationInput)
 	}
 	if err := validateRunLimits(policy.RunLimits); err != nil {
 		return err
+	}
+	if !validPrincipal(policy.TestHarnessPrincipal) {
+		return guardError(ErrInvalidGuardInput, "policy.testHarnessPrincipal", "must identify one canonical configured principal")
+	}
+	if input.HarnessPrincipal != policy.TestHarnessPrincipal {
+		return guardError(ErrInvalidGuardInput, "harnessPrincipal", "does not match the configured test harness principal")
 	}
 	for _, principal := range []struct {
 		path  string

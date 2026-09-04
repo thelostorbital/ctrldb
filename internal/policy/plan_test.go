@@ -447,6 +447,88 @@ func TestPlanDecodeRequiresCompleteNestedCostJSON(t *testing.T) {
 	}
 }
 
+func TestPlanDecodeRequiresExplicitDowntimeAndRollbackMembers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		plan   func() domain.Plan
+		object string
+		field  string
+	}{
+		{
+			name: "zero downtime seconds",
+			plan: func() domain.Plan {
+				plan := validPlan()
+				plan.Downtime.ExpectedSeconds = 0
+
+				return plan
+			},
+			object: "downtime",
+			field:  "expectedSeconds",
+		},
+		{
+			name: "empty rollback assets",
+			plan: func() domain.Plan {
+				plan := validPlan()
+				plan.Rollback.Assets = []string{}
+
+				return plan
+			},
+			object: "rollback",
+			field:  "assets",
+		},
+		{
+			name:   "intent window start",
+			plan:   validPlanWithIntent,
+			object: "intent",
+			field:  "windowStart",
+		},
+		{
+			name:   "intent validity",
+			plan:   validPlanWithIntent,
+			object: "intent",
+			field:  "validUntil",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			sealed, err := policy.SealPlan(test.plan())
+			if err != nil {
+				t.Fatalf("SealPlan() returned an error: %v", err)
+			}
+			encoded, err := policy.EncodePlan(sealed)
+			if err != nil {
+				t.Fatalf("EncodePlan() returned an error: %v", err)
+			}
+			var document map[string]any
+			if err := json.Unmarshal(encoded, &document); err != nil {
+				t.Fatalf("json.Unmarshal() returned an error: %v", err)
+			}
+			delete(document[test.object].(map[string]any), test.field)
+			without, err := json.Marshal(document)
+			if err != nil {
+				t.Fatalf("json.Marshal() returned an error: %v", err)
+			}
+			if _, err := policy.DecodePlan(without); !errors.Is(err, policy.ErrInvalidPlan) {
+				t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
+			}
+		})
+	}
+}
+
+func validPlanWithIntent() domain.Plan {
+	plan := validPlan()
+	plan.Intent = &domain.PlanIntent{
+		WindowStart: time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC),
+		ValidUntil:  time.Date(2026, 9, 4, 13, 0, 0, 0, time.UTC),
+	}
+
+	return plan
+}
+
 func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 	t.Parallel()
 

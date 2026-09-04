@@ -334,6 +334,11 @@ func validateRequiredPlanJSON(encoded []byte) error {
 	if err := requireNestedJSONFields(plan["policyHash"], "policyHash", "match"); err != nil {
 		return err
 	}
+	if intent, exists := plan["intent"]; exists {
+		if err := requireNestedJSONFields(intent, "intent", "validUntil", "windowStart"); err != nil {
+			return err
+		}
+	}
 	if err := requireJSONArrayFields(plan["resources"], "resources", "kind", "scope", "name", "fingerprint"); err != nil {
 		return err
 	}
@@ -377,6 +382,12 @@ func validateRequiredPlanJSON(encoded []byte) error {
 		}
 	}
 	if err := validateRequiredCostJSON(plan["cost"]); err != nil {
+		return err
+	}
+	if err := requireNestedJSONFields(plan["downtime"], "downtime", "expectedSeconds", "kind"); err != nil {
+		return err
+	}
+	if err := requireNestedJSONFields(plan["rollback"], "rollback", "boundary", "assets"); err != nil {
 		return err
 	}
 

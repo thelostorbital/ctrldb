@@ -142,6 +142,11 @@ func (controller CancellationController) Request(
 	}
 	binding.stepID = step.ID
 	binding.cancelSafe = step.CancelSafe
+	if observation != domain.MutationNotOccurred && contract.RollbackBoundary() == "none" {
+		return controller, CancellationDecision{}, fmt.Errorf(
+			"%w: execution contract has no rollback boundary", ErrInvalidCancellation,
+		)
+	}
 	if current == domain.OperationPaused {
 		return routeCancellation(controller, machine, observation != domain.MutationNotOccurred, binding)
 	}
@@ -274,6 +279,9 @@ func RestoreCancellationController(
 	if len(entries) == 0 || entries[0].OperationID != operationID || entries[0].PlanID != planID {
 		return CancellationController{}, fmt.Errorf("%w: journal binding mismatch", ErrInvalidCancellation)
 	}
+	if pointOfNoReturnReached(contract, entries) {
+		return CancellationController{}, fmt.Errorf("%w: point of no return has been reached", ErrInvalidCancellation)
+	}
 
 	var target domain.OperationState
 	var binding cancellationBinding
@@ -308,6 +316,9 @@ func RestoreCancellationController(
 			binding = cancellationBinding{}
 		}
 	}
+	if target == domain.OperationRollback && contract.RollbackBoundary() == "none" {
+		return CancellationController{}, fmt.Errorf("%w: execution contract has no rollback boundary", ErrInvalidCancellation)
+	}
 
 	return CancellationController{queued: target != "", target: target, binding: binding}, nil
 }
@@ -334,6 +345,11 @@ func cancellationContext(
 	if err := ValidateJournal(entries); err != nil || len(entries) == 0 {
 		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: invalid durable journal", ErrInvalidCancellation)
 	}
+	if pointOfNoReturnReached(contract, entries) {
+		return domain.ExecutionStepContract{}, "", fmt.Errorf(
+			"%w: point of no return has been reached", ErrInvalidCancellation,
+		)
+	}
 	last := entries[len(entries)-1]
 	if entries[0].OperationID != machine.operationID || entries[0].PlanID != machine.planID ||
 		last.OperationState != machine.State() || request.Sequence != last.Sequence+1 ||
@@ -348,6 +364,11 @@ func cancellationContext(
 	nextStep := 0
 	observation := domain.MutationNotOccurred
 	for _, entry := range entries {
+		if entry.Kind == domain.JournalEntryCancellationRequest {
+			return domain.ExecutionStepContract{}, "", fmt.Errorf(
+				"%w: durable journal already contains a cancellation request", ErrInvalidCancellation,
+			)
+		}
 		if entry.Pause != nil && entry.Pause.MutationOccurred {
 			observation = domain.MutationOccurred
 		}
@@ -371,6 +392,39 @@ func cancellationContext(
 	}
 
 	return steps[nextStep], observation, nil
+}
+
+func pointOfNoReturnReached(contract domain.ExecutionContract, entries []domain.JournalEntry) bool {
+	pointOfNoReturn := contract.PointOfNoReturn()
+	if pointOfNoReturn == "" {
+		return false
+	}
+	pointIndex := -1
+	stepIndexes := make(map[string]int)
+	for index, step := range contract.Steps() {
+		stepIndexes[step.ID] = index
+		if step.ID == pointOfNoReturn {
+			pointIndex = index
+		}
+	}
+	if pointIndex < 0 {
+		return true
+	}
+	for _, entry := range entries {
+		if entry.Kind != domain.JournalEntryStep {
+			continue
+		}
+		index, exists := stepIndexes[entry.Step.ID]
+		if !exists {
+			return true
+		}
+		if index > pointIndex || index == pointIndex &&
+			(entry.Step.Outcome == domain.StepDone || entry.Step.Outcome == domain.StepUnknown || entry.Step.MutationOccurred) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func executionContractStep(contract domain.ExecutionContract, stepID string) (domain.ExecutionStepContract, bool) {

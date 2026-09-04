@@ -855,6 +855,118 @@ func TestPreMutationBindsDurableAttemptButRequiresExternalAtomicConsumption(t *t
 	// claim the returned binding in its durable journal before provider mutation.
 }
 
+func TestPreMutationRequiresCurrentBoundedRunLifetime(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	tests := []struct {
+		name   string
+		mutate func(*isolation.PreMutationInput)
+		kind   error
+	}{
+		{name: "absent record", mutate: func(value *isolation.PreMutationInput) { value.RunLifetime = isolation.RunLifetimeContract{} }, kind: isolation.ErrInvalidRunID},
+		{name: "expired", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.ExpiresAt = authorizationNow()
+			refreshRunLifetimeFingerprint(value)
+		}, kind: isolation.ErrStaleProof},
+		{name: "record from the future", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.CreatedAt = authorizationNow().Add(time.Nanosecond)
+			refreshRunLifetimeFingerprint(value)
+		}, kind: isolation.ErrStaleProof},
+		{name: "over planned lifetime", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.ExpiresAt = authorizationNow().Add(value.Capacity.Lifetime + time.Nanosecond)
+			refreshRunLifetimeFingerprint(value)
+		}, kind: isolation.ErrCapacityExceeded},
+		{name: "over trusted maximum", mutate: func(value *isolation.PreMutationInput) {
+			value.Capacity.Lifetime = policy.RunLimits.MaxLifetime
+			refreshCapacityFingerprint(&value.Capacity)
+			value.RunLifetime.ExpiresAt = authorizationNow().Add(policy.RunLimits.MaxLifetime + time.Nanosecond)
+			refreshRunLifetimeFingerprint(value)
+		}, kind: isolation.ErrCapacityExceeded},
+		{name: "wrong run", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.RunID = "run2"
+			refreshRunLifetimeFingerprint(value)
+		}, kind: isolation.ErrUnsafeFirewall},
+		{name: "wrong plan", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.Plan.ID = "plan-fedcba9876543210"
+			refreshRunLifetimeFingerprint(value)
+		}, kind: isolation.ErrUnsafeFirewall},
+		{name: "wrong operation", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.OperationID = "op-fedcba9876543210"
+			refreshRunLifetimeFingerprint(value)
+		}, kind: isolation.ErrUnsafeFirewall},
+		{name: "wrong revocation", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.RevocationWorkflowID = "WF-ACC-03"
+		}, kind: isolation.ErrUnsafeFirewall},
+		{name: "stale rule after reused run ID", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.RecordGeneration++
+			// Deliberately retain the earlier rule fingerprint.
+		}, kind: isolation.ErrUnsafeFirewall},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			input := validPreMutationInput()
+			test.mutate(&input)
+			if _, err := isolation.AuthorizePreMutation(policy, input, authorizationNow()); !errors.Is(err, test.kind) {
+				t.Fatalf("AuthorizePreMutation() error = %v; want %v", err, test.kind)
+			}
+		})
+	}
+}
+
+func TestRunLifetimeAllowsExactConfiguredBoundaryAndCannotChangeAtRevalidation(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	atBoundary := validPreMutationInput()
+	atBoundary.Capacity.Lifetime = policy.RunLimits.MaxLifetime
+	refreshCapacityFingerprint(&atBoundary.Capacity)
+	atBoundary.RunLifetime.CreatedAt = authorizationNow()
+	atBoundary.RunLifetime.ExpiresAt = authorizationNow().Add(policy.RunLimits.MaxLifetime)
+	refreshRunLifetimeFingerprint(&atBoundary)
+	decision, err := isolation.AuthorizePreMutation(policy, atBoundary, authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation(exact lifetime boundary) unexpected error: %v", err)
+	}
+	earliest := validPreMutationInput()
+	earliest.RunLifetime.ExpiresAt = authorizationNow().Add(time.Nanosecond)
+	refreshRunLifetimeFingerprint(&earliest)
+	if _, err := isolation.AuthorizePreMutation(policy, earliest, authorizationNow()); err != nil {
+		t.Fatalf("AuthorizePreMutation(strictly-positive lifetime boundary) unexpected error: %v", err)
+	}
+	laterStep := validPreMutationInput()
+	laterStep.Operation.StepID = "create-test-vm"
+	laterStep.Operation.Attempt = 2
+	if _, err := isolation.AuthorizePreMutation(policy, laterStep, authorizationNow()); err != nil {
+		t.Fatalf("AuthorizePreMutation(later step in owning operation) unexpected error: %v", err)
+	}
+
+	fresh := atBoundary
+	fresh.Targets = append([]isolation.MutationTarget(nil), atBoundary.Targets...)
+	fresh.FirewallRules = cloneFirewallRulesForTest(atBoundary.FirewallRules)
+	fresh.Freshness.ObservedAt = fresh.Freshness.ObservedAt.Add(45 * time.Second)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, fresh, revalidationNow()); err != nil {
+		t.Fatalf("RevalidatePreMutation(exact lifetime boundary) unexpected error: %v", err)
+	}
+
+	changed := fresh
+	changed.FirewallRules = cloneFirewallRulesForTest(fresh.FirewallRules)
+	changed.RunLifetime.RecordGeneration++
+	refreshRunLifetimeFingerprint(&changed)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, changed, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(changed lifetime record) error = %v; want ErrProofMismatch", err)
+	}
+	changedExpiry := fresh
+	changedExpiry.FirewallRules = cloneFirewallRulesForTest(fresh.FirewallRules)
+	changedExpiry.RunLifetime.ExpiresAt = changedExpiry.RunLifetime.ExpiresAt.Add(-time.Second)
+	refreshRunLifetimeFingerprint(&changedExpiry)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, changedExpiry, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(changed lifetime expiry) error = %v; want ErrProofMismatch", err)
+	}
+}
+
 func TestPreMutationDecisionRejectsStaleSwappedAndExpiredEvidence(t *testing.T) {
 	t.Parallel()
 
@@ -957,6 +1069,7 @@ func validPreMutationInput() isolation.PreMutationInput {
 		MutationPrincipal:                 operatorPrincipal(),
 		Permissions:                       permissions,
 		FirewallRules:                     validFirewallRules(),
+		RunLifetime:                       validRunLifetimeContract("run1"),
 		Freshness: isolation.EvidenceFreshness{
 			Revision: strings.Repeat("b", 64), ObservedAt: observedAt,
 			ValidUntil: observedAt.Add(4 * time.Minute),
@@ -1020,6 +1133,26 @@ func refreshPermissionInventory(policy *isolation.PreMutationPolicy, expected []
 		panic(err)
 	}
 	policy.PermissionInventory.Fingerprint = fingerprint
+}
+
+func refreshRunLifetimeFingerprint(input *isolation.PreMutationInput) {
+	fingerprint, err := isolation.RunLifetimeContractFingerprint(input.RunLifetime)
+	if err != nil {
+		panic(err)
+	}
+	for index := range input.FirewallRules {
+		if input.FirewallRules[index].Purpose == isolation.FirewallPurposeIAPSSH {
+			input.FirewallRules[index].LifetimeContractFingerprint = fingerprint
+		}
+	}
+}
+
+func cloneFirewallRulesForTest(rules []isolation.FirewallRule) []isolation.FirewallRule {
+	cloned := make([]isolation.FirewallRule, len(rules))
+	for index := range rules {
+		cloned[index] = cloneFirewallRule(rules[index])
+	}
+	return cloned
 }
 
 func moveResourceProject(identity *isolation.ResourceIdentity, project string) {

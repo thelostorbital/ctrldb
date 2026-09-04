@@ -536,7 +536,10 @@ type PreMutationInput struct {
 	MutationPrincipal                 Principal
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
-	Freshness                         EvidenceFreshness
+	// RunLifetime is the currently discovered immutable lifetime-record
+	// generation. The enclosing Freshness revision must cover this observation.
+	RunLifetime RunLifetimeContract
+	Freshness   EvidenceFreshness
 }
 
 // PreMutationDecision is deliberately opaque. It is not an authorization to
@@ -631,7 +634,11 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	if err := ValidatePermissionProof(policy.PermissionInventory, input.Permissions, input.MutationPrincipal); err != nil {
 		return nil, zero, err
 	}
-	if err := ValidateFirewallRules(input.FirewallRules, input.ProductionCIDRs, input.RunID, targets); err != nil {
+	if err := ValidateFirewallRules(input.FirewallRules, input.ProductionCIDRs, targets, FirewallValidationContext{
+		RunID: input.RunID, Plan: input.Capacity.Plan, Operation: input.Operation,
+		PlannedLifetime: input.Capacity.Lifetime, RunLimits: policy.RunLimits,
+		RunLifetime: input.RunLifetime, Now: now,
+	}); err != nil {
 		return nil, zero, err
 	}
 	fingerprint, err := preMutationFingerprint(policy, input, targets)
@@ -1040,6 +1047,7 @@ type preMutationPayload struct {
 	MutationPrincipal                 Principal
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
+	RunLifetime                       RunLifetimeContract
 	EvidenceRevision                  string
 }
 
@@ -1061,6 +1069,7 @@ func preMutationFingerprint(policy PreMutationPolicy, input PreMutationInput, ta
 			Observed: append([]PermissionObservation(nil), input.Permissions.Observed...),
 		},
 		FirewallRules:    cloneFirewallRules(input.FirewallRules),
+		RunLifetime:      input.RunLifetime,
 		EvidenceRevision: input.Freshness.Revision,
 	}
 	sort.Strings(payload.ProductionCIDRs)

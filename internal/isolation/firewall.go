@@ -7,14 +7,18 @@ import (
 	"errors"
 	"regexp"
 	"slices"
+	"time"
 )
 
 const (
-	TestVPCName                     = "ctrldb-test-vpc"
-	IAPTCPSourceCIDR                = "35.235.240.0/20"
-	FirewallProtocolTCP             = "tcp"
-	FirewallPortSSH          uint16 = 22
-	FirewallPortMongo        uint16 = 27017
+	TestVPCName                = "ctrldb-test-vpc"
+	IAPTCPSourceCIDR           = "35.235.240.0/20"
+	FirewallProtocolTCP        = "tcp"
+	FirewallPortSSH     uint16 = 22
+	FirewallPortMongo   uint16 = 27017
+	// TestHarnessRevocationWorkflowID is the only workflow allowed to revoke
+	// or tear down run-scoped TEST-ISO exposure.
+	TestHarnessRevocationWorkflowID = "WF-TEST-01"
 	iapSSHFirewallRuleSuffix        = "iap-ssh"
 	mongoFirewallRuleSuffix         = "internal"
 	testNodeTagSuffix               = "node"
@@ -23,8 +27,9 @@ const (
 var (
 	// ErrUnsafeFirewall marks a rule whose network, purpose, protocol, source,
 	// port, or tag shape could expose a non-test resource.
-	ErrUnsafeFirewall = errors.New("unsafe isolation firewall rule")
-	testTagPattern    = regexp.MustCompile(`^ctrldb-test-[a-z0-9](?:[a-z0-9-]{0,49}[a-z0-9])?$`)
+	ErrUnsafeFirewall          = errors.New("unsafe isolation firewall rule")
+	testTagPattern             = regexp.MustCompile(`^ctrldb-test-[a-z0-9](?:[a-z0-9-]{0,49}[a-z0-9])?$`)
+	runLifetimeRecordIDPattern = regexp.MustCompile(`^lifetime-[0-9a-f]{16}$`)
 )
 
 // FirewallPurpose selects one of the two firewall shapes admitted by the
@@ -40,26 +45,148 @@ const (
 // firewall rule. Identity and Network are complete explicit provider
 // identities; provider-specific adapters are outside this package.
 type FirewallRule struct {
-	Identity    ResourceIdentity
-	Network     ResourceIdentity
-	RunID       string
-	Purpose     FirewallPurpose
-	Protocol    string
-	Ports       []uint16
-	SourceCIDRs []string
-	SourceTags  []string
-	TargetTags  []string
+	Identity                    ResourceIdentity
+	Network                     ResourceIdentity
+	RunID                       string
+	Purpose                     FirewallPurpose
+	Protocol                    string
+	Ports                       []uint16
+	SourceCIDRs                 []string
+	SourceTags                  []string
+	TargetTags                  []string
+	LifetimeContractFingerprint string
+}
+
+// RunLifetimeContract is the single durable lifetime record for one
+// disposable test run. RecordID and RecordGeneration identify the immutable
+// object version that must exist before provider mutation. Plan and OperationID
+// prevent a reused run ID from adopting an earlier run's exposure while still
+// allowing later steps and retries of that same operation to use the rule.
+//
+// A future provider adapter writes the canonical run, plan, operation, record
+// identity, generation, expiry, revocation workflow, and resulting fingerprint
+// into the IAP firewall description. WF-TEST-01 teardown and its nightly cleanup
+// path consume that metadata and remove the rule no later than ExpiresAt.
+type RunLifetimeContract struct {
+	RunID                string
+	Plan                 PlanIdentity
+	OperationID          string
+	RecordID             string
+	RecordGeneration     uint64
+	CreatedAt            time.Time
+	ExpiresAt            time.Time
+	RevocationWorkflowID string
+}
+
+// FirewallValidationContext supplies the independently sourced values used to
+// validate a run-level lifetime record. Full mutation gates construct it from
+// trusted policy, the immutable plan, the durable operation, and their own
+// boundary clock; it is not serialized into each firewall rule.
+type FirewallValidationContext struct {
+	RunID           string
+	Plan            PlanIdentity
+	Operation       OperationBinding
+	PlannedLifetime time.Duration
+	RunLimits       RunLimits
+	RunLifetime     RunLifetimeContract
+	Now             time.Time
+}
+
+// RunLifetimeContractFingerprint returns the canonical identity a future
+// adapter persists in the IAP rule description. Time and policy bounds are
+// evaluated separately at each independent mutation boundary.
+func RunLifetimeContractFingerprint(contract RunLifetimeContract) (string, error) {
+	if err := ValidateRunID(contract.RunID); err != nil {
+		return "", err
+	}
+	if !planIDPattern.MatchString(contract.Plan.ID) || !isSHA256Fingerprint(contract.Plan.Hash) {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.plan", "must identify a canonical immutable plan")
+	}
+	if !operationIDPattern.MatchString(contract.OperationID) {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.operationID", "must identify one durable operation")
+	}
+	if !runLifetimeRecordIDPattern.MatchString(contract.RecordID) || contract.RecordGeneration == 0 {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.record", "must identify one immutable durable record generation")
+	}
+	if contract.CreatedAt.IsZero() || contract.ExpiresAt.IsZero() {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.timestamps", "must be complete")
+	}
+	for _, value := range []time.Time{contract.CreatedAt, contract.ExpiresAt} {
+		if _, offset := value.Zone(); offset != 0 {
+			return "", guardError(ErrInvalidGuardInput, "runLifetime.timestamps", "must use UTC")
+		}
+	}
+	if contract.RevocationWorkflowID != TestHarnessRevocationWorkflowID {
+		return "", guardError(ErrUnsafeFirewall, "runLifetime.revocationWorkflowID", "must use the TEST-ISO teardown workflow")
+	}
+	return canonicalJSONFingerprint(contract)
+}
+
+func validateRunLifetimeContract(
+	contract RunLifetimeContract,
+	runID string,
+	plan PlanIdentity,
+	operation OperationBinding,
+	plannedLifetime time.Duration,
+	limits RunLimits,
+	now time.Time,
+) (string, error) {
+	fingerprint, err := RunLifetimeContractFingerprint(contract)
+	if err != nil {
+		return "", err
+	}
+	if contract.RunID != runID {
+		return "", guardError(ErrUnsafeFirewall, "runLifetime.runID", "does not match the owning run")
+	}
+	if contract.Plan != plan {
+		return "", guardError(ErrUnsafeFirewall, "runLifetime.plan", "does not match the immutable test plan")
+	}
+	if contract.OperationID != operation.OperationID {
+		return "", guardError(ErrUnsafeFirewall, "runLifetime.operationID", "does not match the durable operation")
+	}
+	if now.IsZero() {
+		return "", guardError(ErrInvalidGuardInput, "now", "must not be zero")
+	}
+	if plannedLifetime <= 0 || limits.MaxLifetime <= 0 {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime", "requires positive trusted lifetime bounds")
+	}
+	if contract.CreatedAt.After(now) {
+		return "", guardError(ErrStaleProof, "runLifetime.createdAt", "must not be after the mutation-boundary time")
+	}
+	if !now.Before(contract.ExpiresAt) {
+		return "", guardError(ErrStaleProof, "runLifetime.expiresAt", "must be strictly after the mutation-boundary time")
+	}
+	duration := contract.ExpiresAt.Sub(contract.CreatedAt)
+	if duration <= 0 {
+		return "", guardError(ErrStaleProof, "runLifetime.expiresAt", "must be strictly after record creation")
+	}
+	if duration > plannedLifetime || duration > limits.MaxLifetime {
+		return "", guardError(ErrCapacityExceeded, "runLifetime.expiresAt", "exceeds the planned or configured run lifetime")
+	}
+	return fingerprint, nil
 }
 
 // ValidateFirewallRules requires exactly one IAP SSH rule and exactly one
 // internal MongoDB rule, binds both rule identities to the exact selected
 // mutation targets, and rejects any source range overlapping a CIDR discovered
 // for production.
-func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, runID string, targets []MutationTarget) error {
+func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, targets []MutationTarget, context FirewallValidationContext) error {
+	lifetimeFingerprint, err := validateRunLifetimeContract(
+		context.RunLifetime,
+		context.RunID,
+		context.Plan,
+		context.Operation,
+		context.PlannedLifetime,
+		context.RunLimits,
+		context.Now,
+	)
+	if err != nil {
+		return err
+	}
 	if len(rules) != 2 {
 		return guardError(ErrUnsafeFirewall, "firewallRules", "must contain both required purpose proofs")
 	}
-	selected, err := SelectRunMutationTargets(runID, targets)
+	selected, err := SelectRunMutationTargets(context.RunID, targets)
 	if err != nil {
 		return err
 	}
@@ -79,7 +206,7 @@ func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, runID
 			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier firewall purpose")
 		}
 		seen[rule.Purpose] = struct{}{}
-		if err := ValidateFirewallRule(rule, productionCIDRs, runID); err != nil {
+		if err := validateFirewallRule(rule, productionCIDRs, context.RunID, lifetimeFingerprint); err != nil {
 			return guardError(err, path, "failed its purpose proof")
 		}
 		if _, exists := targetKeys[rule.Identity.CanonicalKey]; !exists {
@@ -97,9 +224,28 @@ func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, runID
 
 // ValidateFirewallRule validates the exact shape allowed for its declared
 // purpose. Errors identify only structural fields and never discovered values.
-func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string, runID string) error {
+func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string, context FirewallValidationContext) error {
+	lifetimeFingerprint, err := validateRunLifetimeContract(
+		context.RunLifetime,
+		context.RunID,
+		context.Plan,
+		context.Operation,
+		context.PlannedLifetime,
+		context.RunLimits,
+		context.Now,
+	)
+	if err != nil {
+		return err
+	}
+	return validateFirewallRule(rule, productionCIDRs, context.RunID, lifetimeFingerprint)
+}
+
+func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID string, lifetimeFingerprint string) error {
 	if err := ValidateRunID(runID); err != nil {
 		return err
+	}
+	if !isSHA256Fingerprint(lifetimeFingerprint) {
+		return guardError(ErrInvalidGuardInput, "runLifetime.fingerprint", "must be a SHA-256 fingerprint")
 	}
 	if rule.RunID != runID {
 		return guardError(ErrUnsafeFirewall, "runID", "does not match the owning run")
@@ -143,13 +289,14 @@ func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 		expectedTag, _ := RunNodeTag(runID)
 		if rule.Identity.Name != expectedName || rule.Ports[0] != FirewallPortSSH || len(rule.SourceTags) != 0 ||
 			len(rule.SourceCIDRs) != 1 || rule.SourceCIDRs[0] != IAPTCPSourceCIDR ||
-			!slices.Equal(rule.TargetTags, []string{expectedTag}) {
+			!slices.Equal(rule.TargetTags, []string{expectedTag}) || rule.LifetimeContractFingerprint != lifetimeFingerprint {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the IAP SSH purpose")
 		}
 	case FirewallPurposeInternalMongo:
 		expectedName, _ := RunFirewallRuleName(runID, FirewallPurposeInternalMongo)
 		expectedTag, _ := RunNodeTag(runID)
-		if rule.Identity.Name != expectedName || rule.Ports[0] != FirewallPortMongo || len(rule.SourceCIDRs) != 0 {
+		if rule.Identity.Name != expectedName || rule.Ports[0] != FirewallPortMongo || len(rule.SourceCIDRs) != 0 ||
+			rule.LifetimeContractFingerprint != "" {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the internal MongoDB purpose")
 		}
 		if err := validateTestTags("sourceTags", rule.SourceTags, true); err != nil {

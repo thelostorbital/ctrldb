@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/isolation"
 )
@@ -15,7 +16,7 @@ func TestTESTISO04FirewallPurposeShapesAreExact(t *testing.T) {
 	t.Parallel()
 
 	rules := validFirewallRules()
-	if err := isolation.ValidateFirewallRules(rules, []string{"10.80.0.0/16"}, "run1", firewallTargets("run1")); err != nil {
+	if err := isolation.ValidateFirewallRules(rules, []string{"10.80.0.0/16"}, firewallTargets("run1"), validFirewallValidationContext("run1")); err != nil {
 		t.Fatalf("ValidateFirewallRules() unexpected error: %v", err)
 	}
 
@@ -49,7 +50,7 @@ func TestTESTISO04FirewallPurposeShapesAreExact(t *testing.T) {
 			t.Parallel()
 			rule := cloneFirewallRule(rules[0])
 			test.mutate(&rule)
-			if err := isolation.ValidateFirewallRule(rule, []string{"10.80.0.0/16"}, "run1"); err == nil {
+			if err := isolation.ValidateFirewallRule(rule, []string{"10.80.0.0/16"}, validFirewallValidationContext("run1")); err == nil {
 				t.Fatal("ValidateFirewallRule() accepted an invalid IAP SSH shape")
 			}
 		})
@@ -81,7 +82,7 @@ func TestTESTISO04InternalMongoDBRuleRequiresMatchingTestTags(t *testing.T) {
 			t.Parallel()
 			rule := cloneFirewallRule(valid)
 			test.mutate(&rule)
-			if err := isolation.ValidateFirewallRule(rule, []string{"10.80.0.0/16"}, "run1"); !errors.Is(err, test.kind) {
+			if err := isolation.ValidateFirewallRule(rule, []string{"10.80.0.0/16"}, validFirewallValidationContext("run1")); !errors.Is(err, test.kind) {
 				t.Fatalf("ValidateFirewallRule() error = %v; want %v", err, test.kind)
 			}
 		})
@@ -93,7 +94,7 @@ func TestFirewallRuleIdentityMustBeAnExactSelectedMutationTarget(t *testing.T) {
 
 	rules := validFirewallRules()
 	targets := firewallTargets("run1")
-	if err := isolation.ValidateFirewallRules(rules, []string{"10.80.0.0/16"}, "run1", targets[:1]); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+	if err := isolation.ValidateFirewallRules(rules, []string{"10.80.0.0/16"}, targets[:1], validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
 		t.Fatalf("ValidateFirewallRules(missing exact target) error = %v; want ErrUnsafeFirewall", err)
 	}
 
@@ -102,8 +103,66 @@ func TestFirewallRuleIdentityMustBeAnExactSelectedMutationTarget(t *testing.T) {
 	crossProject.Identity.CanonicalKey = mustCanonicalTargetKey(crossProject.Identity)
 	crossProject.Network.Project = "another-test-project"
 	crossProject.Network.CanonicalKey = mustCanonicalTargetKey(crossProject.Network)
-	if err := isolation.ValidateFirewallRules([]isolation.FirewallRule{crossProject, rules[1]}, []string{"10.80.0.0/16"}, "run1", targets); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+	if err := isolation.ValidateFirewallRules([]isolation.FirewallRule{crossProject, rules[1]}, []string{"10.80.0.0/16"}, targets, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
 		t.Fatalf("ValidateFirewallRules(cross-project identity) error = %v; want ErrUnsafeFirewall", err)
+	}
+}
+
+func TestIAPFirewallRuleRequiresExactRunLifetimeFingerprint(t *testing.T) {
+	t.Parallel()
+
+	rules := validFirewallRules()
+	missing := cloneFirewallRule(rules[0])
+	missing.LifetimeContractFingerprint = ""
+	if err := isolation.ValidateFirewallRule(missing, []string{"10.80.0.0/16"}, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+		t.Fatalf("ValidateFirewallRule(missing lifetime) error = %v; want ErrUnsafeFirewall", err)
+	}
+
+	staleContract := validRunLifetimeContract("run1")
+	staleContract.RecordGeneration++
+	staleContext := validFirewallValidationContext("run1")
+	staleContext.RunLifetime = staleContract
+	if err := isolation.ValidateFirewallRule(rules[0], []string{"10.80.0.0/16"}, staleContext); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+		t.Fatalf("ValidateFirewallRule(stale lifetime) error = %v; want ErrUnsafeFirewall", err)
+	}
+
+	internal := cloneFirewallRule(rules[1])
+	internal.LifetimeContractFingerprint = validLifetimeFingerprint("run1")
+	if err := isolation.ValidateFirewallRule(internal, []string{"10.80.0.0/16"}, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+		t.Fatalf("ValidateFirewallRule(duplicated internal lifetime) error = %v; want ErrUnsafeFirewall", err)
+	}
+}
+
+func TestRunLifetimeContractFingerprintRejectsIncompleteMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*isolation.RunLifetimeContract)
+		kind   error
+	}{
+		{name: "missing record", mutate: func(value *isolation.RunLifetimeContract) { value.RecordID = "" }, kind: isolation.ErrInvalidGuardInput},
+		{name: "missing generation", mutate: func(value *isolation.RunLifetimeContract) { value.RecordGeneration = 0 }, kind: isolation.ErrInvalidGuardInput},
+		{name: "non-UTC expiry", mutate: func(value *isolation.RunLifetimeContract) {
+			value.ExpiresAt = value.ExpiresAt.In(time.FixedZone("offset", 60))
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "non-UTC creation", mutate: func(value *isolation.RunLifetimeContract) {
+			value.CreatedAt = value.CreatedAt.In(time.FixedZone("offset", 60))
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "wrong revocation workflow", mutate: func(value *isolation.RunLifetimeContract) {
+			value.RevocationWorkflowID = "WF-ACC-03"
+		}, kind: isolation.ErrUnsafeFirewall},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			value := validRunLifetimeContract("run1")
+			test.mutate(&value)
+			if _, err := isolation.RunLifetimeContractFingerprint(value); !errors.Is(err, test.kind) {
+				t.Fatalf("RunLifetimeContractFingerprint() error = %v; want %v", err, test.kind)
+			}
+		})
 	}
 }
 
@@ -116,7 +175,7 @@ func TestFirewallRulesDeriveDisjointOwnershipForConcurrentRuns(t *testing.T) {
 		run1[1].Identity.Name == run2[1].Identity.Name {
 		t.Fatal("concurrent runs share MongoDB firewall ownership or tags")
 	}
-	if err := isolation.ValidateFirewallRules(run2, []string{"10.80.0.0/16"}, "run2", firewallTargets("run2")); err != nil {
+	if err := isolation.ValidateFirewallRules(run2, []string{"10.80.0.0/16"}, firewallTargets("run2"), validFirewallValidationContext("run2")); err != nil {
 		t.Fatalf("ValidateFirewallRules(second run) unexpected error: %v", err)
 	}
 }
@@ -126,13 +185,13 @@ func TestTESTISO08FirewallProofRejectsProductionCIDROverlapAndMalformedDiscovery
 
 	rule := validFirewallRules()[0]
 	rule.SourceCIDRs = []string{"10.80.1.0/24"}
-	if err := isolation.ValidateFirewallRule(rule, []string{"10.80.0.0/16"}, "run1"); !errors.Is(err, isolation.ErrNetworkOverlap) {
+	if err := isolation.ValidateFirewallRule(rule, []string{"10.80.0.0/16"}, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrNetworkOverlap) {
 		t.Fatalf("ValidateFirewallRule(overlap) error = %v; want ErrNetworkOverlap", err)
 	}
-	if err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{"not-a-cidr"}, "run1"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{"not-a-cidr"}, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateFirewallRule(malformed discovery) error = %v; want ErrInvalidGuardInput", err)
 	}
-	if err := isolation.ValidateFirewallRules([]isolation.FirewallRule{validFirewallRules()[0], validFirewallRules()[0]}, []string{"10.80.0.0/16"}, "run1", firewallTargets("run1")); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateFirewallRules([]isolation.FirewallRule{validFirewallRules()[0], validFirewallRules()[0]}, []string{"10.80.0.0/16"}, firewallTargets("run1"), validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateFirewallRules(duplicate purpose) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
@@ -141,7 +200,7 @@ func TestFirewallErrorsDoNotExposeDiscoveredValues(t *testing.T) {
 	t.Parallel()
 
 	const marker = "sensitive-production-cidr"
-	err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{marker}, "run1")
+	err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{marker}, validFirewallValidationContext("run1"))
 	if !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateFirewallRule() error = %v; want ErrInvalidGuardInput", err)
 	}
@@ -164,7 +223,7 @@ func firewallRulesForRun(runID string) []isolation.FirewallRule {
 			Identity: testResourceIdentity(iapName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"), Network: network, RunID: runID,
 			Purpose: isolation.FirewallPurposeIAPSSH, Protocol: isolation.FirewallProtocolTCP,
 			Ports: []uint16{isolation.FirewallPortSSH}, SourceCIDRs: []string{isolation.IAPTCPSourceCIDR},
-			TargetTags: []string{nodeTag},
+			TargetTags: []string{nodeTag}, LifetimeContractFingerprint: validLifetimeFingerprint(runID),
 		},
 		{
 			Identity: testResourceIdentity(mongoName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"), Network: network, RunID: runID,
@@ -172,6 +231,38 @@ func firewallRulesForRun(runID string) []isolation.FirewallRule {
 			Ports: []uint16{isolation.FirewallPortMongo}, SourceTags: []string{nodeTag},
 			TargetTags: []string{nodeTag},
 		},
+	}
+}
+
+func validRunLifetimeContract(runID string) isolation.RunLifetimeContract {
+	return isolation.RunLifetimeContract{
+		RunID:       runID,
+		Plan:        isolation.PlanIdentity{ID: "plan-0123456789abcdef", Hash: strings.Repeat("a", 64)},
+		OperationID: "op-0123456789abcdef",
+		RecordID:    "lifetime-0123456789abcdef", RecordGeneration: 1,
+		CreatedAt:            time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC),
+		ExpiresAt:            time.Date(2026, 9, 4, 11, 0, 0, 0, time.UTC),
+		RevocationWorkflowID: isolation.TestHarnessRevocationWorkflowID,
+	}
+}
+
+func validLifetimeFingerprint(runID string) string {
+	fingerprint, err := isolation.RunLifetimeContractFingerprint(validRunLifetimeContract(runID))
+	if err != nil {
+		panic(err)
+	}
+	return fingerprint
+}
+
+func validFirewallValidationContext(runID string) isolation.FirewallValidationContext {
+	contract := validRunLifetimeContract(runID)
+	return isolation.FirewallValidationContext{
+		RunID: runID, Plan: contract.Plan,
+		Operation: isolation.OperationBinding{
+			OperationID: contract.OperationID, StepID: "create-test-resources", Attempt: 1,
+		},
+		PlannedLifetime: time.Hour, RunLimits: defaultLimits(),
+		RunLifetime: contract, Now: authorizationNow(),
 	}
 }
 

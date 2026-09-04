@@ -474,7 +474,6 @@ type PlanIdentity struct {
 type CapacityProofInput struct {
 	Plan                PlanIdentity
 	SnapshotFingerprint string
-	Limits              RunLimits
 	Instances           []PlannedInstance
 	Disks               []PlannedDisk
 	Lifetime            time.Duration
@@ -508,9 +507,12 @@ type PolicyInventoryPin struct {
 	Fingerprint string
 }
 
-// PreMutationPolicy contains the three independent complete-inventory pins.
-// This pure type does not itself prove the caller sourced them authoritatively.
+// PreMutationPolicy contains trusted resolved caps, the exact configured test
+// CIDR, and three independent complete-inventory pins. This pure type does not
+// itself prove the caller sourced those policy values authoritatively.
 type PreMutationPolicy struct {
+	RunLimits                         RunLimits
+	TestCIDR                          string
 	PermissionInventory               PolicyInventoryPin
 	NonDisposableEnvironmentInventory PolicyInventoryPin
 	ProductionCIDRInventory           PolicyInventoryPin
@@ -600,14 +602,14 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	if err := validateEvidenceFreshness(input.Freshness, now); err != nil {
 		return nil, zero, err
 	}
-	if err := validatePolicyInventories(policy, input); err != nil {
+	if err := validatePreMutationPolicy(policy, input); err != nil {
 		return nil, zero, err
 	}
 	targets, err := SelectRunMutationTargets(input.RunID, input.Targets)
 	if err != nil {
 		return nil, zero, err
 	}
-	if err := validateCapacityProof(input.Capacity, input.RunID, targets); err != nil {
+	if err := validateCapacityProof(input.Capacity, policy.RunLimits, input.RunID, targets); err != nil {
 		return nil, zero, err
 	}
 	if err := ValidateNetworkCIDR(input.TestCIDR, input.ProductionCIDRs); err != nil {
@@ -629,7 +631,7 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	return targets, fingerprint, nil
 }
 
-func validateCapacityProof(capacity CapacityProofInput, runID string, targets []MutationTarget) error {
+func validateCapacityProof(capacity CapacityProofInput, limits RunLimits, runID string, targets []MutationTarget) error {
 	if !planIDPattern.MatchString(capacity.Plan.ID) || !isSHA256Fingerprint(capacity.Plan.Hash) {
 		return guardError(ErrInvalidGuardInput, "capacity.plan", "must identify a canonical immutable plan")
 	}
@@ -710,13 +712,13 @@ func validateCapacityProof(capacity CapacityProofInput, runID string, targets []
 		Lifetime:            capacity.Lifetime,
 		EstimatedCostMicros: capacity.EstimatedCostMicros,
 	}
-	return ValidateRunRequest(capacity.Limits, request)
+	return ValidateRunRequest(limits, request)
 }
 
 // CapacitySnapshotFingerprint returns the deterministic identity of the
-// immutable plan reference and exact capacity/cost snapshot. Limits are policy
-// inputs and are deliberately excluded. The future trusted plan compiler and
-// provider adapter remain responsible for supplying truthful typed values.
+// immutable plan reference and exact capacity/cost snapshot. Run limits are a
+// separate trusted-policy input. The future trusted plan compiler and provider
+// adapter remain responsible for supplying truthful typed values.
 func CapacitySnapshotFingerprint(capacity CapacityProofInput) (string, error) {
 	if !planIDPattern.MatchString(capacity.Plan.ID) || !isSHA256Fingerprint(capacity.Plan.Hash) {
 		return "", guardError(ErrInvalidGuardInput, "capacity.plan", "must identify a canonical immutable plan")
@@ -868,7 +870,13 @@ func validateOperationBinding(binding OperationBinding) error {
 	return nil
 }
 
-func validatePolicyInventories(policy PreMutationPolicy, input PreMutationInput) error {
+func validatePreMutationPolicy(policy PreMutationPolicy, input PreMutationInput) error {
+	if err := validateRunLimits(policy.RunLimits); err != nil {
+		return err
+	}
+	if policy.TestCIDR != input.TestCIDR {
+		return guardError(ErrInvalidGuardInput, "testCIDR", "does not match the configured test-isolation network")
+	}
 	if err := validateInventoryPin("policy.permissionInventory", policy.PermissionInventory); err != nil {
 		return err
 	}

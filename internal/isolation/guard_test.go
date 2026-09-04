@@ -502,7 +502,7 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 			value.Capacity.Instances[0].Machine.VCPUs = 8
 			refreshCapacityFingerprint(&value.Capacity)
 		}, kind: isolation.ErrCapacityExceeded},
-		{name: "network proof", mutate: func(value *isolation.PreMutationInput) { value.TestCIDR = "10.80.1.0/24" }, kind: isolation.ErrNetworkOverlap},
+		{name: "network policy proof", mutate: func(value *isolation.PreMutationInput) { value.TestCIDR = "10.80.1.0/24" }, kind: isolation.ErrInvalidGuardInput},
 		{name: "lock proof", mutate: func(value *isolation.PreMutationInput) {
 			value.Locks[0].Active = true
 			value.Locks[0].Holder = value.HarnessPrincipal
@@ -660,6 +660,30 @@ func TestPreMutationPolicyPinsRejectIncompleteCallerSets(t *testing.T) {
 	}
 }
 
+func TestPreMutationPolicyOwnsCapacityCapsAndConfiguredCIDR(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	oversized := validPreMutationInput()
+	oversized.Capacity.Instances[0].Machine.VCPUs = policy.RunLimits.MaxMachine.VCPUs + 1
+	refreshCapacityFingerprint(&oversized.Capacity)
+	if _, err := isolation.AuthorizePreMutation(policy, oversized, authorizationNow()); !errors.Is(err, isolation.ErrCapacityExceeded) {
+		t.Fatalf("AuthorizePreMutation(plan above trusted cap) error = %v; want ErrCapacityExceeded", err)
+	}
+
+	alternateCIDR := validPreMutationInput()
+	alternateCIDR.TestCIDR = "10.30.0.0/24"
+	if _, err := isolation.AuthorizePreMutation(policy, alternateCIDR, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(alternate private CIDR) error = %v; want ErrInvalidGuardInput", err)
+	}
+
+	invalidPolicy := policy
+	invalidPolicy.RunLimits = isolation.RunLimits{}
+	if _, err := isolation.AuthorizePreMutation(invalidPolicy, validPreMutationInput(), authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(invalid trusted caps) error = %v; want ErrInvalidGuardInput", err)
+	}
+}
+
 func TestPolicyInventoryFingerprintsAreOrderIndependentAndRejectDuplicates(t *testing.T) {
 	t.Parallel()
 
@@ -782,6 +806,18 @@ func TestPreMutationDecisionRejectsStaleSwappedAndExpiredEvidence(t *testing.T) 
 	if _, err := isolation.RevalidatePreMutation(decision, inventorySwap, freshPreMutationInput(), revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(inventory swap) error = %v; want ErrProofMismatch", err)
 	}
+	limitsSwap := policy
+	limitsSwap.RunLimits.MaxMachine.VCPUs++
+	if _, err := isolation.RevalidatePreMutation(decision, limitsSwap, freshPreMutationInput(), revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(limit swap) error = %v; want ErrProofMismatch", err)
+	}
+	cidrSwap := policy
+	cidrSwap.TestCIDR = "10.30.0.0/24"
+	freshCIDR := freshPreMutationInput()
+	freshCIDR.TestCIDR = cidrSwap.TestCIDR
+	if _, err := isolation.RevalidatePreMutation(decision, cidrSwap, freshCIDR, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(configured CIDR swap) error = %v; want ErrProofMismatch", err)
+	}
 }
 
 func TestGuardErrorsDoNotRenderDiscoveredValues(t *testing.T) {
@@ -822,7 +858,6 @@ func validPreMutationInput() isolation.PreMutationInput {
 			firewallTargets("run1")...),
 		Capacity: isolation.CapacityProofInput{
 			Plan:      isolation.PlanIdentity{ID: "plan-0123456789abcdef", Hash: strings.Repeat("a", 64)},
-			Limits:    defaultLimits(),
 			Instances: []isolation.PlannedInstance{{Identity: instance, RunID: "run1", Machine: isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024}}},
 			Disks:     []isolation.PlannedDisk{{Identity: disk, RunID: "run1", SizeGiB: 100}},
 			Lifetime:  time.Hour, EstimatedCostMicros: 1_000_000,
@@ -873,6 +908,8 @@ func validPreMutationPolicy() isolation.PreMutationPolicy {
 		panic(err)
 	}
 	return isolation.PreMutationPolicy{
+		RunLimits:           defaultLimits(),
+		TestCIDR:            input.TestCIDR,
 		PermissionInventory: isolation.PolicyInventoryPin{ID: "permission-inventory", Version: "v1", Fingerprint: permissions},
 		NonDisposableEnvironmentInventory: isolation.PolicyInventoryPin{
 			ID: "environment-inventory", Version: "v1", Fingerprint: environments,

@@ -1372,8 +1372,8 @@ func TestPreMutationRequiresCurrentBoundedRunLifetime(t *testing.T) {
 			value.RunLifetime.ExpiresAt = authorizationNow()
 			refreshRunLifetimeFingerprint(value)
 		}, kind: isolation.ErrStaleProof},
-		{name: "record from the future", mutate: func(value *isolation.PreMutationInput) {
-			value.RunLifetime.CreatedAt = authorizationNow().Add(time.Nanosecond)
+		{name: "record created after evidence observation", mutate: func(value *isolation.PreMutationInput) {
+			value.RunLifetime.CreatedAt = value.Freshness.ObservedAt.Add(time.Nanosecond)
 			refreshRunLifetimeFingerprint(value)
 		}, kind: isolation.ErrStaleProof},
 		{name: "over planned lifetime", mutate: func(value *isolation.PreMutationInput) {
@@ -1426,8 +1426,8 @@ func TestRunLifetimeAllowsExactConfiguredBoundaryAndCannotChangeAtRevalidation(t
 	atBoundary := validPreMutationInput()
 	atBoundary.Capacity.Lifetime = policy.RunLimits.MaxLifetime
 	refreshCapacityFingerprint(&atBoundary.Capacity)
-	atBoundary.RunLifetime.CreatedAt = authorizationNow()
-	atBoundary.RunLifetime.ExpiresAt = authorizationNow().Add(policy.RunLimits.MaxLifetime)
+	atBoundary.RunLifetime.CreatedAt = atBoundary.Freshness.ObservedAt
+	atBoundary.RunLifetime.ExpiresAt = atBoundary.Freshness.ObservedAt.Add(policy.RunLimits.MaxLifetime)
 	refreshRunLifetimeFingerprint(&atBoundary)
 	decision, err := isolation.AuthorizePreMutation(policy, atBoundary, authorizationNow())
 	if err != nil {
@@ -1467,6 +1467,13 @@ func TestRunLifetimeAllowsExactConfiguredBoundaryAndCannotChangeAtRevalidation(t
 	refreshRunLifetimeFingerprint(&changedExpiry)
 	if _, err := isolation.RevalidatePreMutation(decision, policy, changedExpiry, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(changed lifetime expiry) error = %v; want ErrProofMismatch", err)
+	}
+	createdAfterObservation := fresh
+	createdAfterObservation.FirewallRules = cloneFirewallRulesForTest(fresh.FirewallRules)
+	createdAfterObservation.RunLifetime.CreatedAt = createdAfterObservation.Freshness.ObservedAt.Add(time.Nanosecond)
+	refreshRunLifetimeFingerprint(&createdAfterObservation)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, createdAfterObservation, revalidationNow()); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(lifetime created after fresh observation) error = %v; want ErrStaleProof", err)
 	}
 }
 

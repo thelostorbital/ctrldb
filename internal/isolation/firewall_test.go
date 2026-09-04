@@ -285,6 +285,45 @@ func TestStandaloneFirewallValidationRejectsMalformedMutationAttempt(t *testing.
 	}
 }
 
+func TestStandaloneFirewallValidationBindsLifetimeCreationToObservation(t *testing.T) {
+	t.Parallel()
+
+	valid := validFirewallValidationContext("run1")
+	if !valid.RunLifetime.CreatedAt.Equal(valid.ObservedAt) {
+		t.Fatal("fixture does not exercise the inclusive creation/observation boundary")
+	}
+	if err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{"10.80.0.0/16"}, valid); err != nil {
+		t.Fatalf("ValidateFirewallRule(created at observation) unexpected error: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*isolation.FirewallValidationContext)
+		kind   error
+	}{
+		{name: "missing observation", mutate: func(value *isolation.FirewallValidationContext) { value.ObservedAt = time.Time{} }, kind: isolation.ErrInvalidGuardInput},
+		{name: "non UTC observation", mutate: func(value *isolation.FirewallValidationContext) {
+			value.ObservedAt = value.ObservedAt.In(time.FixedZone("offset", 60))
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "future observation", mutate: func(value *isolation.FirewallValidationContext) {
+			value.ObservedAt = value.Now.Add(time.Nanosecond)
+		}, kind: isolation.ErrStaleProof},
+		{name: "record created after observation", mutate: func(value *isolation.FirewallValidationContext) {
+			value.RunLifetime.CreatedAt = value.ObservedAt.Add(time.Nanosecond)
+		}, kind: isolation.ErrStaleProof},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			context := validFirewallValidationContext("run1")
+			test.mutate(&context)
+			if err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{"10.80.0.0/16"}, context); !errors.Is(err, test.kind) {
+				t.Fatalf("ValidateFirewallRule() error = %v; want %v", err, test.kind)
+			}
+		})
+	}
+}
+
 func TestRunLifetimeContractFingerprintRejectsIncompleteMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -420,7 +459,7 @@ func validFirewallValidationContext(runID string) isolation.FirewallValidationCo
 			OperationID: contract.OperationID, StepID: "create-test-resources", Attempt: 1,
 		},
 		PlannedLifetime: time.Hour, RunLimits: defaultLimits(),
-		RunLifetime: contract, Now: authorizationNow(),
+		RunLifetime: contract, ObservedAt: contract.CreatedAt, Now: authorizationNow(),
 	}
 }
 

@@ -747,7 +747,7 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	if err := ValidateFirewallRules(input.FirewallRules, input.FirewallObservations, input.ProductionCIDRs, targets, FirewallValidationContext{
 		RunID: input.RunID, Plan: input.Capacity.Plan, Operation: input.Operation,
 		PlannedLifetime: input.Capacity.Lifetime, RunLimits: policy.RunLimits,
-		RunLifetime: input.RunLifetime, Now: now,
+		RunLifetime: input.RunLifetime, ObservedAt: input.Freshness.ObservedAt, Now: now,
 	}); err != nil {
 		return nil, zero, err
 	}

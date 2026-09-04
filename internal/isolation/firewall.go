@@ -153,6 +153,7 @@ type FirewallValidationContext struct {
 	PlannedLifetime time.Duration
 	RunLimits       RunLimits
 	RunLifetime     RunLifetimeContract
+	ObservedAt      time.Time
 	Now             time.Time
 }
 
@@ -204,6 +205,7 @@ func validateRunLifetimeContract(
 	operation OperationBinding,
 	plannedLifetime time.Duration,
 	limits RunLimits,
+	observedAt time.Time,
 	now time.Time,
 ) (string, error) {
 	fingerprint, err := RunLifetimeContractFingerprint(contract)
@@ -222,8 +224,17 @@ func validateRunLifetimeContract(
 	if contract.OperationID != operation.OperationID {
 		return "", guardError(ErrUnsafeFirewall, "runLifetime.operationID", "does not match the durable operation")
 	}
-	if now.IsZero() {
-		return "", guardError(ErrInvalidGuardInput, "now", "must not be zero")
+	if observedAt.IsZero() || now.IsZero() {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.observation", "requires nonzero observation and boundary times")
+	}
+	if _, offset := observedAt.Zone(); offset != 0 {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.observedAt", "must use UTC")
+	}
+	if observedAt.After(now) {
+		return "", guardError(ErrStaleProof, "runLifetime.observedAt", "must not be after the mutation-boundary time")
+	}
+	if contract.CreatedAt.After(observedAt) {
+		return "", guardError(ErrStaleProof, "runLifetime.createdAt", "must not be after the provider evidence observation")
 	}
 	if plannedLifetime <= 0 || limits.MaxLifetime <= 0 {
 		return "", guardError(ErrInvalidGuardInput, "runLifetime", "requires positive trusted lifetime bounds")
@@ -256,6 +267,7 @@ func ValidateFirewallRules(rules []FirewallRule, observations []FirewallObservat
 		context.Operation,
 		context.PlannedLifetime,
 		context.RunLimits,
+		context.ObservedAt,
 		context.Now,
 	)
 	if err != nil {
@@ -359,6 +371,7 @@ func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string, context F
 		context.Operation,
 		context.PlannedLifetime,
 		context.RunLimits,
+		context.ObservedAt,
 		context.Now,
 	)
 	if err != nil {

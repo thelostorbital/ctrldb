@@ -11,17 +11,19 @@ import (
 )
 
 const (
-	TestVPCName                = "ctrldb-test-vpc"
-	IAPTCPSourceCIDR           = "35.235.240.0/20"
-	FirewallProtocolTCP        = "tcp"
-	FirewallPortSSH     uint16 = 22
-	FirewallPortMongo   uint16 = 27017
+	TestVPCName              = "ctrldb-test-vpc"
+	IAPTCPSourceCIDR         = "35.235.240.0/20"
+	FirewallPortSSH   uint16 = 22
+	FirewallPortMongo uint16 = 27017
+	FirewallPriority         = uint32(1000)
 	// TestHarnessRevocationWorkflowID is the only workflow allowed to revoke
 	// or tear down run-scoped TEST-ISO exposure.
 	TestHarnessRevocationWorkflowID = "WF-TEST-01"
 	iapSSHFirewallRuleSuffix        = "iap-ssh"
 	mongoFirewallRuleSuffix         = "internal"
 	testNodeTagSuffix               = "node"
+	firewallDescriptionPrefix       = "ctrldb:test-isolation:lifetime-sha256="
+	firewallDescriptionSuffix       = ";revoke=" + TestHarnessRevocationWorkflowID
 )
 
 var (
@@ -41,20 +43,60 @@ const (
 	FirewallPurposeInternalMongo FirewallPurpose = "internal-mongodb"
 )
 
-// FirewallRule is the normalized, local input used to prove a proposed test
-// firewall rule. Identity and Network are complete explicit provider
-// identities; provider-specific adapters are outside this package.
+// FirewallDirection is the closed Compute Engine firewall direction admitted
+// by TEST-ISO.
+type FirewallDirection string
+
+const FirewallDirectionIngress FirewallDirection = "INGRESS"
+
+// FirewallIPProtocol is the closed IP protocol admitted by TEST-ISO.
+type FirewallIPProtocol string
+
+const FirewallIPProtocolTCP FirewallIPProtocol = "tcp"
+
+// FirewallTrafficRule is one explicit Compute Engine allowed or denied tuple.
+// TEST-ISO admits exactly one TCP allowed tuple and no denied tuples.
+type FirewallTrafficRule struct {
+	IPProtocol FirewallIPProtocol
+	Ports      []uint16
+}
+
+// FirewallLogMetadata is the closed metadata mode of a Compute Engine
+// firewall log configuration. TEST-ISO health/admin rules admit only none.
+type FirewallLogMetadata string
+
+const FirewallLogMetadataNone FirewallLogMetadata = ""
+
+// FirewallLogConfig is the explicit provider log configuration. D-066 keeps
+// logging disabled, with no metadata mode, for these health/admin rules.
+type FirewallLogConfig struct {
+	Enabled  bool
+	Metadata FirewallLogMetadata
+}
+
+// FirewallRule is the normalized, complete input for one admitted Compute v1
+// firewalls.insert request. Every security-relevant provider default is
+// represented and validated. Output-only provider fields are intentionally
+// absent; provider-specific adapters are outside this package.
 type FirewallRule struct {
 	Identity                    ResourceIdentity
+	Description                 string
 	Network                     ResourceIdentity
 	RunID                       string
 	Purpose                     FirewallPurpose
 	Enabled                     bool
-	Protocol                    string
-	Ports                       []uint16
+	Priority                    uint32
+	Direction                   FirewallDirection
+	Allowed                     []FirewallTrafficRule
+	Denied                      []FirewallTrafficRule
+	DestinationCIDRs            []string
 	SourceCIDRs                 []string
 	SourceTags                  []string
+	SourceServiceAccounts       []string
 	TargetTags                  []string
+	TargetServiceAccounts       []string
+	LogConfig                   FirewallLogConfig
+	ResourceManagerTags         map[string]string
 	LifetimeContractFingerprint string
 }
 
@@ -64,13 +106,13 @@ type FirewallRule struct {
 // prevent a reused run ID from adopting an earlier run's exposure while still
 // allowing later steps and retries of that same operation to use the rule.
 //
-// A future provider adapter must persist the canonical run, plan, operation,
-// record identity, generation, expiry, revocation workflow, and exact resulting
-// fingerprint in both run-scoped firewall rule descriptions, then parse and
-// observe that fingerprint when rediscovering either rule. The WF-TEST-01
-// teardown and nightly-cleanup adapter consumes the metadata and removes each
-// rule no later than ExpiresAt. This pure package performs no provider or
-// durable-record I/O.
+// A future provider adapter must persist the canonical description derived
+// from the resulting fingerprint in both run-scoped firewall rules, then parse
+// and observe that exact description when rediscovering either rule. The
+// fingerprint binds every field in this contract. The WF-TEST-01 teardown and
+// nightly-cleanup adapter consumes the durable record and removes each rule no
+// later than ExpiresAt. This pure package performs no provider or durable-record
+// I/O.
 type RunLifetimeContract struct {
 	RunID                string
 	Plan                 PlanIdentity
@@ -125,6 +167,16 @@ func RunLifetimeContractFingerprint(contract RunLifetimeContract) (string, error
 		return "", guardError(ErrUnsafeFirewall, "runLifetime.revocationWorkflowID", "must use the TEST-ISO teardown workflow")
 	}
 	return canonicalJSONFingerprint(contract)
+}
+
+// RunFirewallDescription returns the only bounded Compute firewall description
+// accepted for a lifetime contract fingerprint. A future adapter must send and
+// rediscover this value verbatim; it must not synthesize its own metadata.
+func RunFirewallDescription(lifetimeFingerprint string) (string, error) {
+	if !isSHA256Fingerprint(lifetimeFingerprint) {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.fingerprint", "must be a SHA-256 fingerprint")
+	}
+	return firewallDescriptionPrefix + lifetimeFingerprint + firewallDescriptionSuffix, nil
 }
 
 func validateRunLifetimeContract(
@@ -258,6 +310,13 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 	if rule.RunID != runID {
 		return guardError(ErrUnsafeFirewall, "runID", "does not match the owning run")
 	}
+	expectedDescription, err := RunFirewallDescription(lifetimeFingerprint)
+	if err != nil {
+		return err
+	}
+	if rule.Description != expectedDescription {
+		return guardError(ErrUnsafeFirewall, "description", "does not bind the exact run lifetime contract")
+	}
 	if !rule.Enabled {
 		return guardError(ErrUnsafeFirewall, "enabled", "must be enabled")
 	}
@@ -272,8 +331,23 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 		rule.Network.Name != TestVPCName || rule.Identity.Project != rule.Network.Project {
 		return guardError(ErrUnsafeFirewall, "identity", "must bind a global Compute firewall to the explicit test VPC project")
 	}
-	if rule.Protocol != FirewallProtocolTCP || len(rule.Ports) != 1 {
+	if rule.Priority != FirewallPriority {
+		return guardError(ErrUnsafeFirewall, "priority", "must use the fixed TEST-ISO priority")
+	}
+	if rule.Direction != FirewallDirectionIngress {
+		return guardError(ErrUnsafeFirewall, "direction", "must be ingress")
+	}
+	if len(rule.Allowed) != 1 || len(rule.Denied) != 0 || rule.Allowed[0].IPProtocol != FirewallIPProtocolTCP || len(rule.Allowed[0].Ports) != 1 {
 		return guardError(ErrUnsafeFirewall, "allow", "must contain one purpose-specific TCP port")
+	}
+	if len(rule.DestinationCIDRs) != 0 || len(rule.SourceServiceAccounts) != 0 || len(rule.TargetServiceAccounts) != 0 {
+		return guardError(ErrUnsafeFirewall, "selectors", "contains a selector outside the admitted TEST-ISO shape")
+	}
+	if rule.LogConfig.Enabled || rule.LogConfig.Metadata != FirewallLogMetadataNone {
+		return guardError(ErrUnsafeFirewall, "logConfig", "must be disabled without metadata")
+	}
+	if len(rule.ResourceManagerTags) != 0 {
+		return guardError(ErrUnsafeFirewall, "resourceManagerTags", "must be empty")
 	}
 	if err := validateTestTags("targetTags", rule.TargetTags, true); err != nil {
 		return err
@@ -298,7 +372,7 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 	case FirewallPurposeIAPSSH:
 		expectedName, _ := RunFirewallRuleName(runID, FirewallPurposeIAPSSH)
 		expectedTag, _ := RunNodeTag(runID)
-		if rule.Identity.Name != expectedName || rule.Ports[0] != FirewallPortSSH || len(rule.SourceTags) != 0 ||
+		if rule.Identity.Name != expectedName || rule.Allowed[0].Ports[0] != FirewallPortSSH || len(rule.SourceTags) != 0 ||
 			len(rule.SourceCIDRs) != 1 || rule.SourceCIDRs[0] != IAPTCPSourceCIDR ||
 			!slices.Equal(rule.TargetTags, []string{expectedTag}) || rule.LifetimeContractFingerprint != lifetimeFingerprint {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the IAP SSH purpose")
@@ -306,7 +380,7 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 	case FirewallPurposeInternalMongo:
 		expectedName, _ := RunFirewallRuleName(runID, FirewallPurposeInternalMongo)
 		expectedTag, _ := RunNodeTag(runID)
-		if rule.Identity.Name != expectedName || rule.Ports[0] != FirewallPortMongo || len(rule.SourceCIDRs) != 0 ||
+		if rule.Identity.Name != expectedName || rule.Allowed[0].Ports[0] != FirewallPortMongo || len(rule.SourceCIDRs) != 0 ||
 			rule.LifetimeContractFingerprint != lifetimeFingerprint {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the internal MongoDB purpose")
 		}

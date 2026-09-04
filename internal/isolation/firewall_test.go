@@ -5,6 +5,7 @@ package isolation_test
 
 import (
 	"errors"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,12 @@ func TestTESTISO04FirewallPurposeShapesAreExact(t *testing.T) {
 		name   string
 		mutate func(*isolation.FirewallRule)
 	}{
+		{name: "missing description", mutate: func(rule *isolation.FirewallRule) { rule.Description = "" }},
+		{name: "wrong description", mutate: func(rule *isolation.FirewallRule) { rule.Description = "unbound test rule" }},
+		{name: "missing network", mutate: func(rule *isolation.FirewallRule) { rule.Network = isolation.ResourceIdentity{} }},
+		{name: "default network", mutate: func(rule *isolation.FirewallRule) {
+			rule.Network = testResourceIdentity("default", isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
+		}},
 		{name: "wrong network", mutate: func(rule *isolation.FirewallRule) {
 			rule.Network = testResourceIdentity("production-vpc", isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
 		}},
@@ -34,12 +41,35 @@ func TestTESTISO04FirewallPurposeShapesAreExact(t *testing.T) {
 		{name: "malformed rule identity", mutate: func(rule *isolation.FirewallRule) { rule.Identity.Project = "" }},
 		{name: "unknown purpose", mutate: func(rule *isolation.FirewallRule) { rule.Purpose = "other" }},
 		{name: "disabled", mutate: func(rule *isolation.FirewallRule) { rule.Enabled = false }},
-		{name: "wrong protocol", mutate: func(rule *isolation.FirewallRule) { rule.Protocol = "udp" }},
-		{name: "extra port", mutate: func(rule *isolation.FirewallRule) { rule.Ports = append(rule.Ports, 443) }},
+		{name: "missing priority", mutate: func(rule *isolation.FirewallRule) { rule.Priority = 0 }},
+		{name: "wrong priority", mutate: func(rule *isolation.FirewallRule) { rule.Priority = 900 }},
+		{name: "missing direction", mutate: func(rule *isolation.FirewallRule) { rule.Direction = "" }},
+		{name: "egress", mutate: func(rule *isolation.FirewallRule) { rule.Direction = "EGRESS" }},
+		{name: "missing allow", mutate: func(rule *isolation.FirewallRule) { rule.Allowed = nil }},
+		{name: "deny action", mutate: func(rule *isolation.FirewallRule) {
+			rule.Denied = []isolation.FirewallTrafficRule{{IPProtocol: isolation.FirewallIPProtocolTCP, Ports: []uint16{22}}}
+		}},
+		{name: "wrong protocol", mutate: func(rule *isolation.FirewallRule) { rule.Allowed[0].IPProtocol = "udp" }},
+		{name: "extra allow tuple", mutate: func(rule *isolation.FirewallRule) {
+			rule.Allowed = append(rule.Allowed, isolation.FirewallTrafficRule{IPProtocol: isolation.FirewallIPProtocolTCP, Ports: []uint16{443}})
+		}},
+		{name: "extra port", mutate: func(rule *isolation.FirewallRule) { rule.Allowed[0].Ports = append(rule.Allowed[0].Ports, 443) }},
+		{name: "destination selector", mutate: func(rule *isolation.FirewallRule) { rule.DestinationCIDRs = []string{"10.20.0.0/24"} }},
+		{name: "source service account", mutate: func(rule *isolation.FirewallRule) {
+			rule.SourceServiceAccounts = []string{"source@example-test-project.iam.gserviceaccount.com"}
+		}},
+		{name: "target service account", mutate: func(rule *isolation.FirewallRule) {
+			rule.TargetServiceAccounts = []string{"target@example-test-project.iam.gserviceaccount.com"}
+		}},
+		{name: "logging enabled", mutate: func(rule *isolation.FirewallRule) { rule.LogConfig.Enabled = true }},
+		{name: "logging metadata", mutate: func(rule *isolation.FirewallRule) { rule.LogConfig.Metadata = "INCLUDE_ALL_METADATA" }},
+		{name: "resource manager tag", mutate: func(rule *isolation.FirewallRule) {
+			rule.ResourceManagerTags = map[string]string{"tagKeys/123": "tagValues/456"}
+		}},
 		{name: "production target tag", mutate: func(rule *isolation.FirewallRule) { rule.TargetTags = []string{"production-db"} }},
 		{name: "IAP source tag", mutate: func(rule *isolation.FirewallRule) { rule.SourceTags = []string{"ctrldb-test-node"} }},
 		{name: "IAP wrong CIDR", mutate: func(rule *isolation.FirewallRule) { rule.SourceCIDRs = []string{"192.0.2.0/24"} }},
-		{name: "IAP wrong port", mutate: func(rule *isolation.FirewallRule) { rule.Ports = []uint16{2222} }},
+		{name: "IAP wrong port", mutate: func(rule *isolation.FirewallRule) { rule.Allowed[0].Ports = []uint16{2222} }},
 		{name: "IAP wrong name", mutate: func(rule *isolation.FirewallRule) {
 			rule.Identity = testResourceIdentity("ctrldb-test-run1-other", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global")
 		}},
@@ -68,7 +98,7 @@ func TestTESTISO04InternalMongoDBRuleRequiresMatchingTestTags(t *testing.T) {
 		mutate func(*isolation.FirewallRule)
 		kind   error
 	}{
-		{name: "wrong port", mutate: func(rule *isolation.FirewallRule) { rule.Ports = []uint16{22} }, kind: isolation.ErrUnsafeFirewall},
+		{name: "wrong port", mutate: func(rule *isolation.FirewallRule) { rule.Allowed[0].Ports = []uint16{22} }, kind: isolation.ErrUnsafeFirewall},
 		{name: "disabled", mutate: func(rule *isolation.FirewallRule) { rule.Enabled = false }, kind: isolation.ErrUnsafeFirewall},
 		{name: "CIDR source", mutate: func(rule *isolation.FirewallRule) { rule.SourceCIDRs = []string{"10.20.0.0/24"} }, kind: isolation.ErrUnsafeFirewall},
 		{name: "missing source tag", mutate: func(rule *isolation.FirewallRule) { rule.SourceTags = nil }, kind: isolation.ErrInvalidGuardInput},
@@ -136,10 +166,30 @@ func TestFirewallRulesRequireExactRunLifetimeFingerprint(t *testing.T) {
 		t.Fatalf("RunLifetimeContractFingerprint(updated record) unexpected error: %v", err)
 	}
 	reusedRunRules[0].LifetimeContractFingerprint = updatedFingerprint
+	reusedRunRules[0].Description, err = isolation.RunFirewallDescription(updatedFingerprint)
+	if err != nil {
+		t.Fatalf("RunFirewallDescription(updated record) unexpected error: %v", err)
+	}
 	updatedContext := validFirewallValidationContext("run1")
 	updatedContext.RunLifetime = updatedContract
 	if err := isolation.ValidateFirewallRules(reusedRunRules, []string{"10.80.0.0/16"}, firewallTargets("run1"), updatedContext); !errors.Is(err, isolation.ErrUnsafeFirewall) {
 		t.Fatalf("ValidateFirewallRules(stale internal rule after reused run) error = %v; want ErrUnsafeFirewall", err)
+	}
+}
+
+func TestRunFirewallDescriptionIsCanonicalAndBounded(t *testing.T) {
+	t.Parallel()
+
+	fingerprint := validLifetimeFingerprint("run1")
+	description, err := isolation.RunFirewallDescription(fingerprint)
+	if err != nil {
+		t.Fatalf("RunFirewallDescription() unexpected error: %v", err)
+	}
+	if description != validFirewallRules()[0].Description || len(description) > 256 {
+		t.Fatalf("RunFirewallDescription() returned a non-canonical or overlong description")
+	}
+	if _, err := isolation.RunFirewallDescription(""); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("RunFirewallDescription(missing fingerprint) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
 
@@ -251,18 +301,23 @@ func firewallRulesForRun(runID string) []isolation.FirewallRule {
 	mongoName, _ := isolation.RunFirewallRuleName(runID, isolation.FirewallPurposeInternalMongo)
 	nodeTag, _ := isolation.RunNodeTag(runID)
 	network := testResourceIdentity(isolation.TestVPCName, isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
+	description, _ := isolation.RunFirewallDescription(validLifetimeFingerprint(runID))
 	return []isolation.FirewallRule{
 		{
-			Identity: testResourceIdentity(iapName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"), Network: network, RunID: runID,
-			Purpose: isolation.FirewallPurposeIAPSSH, Enabled: true, Protocol: isolation.FirewallProtocolTCP,
-			Ports: []uint16{isolation.FirewallPortSSH}, SourceCIDRs: []string{isolation.IAPTCPSourceCIDR},
-			TargetTags: []string{nodeTag}, LifetimeContractFingerprint: validLifetimeFingerprint(runID),
+			Identity:    testResourceIdentity(iapName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"),
+			Description: description, Network: network, RunID: runID, Purpose: isolation.FirewallPurposeIAPSSH, Enabled: true,
+			Priority: isolation.FirewallPriority, Direction: isolation.FirewallDirectionIngress,
+			Allowed:     []isolation.FirewallTrafficRule{{IPProtocol: isolation.FirewallIPProtocolTCP, Ports: []uint16{isolation.FirewallPortSSH}}},
+			SourceCIDRs: []string{isolation.IAPTCPSourceCIDR}, TargetTags: []string{nodeTag},
+			ResourceManagerTags: map[string]string{}, LifetimeContractFingerprint: validLifetimeFingerprint(runID),
 		},
 		{
-			Identity: testResourceIdentity(mongoName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"), Network: network, RunID: runID,
-			Purpose: isolation.FirewallPurposeInternalMongo, Enabled: true, Protocol: isolation.FirewallProtocolTCP,
-			Ports: []uint16{isolation.FirewallPortMongo}, SourceTags: []string{nodeTag},
-			TargetTags: []string{nodeTag}, LifetimeContractFingerprint: validLifetimeFingerprint(runID),
+			Identity:    testResourceIdentity(mongoName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"),
+			Description: description, Network: network, RunID: runID, Purpose: isolation.FirewallPurposeInternalMongo, Enabled: true,
+			Priority: isolation.FirewallPriority, Direction: isolation.FirewallDirectionIngress,
+			Allowed:    []isolation.FirewallTrafficRule{{IPProtocol: isolation.FirewallIPProtocolTCP, Ports: []uint16{isolation.FirewallPortMongo}}},
+			SourceTags: []string{nodeTag}, TargetTags: []string{nodeTag}, ResourceManagerTags: map[string]string{},
+			LifetimeContractFingerprint: validLifetimeFingerprint(runID),
 		},
 	}
 }
@@ -308,9 +363,23 @@ func firewallTargets(runID string) []isolation.MutationTarget {
 }
 
 func cloneFirewallRule(rule isolation.FirewallRule) isolation.FirewallRule {
-	rule.Ports = append([]uint16(nil), rule.Ports...)
+	rule.Allowed = cloneFirewallTrafficRules(rule.Allowed)
+	rule.Denied = cloneFirewallTrafficRules(rule.Denied)
+	rule.DestinationCIDRs = append([]string(nil), rule.DestinationCIDRs...)
 	rule.SourceCIDRs = append([]string(nil), rule.SourceCIDRs...)
 	rule.SourceTags = append([]string(nil), rule.SourceTags...)
+	rule.SourceServiceAccounts = append([]string(nil), rule.SourceServiceAccounts...)
 	rule.TargetTags = append([]string(nil), rule.TargetTags...)
+	rule.TargetServiceAccounts = append([]string(nil), rule.TargetServiceAccounts...)
+	rule.ResourceManagerTags = maps.Clone(rule.ResourceManagerTags)
 	return rule
+}
+
+func cloneFirewallTrafficRules(rules []isolation.FirewallTrafficRule) []isolation.FirewallTrafficRule {
+	cloned := make([]isolation.FirewallTrafficRule, len(rules))
+	for index, rule := range rules {
+		rule.Ports = append([]uint16(nil), rule.Ports...)
+		cloned[index] = rule
+	}
+	return cloned
 }

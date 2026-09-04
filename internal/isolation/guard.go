@@ -505,14 +505,15 @@ type OperationBinding struct {
 }
 
 // MutationAction is a closed provider verb admitted by the test-isolation
-// boundary. M-0 proves creation only; update and delete require their own
-// future proof families and cannot be represented by this type.
+// boundary. M-0 proves only an exact Compute firewalls.insert request; every
+// other create, update, and delete requires its own complete request type and
+// proof family.
 type MutationAction string
 
-const MutationActionCreate MutationAction = "create"
+const MutationActionComputeFirewallInsert MutationAction = "compute.firewalls.insert"
 
-// TestPrincipalRole selects one exact trusted test identity. Creation is
-// operator-only; the destructive role is reserved for a future exhaustively
+// TestPrincipalRole selects one exact trusted test identity. Firewall creation
+// is operator-only; the destructive role is reserved for a future exhaustively
 // validated cleanup intent.
 type TestPrincipalRole string
 
@@ -521,11 +522,10 @@ const (
 	TestPrincipalRoleDestructive TestPrincipalRole = "destructive"
 )
 
-// CreateDesiredState is a closed typed union. Exactly one member must be set
-// and its identity and values must equal the independently validated capacity
-// or firewall proof for the target.
+// CreateDesiredState is the closed M-0 creation union. Only Firewall is
+// currently representable; VM, disk, VPC, subnet, NAT, and other provider
+// creates remain unrepresentable until complete request types exist.
 type CreateDesiredState struct {
-	Instance *PlannedInstance
 	Firewall *FirewallRule
 }
 
@@ -559,15 +559,6 @@ func (intent AuthorizedMutationIntent) Target() MutationTarget {
 // RequiredPrincipalRole returns the trusted identity class required by Action.
 func (intent AuthorizedMutationIntent) RequiredPrincipalRole() TestPrincipalRole {
 	return intent.requiredPrincipalRole
-}
-
-// InstanceCreateState returns the validated instance state when this is an
-// instance-create intent.
-func (intent AuthorizedMutationIntent) InstanceCreateState() (PlannedInstance, bool) {
-	if intent.create.Instance == nil {
-		return PlannedInstance{}, false
-	}
-	return *intent.create.Instance, true
 }
 
 // FirewallCreateState returns a detached copy of the validated firewall state
@@ -638,8 +629,9 @@ type PreMutationDecision struct {
 
 // MutationBoundary is the detached result for immediate provider-boundary use.
 // The caller must atomically claim Operation in its durable journal, then a
-// future provider adapter must execute each typed Intent verbatim as Principal;
-// repeated pure validation is not atomic consumption.
+// future provider adapter must execute each typed Intent verbatim as Principal.
+// It must not infer provider defaults or synthesize unrepresented resources.
+// Repeated pure validation is not atomic consumption.
 type MutationBoundary struct {
 	operation OperationBinding
 	principal Principal
@@ -851,10 +843,6 @@ func validateMutationIntents(policy PreMutationPolicy, input PreMutationInput, t
 	for _, target := range targets {
 		targetsByKey[target.Identity.CanonicalKey] = target
 	}
-	instancesByKey := make(map[string]PlannedInstance, len(input.Capacity.Instances))
-	for _, instance := range input.Capacity.Instances {
-		instancesByKey[instance.Identity.CanonicalKey] = instance
-	}
 	firewallsByKey := make(map[string]FirewallRule, len(input.FirewallRules))
 	for _, firewall := range input.FirewallRules {
 		firewallsByKey[firewall.Identity.CanonicalKey] = firewall
@@ -864,7 +852,7 @@ func validateMutationIntents(policy PreMutationPolicy, input PreMutationInput, t
 	validated := make([]MutationIntent, 0, len(input.MutationIntents))
 	for index, intent := range input.MutationIntents {
 		path := indexedField("mutationIntents", index)
-		if intent.Action != MutationActionCreate {
+		if intent.Action != MutationActionComputeFirewallInsert {
 			return nil, guardError(ErrInvalidGuardInput, path+".action", "is not an admitted provider action")
 		}
 		if intent.RequiredPrincipalRole != TestPrincipalRoleOperator {
@@ -882,17 +870,9 @@ func validateMutationIntents(policy PreMutationPolicy, input PreMutationInput, t
 		}
 
 		switch {
-		case intent.Target.Identity.Service == ComputeServiceName && intent.Target.Identity.Kind == ComputeInstanceKind:
-			if intent.Create.Instance == nil || intent.Create.Firewall != nil {
-				return nil, guardError(ErrInvalidGuardInput, path+".create", "must contain only typed instance state")
-			}
-			want, exists := instancesByKey[intent.Target.Identity.CanonicalKey]
-			if !exists || *intent.Create.Instance != want {
-				return nil, guardError(ErrInvalidGuardInput, path+".create.instance", "does not match the validated capacity proof")
-			}
 		case intent.Target.Identity.Service == ComputeServiceName && intent.Target.Identity.Kind == ComputeFirewallKind:
-			if intent.Create.Firewall == nil || intent.Create.Instance != nil {
-				return nil, guardError(ErrInvalidGuardInput, path+".create", "must contain only typed firewall state")
+			if intent.Create.Firewall == nil {
+				return nil, guardError(ErrInvalidGuardInput, path+".create", "must contain typed firewall state")
 			}
 			want, exists := firewallsByKey[intent.Target.Identity.CanonicalKey]
 			if !exists || !equalFirewallRule(*intent.Create.Firewall, want) {
@@ -919,11 +899,27 @@ func equalMutationTarget(first, second MutationTarget) bool {
 }
 
 func equalFirewallRule(first, second FirewallRule) bool {
-	return first.Identity == second.Identity && first.Network == second.Network && first.RunID == second.RunID &&
-		first.Purpose == second.Purpose && first.Enabled == second.Enabled && first.Protocol == second.Protocol &&
-		slices.Equal(first.Ports, second.Ports) && slices.Equal(first.SourceCIDRs, second.SourceCIDRs) &&
-		slices.Equal(first.SourceTags, second.SourceTags) && slices.Equal(first.TargetTags, second.TargetTags) &&
+	return first.Identity == second.Identity && first.Description == second.Description && first.Network == second.Network &&
+		first.RunID == second.RunID && first.Purpose == second.Purpose && first.Enabled == second.Enabled &&
+		first.Priority == second.Priority && first.Direction == second.Direction &&
+		equalFirewallTrafficRules(first.Allowed, second.Allowed) && equalFirewallTrafficRules(first.Denied, second.Denied) &&
+		slices.Equal(first.DestinationCIDRs, second.DestinationCIDRs) && slices.Equal(first.SourceCIDRs, second.SourceCIDRs) &&
+		slices.Equal(first.SourceTags, second.SourceTags) && slices.Equal(first.SourceServiceAccounts, second.SourceServiceAccounts) &&
+		slices.Equal(first.TargetTags, second.TargetTags) && slices.Equal(first.TargetServiceAccounts, second.TargetServiceAccounts) &&
+		first.LogConfig == second.LogConfig && maps.Equal(first.ResourceManagerTags, second.ResourceManagerTags) &&
 		first.LifetimeContractFingerprint == second.LifetimeContractFingerprint
+}
+
+func equalFirewallTrafficRules(first, second []FirewallTrafficRule) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for index := range first {
+		if first[index].IPProtocol != second[index].IPProtocol || !slices.Equal(first[index].Ports, second[index].Ports) {
+			return false
+		}
+	}
+	return true
 }
 
 // CapacitySnapshotFingerprint returns the deterministic identity of the
@@ -1347,10 +1343,24 @@ func sortPermissionObservations(values []PermissionObservation) {
 func cloneFirewallRules(rules []FirewallRule) []FirewallRule {
 	cloned := make([]FirewallRule, len(rules))
 	for index, rule := range rules {
-		rule.Ports = append([]uint16(nil), rule.Ports...)
+		rule.Allowed = cloneFirewallTrafficRules(rule.Allowed)
+		rule.Denied = cloneFirewallTrafficRules(rule.Denied)
+		rule.DestinationCIDRs = append([]string(nil), rule.DestinationCIDRs...)
 		rule.SourceCIDRs = append([]string(nil), rule.SourceCIDRs...)
 		rule.SourceTags = append([]string(nil), rule.SourceTags...)
+		rule.SourceServiceAccounts = append([]string(nil), rule.SourceServiceAccounts...)
 		rule.TargetTags = append([]string(nil), rule.TargetTags...)
+		rule.TargetServiceAccounts = append([]string(nil), rule.TargetServiceAccounts...)
+		rule.ResourceManagerTags = maps.Clone(rule.ResourceManagerTags)
+		cloned[index] = rule
+	}
+	return cloned
+}
+
+func cloneFirewallTrafficRules(rules []FirewallTrafficRule) []FirewallTrafficRule {
+	cloned := make([]FirewallTrafficRule, len(rules))
+	for index, rule := range rules {
+		rule.Ports = append([]uint16(nil), rule.Ports...)
 		cloned[index] = rule
 	}
 	return cloned
@@ -1366,10 +1376,6 @@ func cloneMutationIntents(intents []MutationIntent) []MutationIntent {
 
 func cloneMutationIntent(intent MutationIntent) MutationIntent {
 	intent.Target = cloneMutationTarget(intent.Target)
-	if intent.Create.Instance != nil {
-		instance := *intent.Create.Instance
-		intent.Create.Instance = &instance
-	}
 	if intent.Create.Firewall != nil {
 		firewall := cloneFirewallRules([]FirewallRule{*intent.Create.Firewall})[0]
 		intent.Create.Firewall = &firewall

@@ -701,6 +701,7 @@ func summarizeParameterFlows(parsedFiles []*ast.File, information *types.Info, f
 					parameterIndexes[parameter] = index
 				}
 			}
+			parameterDependencies := functionParameterDependencies(function.Body, information, parameterIndexes, facts.aliases)
 			receiver := facts.functionReceivers[object]
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				if _, nested := node.(*ast.FuncLit); nested {
@@ -708,29 +709,23 @@ func summarizeParameterFlows(parsedFiles []*ast.File, information *types.Info, f
 				}
 				switch statement := node.(type) {
 				case *ast.CallExpr:
-					callbackIndex, callbackParameter := expressionParameterIndex(statement.Fun, information, parameterIndexes, facts.aliases)
-					if !callbackParameter {
-						return true
-					}
-					invocation := callbackInvocation{callbackParameter: callbackIndex, argumentParameters: make([]int, len(statement.Args))}
-					for index, argument := range statement.Args {
-						parameterIndex, found := expressionParameterIndex(argument, information, parameterIndexes, facts.aliases)
-						if !found {
-							parameterIndex = -1
+					for _, callbackIndex := range directParameterIndexes(statement.Fun, information, parameterDependencies, facts.aliases) {
+						invocation := callbackInvocation{callbackParameter: callbackIndex, argumentParameters: make([][]int, len(statement.Args))}
+						for index, argument := range statement.Args {
+							invocation.argumentParameters[index] = expressionParameterIndexes(argument, information, parameterDependencies, facts.aliases)
 						}
-						invocation.argumentParameters[index] = parameterIndex
+						summaries.callbackInvocations[object] = appendUniqueCallbackInvocation(summaries.callbackInvocations[object], invocation)
 					}
-					summaries.callbackInvocations[object] = appendUniqueCallbackInvocation(summaries.callbackInvocations[object], invocation)
 				case *ast.AssignStmt:
 					if receiver == nil || len(statement.Lhs) != len(statement.Rhs) {
 						return true
 					}
 					for index, target := range statement.Lhs {
-						if !objectsRelated(flowRootObject(target, information), receiver, facts.aliases) {
+						if !objectsRelated(flowRootObject(target, information), receiver, facts.aliases) ||
+							!receiverMutationObservable(target, information) {
 							continue
 						}
-						parameterIndex, found := expressionParameterIndex(statement.Rhs[index], information, parameterIndexes, facts.aliases)
-						if found {
+						for _, parameterIndex := range expressionParameterIndexes(statement.Rhs[index], information, parameterDependencies, facts.aliases) {
 							summaries.receiverMutations[object] = appendUniqueInt(summaries.receiverMutations[object], parameterIndex)
 						}
 					}
@@ -741,16 +736,94 @@ func summarizeParameterFlows(parsedFiles []*ast.File, information *types.Info, f
 	}
 }
 
-func expressionParameterIndex(expression ast.Expr, information *types.Info, indexes map[types.Object]int, aliases map[types.Object]map[types.Object]bool) (int, bool) {
-	for _, object := range []types.Object{expressionObject(expression, information), flowRootObject(expression, information)} {
-		if index, found := relatedParameterIndex(object, indexes, aliases); found {
-			return index, true
-		}
+func functionParameterDependencies(body *ast.BlockStmt, information *types.Info, indexes map[types.Object]int, aliases map[types.Object]map[types.Object]bool) map[types.Object][]int {
+	dependencies := make(map[types.Object][]int, len(indexes))
+	for object, index := range indexes {
+		dependencies[object] = []int{index}
 	}
-	return 0, false
+	for changed := true; changed; {
+		changed = false
+		ast.Inspect(body, func(node ast.Node) bool {
+			if _, nested := node.(*ast.FuncLit); nested {
+				return false
+			}
+			switch statement := node.(type) {
+			case *ast.AssignStmt:
+				if propagateParameterDependencies(statement.Lhs, statement.Rhs, information, dependencies, aliases) {
+					changed = true
+				}
+			case *ast.ValueSpec:
+				left := make([]ast.Expr, 0, len(statement.Names))
+				for _, name := range statement.Names {
+					left = append(left, name)
+				}
+				if propagateParameterDependencies(left, statement.Values, information, dependencies, aliases) {
+					changed = true
+				}
+			}
+			return true
+		})
+	}
+	return dependencies
 }
 
-func relatedParameterIndex(root types.Object, indexes map[types.Object]int, aliases map[types.Object]map[types.Object]bool) (int, bool) {
+func propagateParameterDependencies(left, right []ast.Expr, information *types.Info, dependencies map[types.Object][]int, aliases map[types.Object]map[types.Object]bool) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	if len(left) == len(right) {
+		changed := false
+		for index := range left {
+			changed = addParameterDependencies(flowRootObject(left[index], information), expressionParameterIndexes(right[index], information, dependencies, aliases), dependencies) || changed
+		}
+		return changed
+	}
+	var combined []int
+	for _, expression := range right {
+		combined = appendUniqueInts(combined, expressionParameterIndexes(expression, information, dependencies, aliases)...)
+	}
+	changed := false
+	for _, target := range left {
+		changed = addParameterDependencies(flowRootObject(target, information), combined, dependencies) || changed
+	}
+	return changed
+}
+
+func addParameterDependencies(object types.Object, indexes []int, dependencies map[types.Object][]int) bool {
+	if object == nil || len(indexes) == 0 {
+		return false
+	}
+	updated := appendUniqueInts(dependencies[object], indexes...)
+	if len(updated) == len(dependencies[object]) {
+		return false
+	}
+	dependencies[object] = updated
+	return true
+}
+
+func directParameterIndexes(expression ast.Expr, information *types.Info, dependencies map[types.Object][]int, aliases map[types.Object]map[types.Object]bool) []int {
+	var indexes []int
+	for _, object := range []types.Object{expressionObject(expression, information), flowRootObject(expression, information)} {
+		indexes = appendUniqueInts(indexes, relatedParameterIndexes(object, dependencies, aliases)...)
+	}
+	return indexes
+}
+
+func expressionParameterIndexes(expression ast.Expr, information *types.Info, dependencies map[types.Object][]int, aliases map[types.Object]map[types.Object]bool) []int {
+	var indexes []int
+	ast.Inspect(expression, func(node ast.Node) bool {
+		value, ok := node.(ast.Expr)
+		if !ok {
+			return true
+		}
+		indexes = appendUniqueInts(indexes, relatedParameterIndexes(expressionObject(value, information), dependencies, aliases)...)
+		return true
+	})
+	return indexes
+}
+
+func relatedParameterIndexes(root types.Object, dependencies map[types.Object][]int, aliases map[types.Object]map[types.Object]bool) []int {
+	var indexes []int
 	seen := make(map[types.Object]bool)
 	pending := []types.Object{root}
 	for len(pending) != 0 {
@@ -760,22 +833,34 @@ func relatedParameterIndex(root types.Object, indexes map[types.Object]int, alia
 			continue
 		}
 		seen[object] = true
-		if index, found := indexes[object]; found {
-			return index, true
-		}
+		indexes = appendUniqueInts(indexes, dependencies[object]...)
 		for alias := range aliases[object] {
 			pending = append(pending, alias)
 		}
 	}
-	return 0, false
+	return indexes
 }
 
 func objectsRelated(left, right types.Object, aliases map[types.Object]map[types.Object]bool) bool {
 	if left == nil || right == nil {
 		return false
 	}
-	_, found := relatedParameterIndex(left, map[types.Object]int{right: 0}, aliases)
-	return found
+	return len(relatedParameterIndexes(left, map[types.Object][]int{right: []int{0}}, aliases)) != 0
+}
+
+func receiverMutationObservable(target ast.Expr, information *types.Info) bool {
+	switch value := target.(type) {
+	case *ast.ParenExpr:
+		return receiverMutationObservable(value.X, information)
+	case *ast.SelectorExpr:
+		return isReferenceLike(information.TypeOf(value.X)) || receiverMutationObservable(value.X, information)
+	case *ast.IndexExpr:
+		return isReferenceLike(information.TypeOf(value.X)) || receiverMutationObservable(value.X, information)
+	case *ast.StarExpr:
+		return isReferenceLike(information.TypeOf(value.X))
+	default:
+		return false
+	}
 }
 
 func appendUniqueCallbackInvocation(existing []callbackInvocation, candidate callbackInvocation) []callbackInvocation {
@@ -785,7 +870,7 @@ func appendUniqueCallbackInvocation(existing []callbackInvocation, candidate cal
 		}
 		equal := true
 		for index := range invocation.argumentParameters {
-			if invocation.argumentParameters[index] != candidate.argumentParameters[index] {
+			if !equalInts(invocation.argumentParameters[index], candidate.argumentParameters[index]) {
 				equal = false
 				break
 			}
@@ -795,6 +880,26 @@ func appendUniqueCallbackInvocation(existing []callbackInvocation, candidate cal
 		}
 	}
 	return append(existing, candidate)
+}
+
+func appendUniqueInts(existing []int, candidates ...int) []int {
+	for _, candidate := range candidates {
+		existing = appendUniqueInt(existing, candidate)
+	}
+	sort.Ints(existing)
+	return existing
+}
+
+func equalInts(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func appendUniqueInt(existing []int, candidate int) []int {
@@ -936,7 +1041,7 @@ type flowFacts struct {
 
 type callbackInvocation struct {
 	callbackParameter  int
-	argumentParameters []int
+	argumentParameters [][]int
 }
 
 type flowSummaries struct {
@@ -1222,23 +1327,25 @@ func propagateCallArguments(call *ast.CallExpr, information *types.Info, checked
 			}
 			callback := explicitArguments[invocation.callbackParameter]
 			for _, literal := range expressionFunctionLiterals(callback, information, facts) {
-				parameters := facts.literalParameters[literal]
-				for callbackArgument, sourceParameter := range invocation.argumentParameters {
-					if callbackArgument >= len(parameters) || sourceParameter < 0 || sourceParameter >= len(explicitArguments) {
-						continue
+				changed = propagateCallbackParameters(facts.literalParameters[literal], invocation, explicitArguments, information, facts) || changed
+			}
+			for _, callbackFunction := range calledFunctionCandidates(callback, information, facts) {
+				if callbackFunction.Pkg() == nil || checkedPackage == nil || callbackFunction.Pkg() != checkedPackage {
+					continue
+				}
+				changed = propagateCallbackParameters(facts.functionParameters[callbackFunction], invocation, explicitArguments, information, facts) || changed
+				if receiver := facts.functionReceivers[callbackFunction]; receiver != nil {
+					if callbackReceiver := methodValueReceiver(callback, information); callbackReceiver != nil {
+						changed = propagateReceiver(receiver, callbackReceiver, information, facts) || changed
 					}
-					changed = propagateParameters(
-						[]types.Object{parameters[callbackArgument]},
-						[]ast.Expr{explicitArguments[sourceParameter]},
-						information,
-						facts,
-					) || changed
 				}
 			}
 			if expressionIsFormatter(callback, information, facts) {
-				for _, sourceParameter := range invocation.argumentParameters {
-					if sourceParameter >= 0 && sourceParameter < len(explicitArguments) && expressionContainsSecret(explicitArguments[sourceParameter], information, facts) {
-						changed = markObject(function, facts.formatterObjects) || changed
+				for _, sourceParameters := range invocation.argumentParameters {
+					for _, sourceParameter := range sourceParameters {
+						if sourceParameter >= 0 && sourceParameter < len(explicitArguments) && expressionContainsSecret(explicitArguments[sourceParameter], information, facts) {
+							changed = markObject(function, facts.formatterObjects) || changed
+						}
 					}
 				}
 			}
@@ -1268,6 +1375,43 @@ func propagateCallArguments(call *ast.CallExpr, information *types.Info, checked
 		changed = propagateParameters(facts.literalParameters[literal], call.Args, information, facts) || changed
 	}
 	return changed
+}
+
+func propagateCallbackParameters(parameters []types.Object, invocation callbackInvocation, explicitArguments []ast.Expr, information *types.Info, facts *flowFacts) bool {
+	changed := false
+	for callbackArgument, sourceParameters := range invocation.argumentParameters {
+		if callbackArgument >= len(parameters) {
+			continue
+		}
+		for _, sourceParameter := range sourceParameters {
+			if sourceParameter < 0 || sourceParameter >= len(explicitArguments) {
+				continue
+			}
+			changed = propagateParameters(
+				[]types.Object{parameters[callbackArgument]},
+				[]ast.Expr{explicitArguments[sourceParameter]},
+				information,
+				facts,
+			) || changed
+		}
+	}
+	return changed
+}
+
+func methodValueReceiver(expression ast.Expr, information *types.Info) ast.Expr {
+	for {
+		switch value := expression.(type) {
+		case *ast.ParenExpr:
+			expression = value.X
+			continue
+		case *ast.SelectorExpr:
+			selection := information.Selections[value]
+			if selection != nil && selection.Kind() == types.MethodVal {
+				return value.X
+			}
+		}
+		return nil
+	}
 }
 
 func callReceiverAndArguments(call *ast.CallExpr, information *types.Info) (ast.Expr, []ast.Expr) {

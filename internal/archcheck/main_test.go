@@ -1165,6 +1165,75 @@ func safe() { provider.Invoke(func(argument any) { fmt.Print(argument) }, "[reda
 `,
 		},
 		{
+			name: "callback wrapper propagates into named callback",
+			provider: `package provider
+func Invoke(callback func(any), value any) { callback(value) }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func printValue(value any) { fmt.Print(value) }
+func expose(value *secret.Value) { provider.Invoke(printValue, value.Reveal()) }
+`,
+			want: 1,
+		},
+		{
+			name: "callback wrapper propagates every nested source parameter",
+			provider: `package provider
+func Invoke(callback func(any), first, second any) {
+	values := []any{first, second}
+	forwarded := values
+	callback(forwarded)
+}
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func expose(value *secret.Value) {
+	provider.Invoke(func(argument any) { fmt.Print(argument) }, "[redacted]", value.Reveal())
+}
+`,
+			want: 2,
+		},
+		{
+			name: "callback wrapper propagates into named method value",
+			provider: `package provider
+func Invoke(callback func(any), value any) { callback(value) }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+type printer struct{}
+func (printer) Print(value any) { fmt.Print(value) }
+func expose(value *secret.Value) { provider.Invoke(printer{}.Print, value.Reveal()) }
+`,
+			want: 1,
+		},
+		{
+			name: "callback wrapper accepts nested safe source parameters",
+			provider: `package provider
+func Invoke(callback func(any), first, second any) { callback([]any{first, second}) }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func safe() {
+	provider.Invoke(func(argument any) { fmt.Print(argument) }, "[redacted]", "also-redacted")
+}
+`,
+		},
+		{
 			name: "method mutation propagates into receiver",
 			provider: `package provider
 type Box struct { Value any }
@@ -1192,6 +1261,78 @@ import (
 	"github.com/thelostorbital/ctrldb/provider"
 )
 func safe() { var box provider.Box; box.Put("[redacted]"); fmt.Print(box) }
+`,
+		},
+		{
+			name: "pointer receiver nested field mutation remains observable",
+			provider: `package provider
+type State struct { Value any }
+type Box struct { State State }
+func (box *Box) Put(value any) { box.State.Value = value }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func expose(value *secret.Value) { var box provider.Box; box.Put(value.Reveal()); fmt.Print(box) }
+`,
+			want: 1,
+		},
+		{
+			name: "value receiver reference field mutation remains observable",
+			provider: `package provider
+type Box struct { Values map[string]any }
+func (box Box) Put(value any) { box.Values["value"] = value }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func expose(value *secret.Value) {
+	box := provider.Box{Values: make(map[string]any)}
+	box.Put(value.Reveal())
+	fmt.Print(box)
+}
+`,
+			want: 1,
+		},
+		{
+			name: "value receiver mutation does not taint caller copy",
+			provider: `package provider
+type Box struct { Value any }
+func (box Box) Put(value any) { box.Value = value }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func safe(value *secret.Value) { var box provider.Box; box.Put(value.Reveal()); fmt.Print(box) }
+`,
+		},
+		{
+			name: "receiver rebinding does not taint caller pointer",
+			provider: `package provider
+type Box struct { Value any }
+func (box *Box) Repoint(value *Box) { box = value }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func safe(value *secret.Value) {
+	var box provider.Box
+	tainted := provider.Box{Value: value.Reveal()}
+	box.Repoint(&tainted)
+	fmt.Print(box)
+}
 `,
 		},
 		{

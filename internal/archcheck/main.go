@@ -1262,17 +1262,6 @@ func addFunctionLiterals(destination map[*ast.FuncLit]bool, literals []*ast.Func
 	return changed
 }
 
-func directFunctionLiteral(expression ast.Expr) *ast.FuncLit {
-	switch value := expression.(type) {
-	case *ast.FuncLit:
-		return value
-	case *ast.ParenExpr:
-		return directFunctionLiteral(value.X)
-	default:
-		return nil
-	}
-}
-
 func linkObjectToExpression(object types.Object, expression ast.Expr, information *types.Info, facts *flowFacts) bool {
 	changed := linkFunctionLiteralsToObject(object, expressionFunctionLiterals(expression, information, facts), facts)
 	if isReferenceLike(information.TypeOf(expression)) {

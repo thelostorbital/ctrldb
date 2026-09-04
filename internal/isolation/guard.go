@@ -8,6 +8,7 @@ package isolation
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,12 +53,16 @@ var (
 	projectIDPattern             = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
 	servicePattern               = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$`)
 	resourceKindPattern          = regexp.MustCompile(`^[a-z][A-Za-z0-9]{0,62}$`)
-	regionPattern                = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+[0-9]$`)
-	zonePattern                  = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+[0-9]-[a-z]$`)
+	regionPattern                = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+[0-9]+$`)
+	zonePattern                  = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+[0-9]+-[a-z]$`)
 	resourceNamePattern          = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$`)
 	environmentNamePattern       = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	userSubjectPattern           = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
 	serviceAccountSubjectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$`)
+	canonicalIDPattern           = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+	operationIDPattern           = regexp.MustCompile(`^op-[0-9a-f]{16}$`)
+	planIDPattern                = regexp.MustCompile(`^plan-[0-9a-f]{16}$`)
+	inventoryVersionPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 )
 
 const (
@@ -196,6 +201,8 @@ const (
 	ComputeServiceName  ProviderService = "compute.googleapis.com"
 	ComputeInstanceKind ResourceKind    = "instances"
 	ComputeDiskKind     ResourceKind    = "disks"
+	ComputeFirewallKind ResourceKind    = "firewalls"
+	ComputeNetworkKind  ResourceKind    = "networks"
 )
 
 // ResourceIdentity is the complete explicit identity a future provider adapter
@@ -250,6 +257,9 @@ func CanonicalTargetKey(identity ResourceIdentity) (string, error) {
 		scopePath = "zones/" + identity.Location
 	default:
 		return "", guardError(ErrInvalidGuardInput, "target.identity.scope", "must be global, region, or zone")
+	}
+	if err := validateKnownResourceScope(identity); err != nil {
+		return "", err
 	}
 	if !resourceNamePattern.MatchString(identity.Name) {
 		return "", guardError(ErrInvalidGuardInput, "target.identity.name", "must be a canonical resource name")
@@ -448,12 +458,22 @@ type PlannedDisk struct {
 	SizeGiB  int64
 }
 
+// PlanIdentity binds the capacity snapshot to an immutable plan artifact
+// produced by the future trusted plan compiler.
+type PlanIdentity struct {
+	ID   string
+	Hash string
+}
+
 // CapacityProofInput is the full run-capacity inventory supplied from an
 // inspectable plan and provider-resolved machine data. EstimatedCostMicros is
-// a plan-derived upward-rounded claim per D-146. This package derives counts
-// and maxima, validates and fingerprints them, but performs no provider reads.
+// a plan-derived upward-rounded claim per D-146. SnapshotFingerprint must be
+// produced by CapacitySnapshotFingerprint over this exact typed snapshot.
+// This package checks local integrity and caps but cannot establish that the
+// future trusted plan compiler/provider adapter supplied truthful inputs.
 type CapacityProofInput struct {
-	PlanFingerprint     string
+	Plan                PlanIdentity
+	SnapshotFingerprint string
 	Limits              RunLimits
 	Instances           []PlannedInstance
 	Disks               []PlannedDisk
@@ -468,12 +488,38 @@ type EvidenceFreshness struct {
 	Revision   string
 	ObservedAt time.Time
 	ValidUntil time.Time
-	CheckedAt  time.Time
+}
+
+// OperationBinding identifies exactly one durable mutation attempt. The I/O-
+// free guard fingerprints this binding; a durable journal must atomically
+// claim it before provider mutation because this package cannot consume it.
+type OperationBinding struct {
+	OperationID string
+	StepID      string
+	Attempt     uint32
+}
+
+// PolicyInventoryPin is a policy-owned name, version, and expected content
+// fingerprint. It is passed separately from discovered proof values so the
+// mutation boundary can source it from a trusted configuration boundary.
+type PolicyInventoryPin struct {
+	ID          string
+	Version     string
+	Fingerprint string
+}
+
+// PreMutationPolicy contains the three independent complete-inventory pins.
+// This pure type does not itself prove the caller sourced them authoritatively.
+type PreMutationPolicy struct {
+	PermissionInventory               PolicyInventoryPin
+	NonDisposableEnvironmentInventory PolicyInventoryPin
+	ProductionCIDRInventory           PolicyInventoryPin
 }
 
 // PreMutationInput contains every local proof family required before a test
 // harness operation can reach a provider mutation boundary.
 type PreMutationInput struct {
+	Operation                         OperationBinding
 	RunID                             string
 	Targets                           []MutationTarget
 	Capacity                          CapacityProofInput
@@ -482,6 +528,7 @@ type PreMutationInput struct {
 	ExpectedNonDisposableEnvironments []EnvironmentIdentity
 	Locks                             []EnvironmentLock
 	HarnessPrincipal                  Principal
+	MutationPrincipal                 Principal
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
 	Freshness                         EvidenceFreshness
@@ -492,20 +539,31 @@ type PreMutationInput struct {
 // newer fresh observation at the mutation boundary.
 type PreMutationDecision struct {
 	fingerprint [sha256.Size]byte
+	operation   OperationBinding
 	observedAt  time.Time
 	validUntil  time.Time
 }
 
+// MutationBoundary is the detached result for immediate provider-boundary
+// use. The caller must atomically claim Operation in its durable journal before
+// using Targets; repeated pure validation is not atomic consumption.
+type MutationBoundary struct {
+	Operation OperationBinding
+	Targets   []MutationTarget
+}
+
 // AuthorizePreMutation evaluates every local isolation proof and returns an
 // opaque, bounded comparison token. It performs no I/O and grants no mutation
-// capability by itself.
-func AuthorizePreMutation(input PreMutationInput) (PreMutationDecision, error) {
-	_, fingerprint, err := evaluatePreMutation(input)
+// capability by itself. The caller must source now from its boundary clock,
+// independently of the evidence timestamps.
+func AuthorizePreMutation(policy PreMutationPolicy, input PreMutationInput, now time.Time) (PreMutationDecision, error) {
+	_, fingerprint, err := evaluatePreMutation(policy, input, now)
 	if err != nil {
 		return PreMutationDecision{}, err
 	}
 	return PreMutationDecision{
 		fingerprint: fingerprint,
+		operation:   input.Operation,
 		observedAt:  input.Freshness.ObservedAt,
 		validUntil:  input.Freshness.ValidUntil,
 	}, nil
@@ -514,31 +572,35 @@ func AuthorizePreMutation(input PreMutationInput) (PreMutationDecision, error) {
 // RevalidatePreMutation reevaluates fresh input at the mutation boundary and
 // returns detached exact targets only when no semantic evidence changed. The
 // returned targets are for immediate provider-boundary consumption only. The
-// fresh observation must be newer and retain the original fixed expiry.
-func RevalidatePreMutation(decision PreMutationDecision, fresh PreMutationInput) ([]MutationTarget, error) {
+// fresh observation must be newer and retain the original fixed expiry. The
+// caller must independently sample now at this boundary.
+func RevalidatePreMutation(decision PreMutationDecision, policy PreMutationPolicy, fresh PreMutationInput, now time.Time) (MutationBoundary, error) {
 	if decision.validUntil.IsZero() || !fresh.Freshness.ObservedAt.After(decision.observedAt) ||
-		!fresh.Freshness.ValidUntil.Equal(decision.validUntil) || !fresh.Freshness.CheckedAt.Before(decision.validUntil) {
-		return nil, guardError(ErrStaleProof, "freshness", "does not satisfy immediate revalidation")
+		!fresh.Freshness.ValidUntil.Equal(decision.validUntil) {
+		return MutationBoundary{}, guardError(ErrStaleProof, "freshness", "does not satisfy immediate revalidation")
 	}
-	targets, fingerprint, err := evaluatePreMutation(fresh)
+	targets, fingerprint, err := evaluatePreMutation(policy, fresh, now)
 	if err != nil {
-		return nil, err
+		return MutationBoundary{}, err
 	}
-	if fingerprint != decision.fingerprint {
-		return nil, guardError(ErrProofMismatch, "evidence", "changed since authorization")
+	if fingerprint != decision.fingerprint || fresh.Operation != decision.operation {
+		return MutationBoundary{}, guardError(ErrProofMismatch, "evidence", "changed since authorization")
 	}
-	return targets, nil
+	return MutationBoundary{Operation: fresh.Operation, Targets: targets}, nil
 }
 
-func evaluatePreMutation(input PreMutationInput) ([]MutationTarget, [sha256.Size]byte, error) {
+func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now time.Time) ([]MutationTarget, [sha256.Size]byte, error) {
 	var zero [sha256.Size]byte
 	if len(input.Targets) == 0 {
 		return nil, zero, guardError(ErrInvalidGuardInput, "targets", "must not be empty")
 	}
-	if len(input.ProductionCIDRs) == 0 {
-		return nil, zero, guardError(ErrInvalidGuardInput, "productionCIDRs", "must not be empty")
+	if err := validateOperationBinding(input.Operation); err != nil {
+		return nil, zero, err
 	}
-	if err := validateEvidenceFreshness(input.Freshness); err != nil {
+	if err := validateEvidenceFreshness(input.Freshness, now); err != nil {
+		return nil, zero, err
+	}
+	if err := validatePolicyInventories(policy, input); err != nil {
 		return nil, zero, err
 	}
 	targets, err := SelectRunMutationTargets(input.RunID, input.Targets)
@@ -554,13 +616,13 @@ func evaluatePreMutation(input PreMutationInput) ([]MutationTarget, [sha256.Size
 	if err := ValidateHarnessLocks(input.Locks, input.ExpectedNonDisposableEnvironments, input.RunID, input.HarnessPrincipal); err != nil {
 		return nil, zero, err
 	}
-	if err := ValidatePermissionProof(input.Permissions); err != nil {
+	if err := ValidatePermissionProof(policy.PermissionInventory, input.Permissions, input.MutationPrincipal); err != nil {
 		return nil, zero, err
 	}
-	if err := ValidateFirewallRules(input.FirewallRules, input.ProductionCIDRs); err != nil {
+	if err := ValidateFirewallRules(input.FirewallRules, input.ProductionCIDRs, input.RunID, targets); err != nil {
 		return nil, zero, err
 	}
-	fingerprint, err := preMutationFingerprint(input, targets)
+	fingerprint, err := preMutationFingerprint(policy, input, targets)
 	if err != nil {
 		return nil, zero, err
 	}
@@ -568,8 +630,15 @@ func evaluatePreMutation(input PreMutationInput) ([]MutationTarget, [sha256.Size
 }
 
 func validateCapacityProof(capacity CapacityProofInput, runID string, targets []MutationTarget) error {
-	if !isSHA256Fingerprint(capacity.PlanFingerprint) {
-		return guardError(ErrInvalidGuardInput, "capacity.planFingerprint", "must be a SHA-256 fingerprint")
+	if !planIDPattern.MatchString(capacity.Plan.ID) || !isSHA256Fingerprint(capacity.Plan.Hash) {
+		return guardError(ErrInvalidGuardInput, "capacity.plan", "must identify a canonical immutable plan")
+	}
+	fingerprint, err := CapacitySnapshotFingerprint(capacity)
+	if err != nil {
+		return err
+	}
+	if capacity.SnapshotFingerprint != fingerprint {
+		return guardError(ErrInvalidGuardInput, "capacity.snapshotFingerprint", "does not match the typed capacity snapshot")
 	}
 	if len(capacity.Instances) == 0 {
 		return guardError(ErrInvalidGuardInput, "capacity.instances", "must contain the full planned instance inventory")
@@ -586,7 +655,8 @@ func validateCapacityProof(capacity CapacityProofInput, runID string, targets []
 			return guardError(err, path, "has invalid identity")
 		}
 		if instance.Identity.Service != ComputeServiceName || instance.Identity.Kind != ComputeInstanceKind ||
-			!strings.HasPrefix(instance.Identity.Name, prefix) || len(instance.Identity.Name) == len(prefix) || instance.RunID != runID {
+			instance.Identity.Scope != ResourceScopeZone || !strings.HasPrefix(instance.Identity.Name, prefix) ||
+			len(instance.Identity.Name) == len(prefix) || instance.RunID != runID {
 			return guardError(ErrInvalidGuardInput, path, "must identify a run-scoped Compute instance")
 		}
 		if instance.Machine.VCPUs <= 0 || instance.Machine.MemoryMB <= 0 {
@@ -608,6 +678,7 @@ func validateCapacityProof(capacity CapacityProofInput, runID string, targets []
 			return guardError(err, path, "has invalid identity")
 		}
 		if disk.Identity.Service != ComputeServiceName || disk.Identity.Kind != ComputeDiskKind ||
+			(disk.Identity.Scope != ResourceScopeZone && disk.Identity.Scope != ResourceScopeRegion) ||
 			!strings.HasPrefix(disk.Identity.Name, prefix) || len(disk.Identity.Name) == len(prefix) || disk.RunID != runID || disk.SizeGiB <= 0 {
 			return guardError(ErrInvalidGuardInput, path, "must identify a positive run-scoped Compute disk")
 		}
@@ -640,6 +711,37 @@ func validateCapacityProof(capacity CapacityProofInput, runID string, targets []
 		EstimatedCostMicros: capacity.EstimatedCostMicros,
 	}
 	return ValidateRunRequest(capacity.Limits, request)
+}
+
+// CapacitySnapshotFingerprint returns the deterministic identity of the
+// immutable plan reference and exact capacity/cost snapshot. Limits are policy
+// inputs and are deliberately excluded. The future trusted plan compiler and
+// provider adapter remain responsible for supplying truthful typed values.
+func CapacitySnapshotFingerprint(capacity CapacityProofInput) (string, error) {
+	if !planIDPattern.MatchString(capacity.Plan.ID) || !isSHA256Fingerprint(capacity.Plan.Hash) {
+		return "", guardError(ErrInvalidGuardInput, "capacity.plan", "must identify a canonical immutable plan")
+	}
+	if len(capacity.Instances) == 0 || capacity.Lifetime <= 0 || capacity.EstimatedCostMicros < 0 {
+		return "", guardError(ErrInvalidGuardInput, "capacity", "must contain a complete positive snapshot")
+	}
+	payload := struct {
+		Plan                PlanIdentity
+		Instances           []PlannedInstance
+		Disks               []PlannedDisk
+		Lifetime            time.Duration
+		EstimatedCostMicros int64
+	}{
+		Plan: capacity.Plan, Instances: append([]PlannedInstance(nil), capacity.Instances...),
+		Disks: append([]PlannedDisk(nil), capacity.Disks...), Lifetime: capacity.Lifetime,
+		EstimatedCostMicros: capacity.EstimatedCostMicros,
+	}
+	sort.Slice(payload.Instances, func(i, j int) bool {
+		return payload.Instances[i].Identity.CanonicalKey < payload.Instances[j].Identity.CanonicalKey
+	})
+	sort.Slice(payload.Disks, func(i, j int) bool {
+		return payload.Disks[i].Identity.CanonicalKey < payload.Disks[j].Identity.CanonicalKey
+	})
+	return canonicalJSONFingerprint(payload)
 }
 
 // ValidateHarnessLocks proves an exact lock observation set: one active,
@@ -736,14 +838,14 @@ type environmentLockKey struct {
 	runID       string
 }
 
-func validateEvidenceFreshness(freshness EvidenceFreshness) error {
+func validateEvidenceFreshness(freshness EvidenceFreshness, now time.Time) error {
 	if !isSHA256Fingerprint(freshness.Revision) {
 		return guardError(ErrInvalidGuardInput, "freshness.revision", "must be a SHA-256 fingerprint")
 	}
-	if freshness.ObservedAt.IsZero() || freshness.ValidUntil.IsZero() || freshness.CheckedAt.IsZero() {
+	if freshness.ObservedAt.IsZero() || freshness.ValidUntil.IsZero() || now.IsZero() {
 		return guardError(ErrInvalidGuardInput, "freshness", "must contain complete timestamps")
 	}
-	for _, value := range []time.Time{freshness.ObservedAt, freshness.ValidUntil, freshness.CheckedAt} {
+	for _, value := range []time.Time{freshness.ObservedAt, freshness.ValidUntil, now} {
 		_, offset := value.Zone()
 		if offset != 0 {
 			return guardError(ErrInvalidGuardInput, "freshness", "timestamps must use UTC")
@@ -753,13 +855,115 @@ func validateEvidenceFreshness(freshness EvidenceFreshness) error {
 	if window <= 0 || window > MaxPreMutationProofLifetime {
 		return guardError(ErrStaleProof, "freshness", "must use a positive bounded validity window")
 	}
-	if freshness.CheckedAt.Before(freshness.ObservedAt) || !freshness.CheckedAt.Before(freshness.ValidUntil) {
-		return guardError(ErrStaleProof, "freshness", "is outside its validity window")
+	if now.Before(freshness.ObservedAt) || !now.Before(freshness.ValidUntil) {
+		return guardError(ErrStaleProof, "now", "is outside the evidence validity window")
 	}
 	return nil
 }
 
+func validateOperationBinding(binding OperationBinding) error {
+	if !operationIDPattern.MatchString(binding.OperationID) || !canonicalIDPattern.MatchString(binding.StepID) || binding.Attempt == 0 {
+		return guardError(ErrInvalidGuardInput, "operation", "must identify one canonical durable step attempt")
+	}
+	return nil
+}
+
+func validatePolicyInventories(policy PreMutationPolicy, input PreMutationInput) error {
+	if err := validateInventoryPin("policy.permissionInventory", policy.PermissionInventory); err != nil {
+		return err
+	}
+	if err := validateInventoryPin("policy.nonDisposableEnvironmentInventory", policy.NonDisposableEnvironmentInventory); err != nil {
+		return err
+	}
+	if err := validateInventoryPin("policy.productionCIDRInventory", policy.ProductionCIDRInventory); err != nil {
+		return err
+	}
+	environments, err := NonDisposableEnvironmentInventoryFingerprint(input.ExpectedNonDisposableEnvironments)
+	if err != nil {
+		return err
+	}
+	if environments != policy.NonDisposableEnvironmentInventory.Fingerprint {
+		return guardError(ErrInvalidGuardInput, "policy.nonDisposableEnvironmentInventory", "does not match the supplied complete environment set")
+	}
+	cidrs, err := ProductionCIDRInventoryFingerprint(input.ProductionCIDRs)
+	if err != nil {
+		return err
+	}
+	if cidrs != policy.ProductionCIDRInventory.Fingerprint {
+		return guardError(ErrInvalidGuardInput, "policy.productionCIDRInventory", "does not match the supplied complete CIDR set")
+	}
+	return nil
+}
+
+func validateInventoryPin(path string, pin PolicyInventoryPin) error {
+	if !canonicalIDPattern.MatchString(pin.ID) || !inventoryVersionPattern.MatchString(pin.Version) || !isSHA256Fingerprint(pin.Fingerprint) {
+		return guardError(ErrInvalidGuardInput, path, "must contain a canonical name, version, and SHA-256 fingerprint")
+	}
+	return nil
+}
+
+// NonDisposableEnvironmentInventoryFingerprint hashes a validated complete
+// policy inventory. Completeness is guaranteed only when a trusted policy
+// boundary pins the returned digest.
+func NonDisposableEnvironmentInventoryFingerprint(values []EnvironmentIdentity) (string, error) {
+	if len(values) == 0 {
+		return "", guardError(ErrInvalidGuardInput, "expectedEnvironments", "must not be empty")
+	}
+	canonical := append([]EnvironmentIdentity(nil), values...)
+	seen := make(map[string]struct{}, len(canonical))
+	for index, value := range canonical {
+		if !environmentNamePattern.MatchString(value.Environment) || value.Environment == config.TestEnvironmentLabel ||
+			!value.Class.Valid() || value.Class == domain.EnvironmentDisposable {
+			return "", guardError(ErrInvalidGuardInput, indexedField("expectedEnvironments", index), "must identify a non-disposable environment")
+		}
+		if _, exists := seen[value.Environment]; exists {
+			return "", guardError(ErrInvalidGuardInput, indexedField("expectedEnvironments", index), "duplicates an earlier environment")
+		}
+		seen[value.Environment] = struct{}{}
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].Environment != canonical[j].Environment {
+			return canonical[i].Environment < canonical[j].Environment
+		}
+		return canonical[i].Class < canonical[j].Class
+	})
+	return canonicalJSONFingerprint(canonical)
+}
+
+// ProductionCIDRInventoryFingerprint hashes canonical discovered production
+// CIDRs. Only a separately trusted policy pin makes the set authoritative.
+func ProductionCIDRInventoryFingerprint(values []string) (string, error) {
+	if len(values) == 0 {
+		return "", guardError(ErrInvalidGuardInput, "productionCIDRs", "must not be empty")
+	}
+	if err := validateProductionCIDRs(values); err != nil {
+		return "", err
+	}
+	canonical := append([]string(nil), values...)
+	sort.Strings(canonical)
+	return canonicalJSONFingerprint(canonical)
+}
+
+func canonicalJSONFingerprint(value any) (string, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", guardError(ErrInvalidGuardInput, "inventory", "could not be fingerprinted")
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func isSHA256Fingerprint(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
+}
+
 type preMutationPayload struct {
+	Policy                            PreMutationPolicy
+	Operation                         OperationBinding
 	RunID                             string
 	Targets                           []MutationTarget
 	Capacity                          CapacityProofInput
@@ -768,13 +972,16 @@ type preMutationPayload struct {
 	ExpectedNonDisposableEnvironments []EnvironmentIdentity
 	Locks                             []EnvironmentLock
 	HarnessPrincipal                  Principal
+	MutationPrincipal                 Principal
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
 	EvidenceRevision                  string
 }
 
-func preMutationFingerprint(input PreMutationInput, targets []MutationTarget) ([sha256.Size]byte, error) {
+func preMutationFingerprint(policy PreMutationPolicy, input PreMutationInput, targets []MutationTarget) ([sha256.Size]byte, error) {
 	payload := preMutationPayload{
+		Policy:                            policy,
+		Operation:                         input.Operation,
 		RunID:                             input.RunID,
 		Targets:                           append([]MutationTarget(nil), targets...),
 		Capacity:                          cloneCapacityProof(input.Capacity),
@@ -783,10 +990,10 @@ func preMutationFingerprint(input PreMutationInput, targets []MutationTarget) ([
 		ExpectedNonDisposableEnvironments: append([]EnvironmentIdentity(nil), input.ExpectedNonDisposableEnvironments...),
 		Locks:                             append([]EnvironmentLock(nil), input.Locks...),
 		HarnessPrincipal:                  input.HarnessPrincipal,
+		MutationPrincipal:                 input.MutationPrincipal,
 		Permissions: PermissionProofInput{
-			Inventory: input.Permissions.Inventory,
-			Expected:  append([]PermissionObservation(nil), input.Permissions.Expected...),
-			Observed:  append([]PermissionObservation(nil), input.Permissions.Observed...),
+			Expected: append([]PermissionObservation(nil), input.Permissions.Expected...),
+			Observed: append([]PermissionObservation(nil), input.Permissions.Observed...),
 		},
 		FirewallRules:    cloneFirewallRules(input.FirewallRules),
 		EvidenceRevision: input.Freshness.Revision,
@@ -900,6 +1107,26 @@ func validateResourceIdentity(identity ResourceIdentity) error {
 	}
 	if identity.CanonicalKey != wantKey {
 		return guardError(ErrInvalidGuardInput, "target.identity.canonicalKey", "does not match the explicit identity fields")
+	}
+	return nil
+}
+
+func validateKnownResourceScope(identity ResourceIdentity) error {
+	if identity.Service == ComputeServiceName {
+		switch identity.Kind {
+		case ComputeInstanceKind:
+			if identity.Scope != ResourceScopeZone {
+				return guardError(ErrInvalidGuardInput, "target.identity.scope", "Compute instances must be zonal")
+			}
+		case ComputeDiskKind:
+			if identity.Scope != ResourceScopeZone && identity.Scope != ResourceScopeRegion {
+				return guardError(ErrInvalidGuardInput, "target.identity.scope", "Compute disks must be zonal or regional")
+			}
+		case ComputeFirewallKind, ComputeNetworkKind:
+			if identity.Scope != ResourceScopeGlobal {
+				return guardError(ErrInvalidGuardInput, "target.identity.scope", "Compute networks and firewalls must be global")
+			}
+		}
 	}
 	return nil
 }

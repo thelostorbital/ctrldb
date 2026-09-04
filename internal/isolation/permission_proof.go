@@ -4,9 +4,6 @@
 package isolation
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"regexp"
 	"sort"
@@ -23,9 +20,7 @@ var (
 )
 
 var (
-	permissionPattern          = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+$`)
-	permissionInventoryID      = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	permissionInventoryVersion = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+	permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+$`)
 )
 
 // PermissionObservation is one exact testIamPermissions-style observation.
@@ -38,34 +33,27 @@ type PermissionObservation struct {
 	Granted    bool
 }
 
-// PermissionInventory identifies the authoritative, externally owned
-// permission inventory. Fingerprint is the SHA-256 fingerprint returned by
-// PermissionInventoryFingerprint for the complete Expected slice.
-type PermissionInventory struct {
-	ID          string
-	Version     string
-	Fingerprint string
-}
-
-// PermissionProofInput binds exact observations to a named and versioned
-// caller-supplied inventory. This package deliberately does not compile role
-// definitions; the future bootstrap policy owner must pin the inventory
-// identity and fingerprint it supplies here.
+// PermissionProofInput carries exact expected and observed tuples separately
+// from the policy-owned inventory pin. This package deliberately does not
+// compile role definitions; the future bootstrap policy owner supplies the
+// authoritative pin and expected tuples.
 type PermissionProofInput struct {
-	Inventory PermissionInventory
-	Expected  []PermissionObservation
-	Observed  []PermissionObservation
+	Expected []PermissionObservation
+	Observed []PermissionObservation
 }
 
 // ValidatePermissionProof proves that observations are an exact, complete
-// match for caller-supplied expectations. No missing, duplicate, or unexpected
-// tuple is tolerated. Independently, a granted Monitoring, Scheduler, or Cloud
-// Run write is always rejected even if an expectation incorrectly permits it.
-func ValidatePermissionProof(input PermissionProofInput) error {
-	if !permissionInventoryID.MatchString(input.Inventory.ID) ||
-		!permissionInventoryVersion.MatchString(input.Inventory.Version) ||
-		!isSHA256Fingerprint(input.Inventory.Fingerprint) {
-		return guardError(ErrPermissionProof, "inventory", "must have a canonical ID, version, and SHA-256 fingerprint")
+// match for the separately pinned caller-supplied inventory and that every
+// tuple covers the exact mutation principal. No missing, duplicate, or
+// unexpected tuple is tolerated. Independently, a granted Monitoring,
+// Scheduler, or Cloud Run write is always rejected even if an expectation
+// incorrectly permits it.
+func ValidatePermissionProof(pin PolicyInventoryPin, input PermissionProofInput, mutationPrincipal Principal) error {
+	if err := validateInventoryPin("permissionInventory", pin); err != nil {
+		return guardError(ErrPermissionProof, "permissionInventory", "must contain a valid policy pin")
+	}
+	if !validPrincipal(mutationPrincipal) {
+		return guardError(ErrPermissionProof, "mutationPrincipal", "must be canonical")
 	}
 	if len(input.Expected) == 0 {
 		return guardError(ErrPermissionProof, "expected", "must not be empty")
@@ -76,6 +64,9 @@ func ValidatePermissionProof(input PermissionProofInput) error {
 		path := indexedField("expected", index)
 		if err := validatePermissionObservation(path, item); err != nil {
 			return err
+		}
+		if item.Identity != mutationPrincipal {
+			return guardError(ErrPermissionProof, path, "does not cover the exact mutation principal")
 		}
 		key := newPermissionObservationKey(item)
 		if _, exists := expectedByKey[key]; exists {
@@ -91,7 +82,7 @@ func ValidatePermissionProof(input PermissionProofInput) error {
 	if err != nil {
 		return err
 	}
-	if fingerprint != input.Inventory.Fingerprint {
+	if fingerprint != pin.Fingerprint {
 		return guardError(ErrPermissionProof, "inventory.fingerprint", "does not match the expected tuple inventory")
 	}
 
@@ -100,6 +91,9 @@ func ValidatePermissionProof(input PermissionProofInput) error {
 		path := indexedField("observed", index)
 		if err := validatePermissionObservation(path, item); err != nil {
 			return err
+		}
+		if item.Identity != mutationPrincipal {
+			return guardError(ErrPermissionProof, path, "does not cover the exact mutation principal")
 		}
 		key := newPermissionObservationKey(item)
 		if _, exists := seen[key]; exists {
@@ -154,12 +148,7 @@ func PermissionInventoryFingerprint(expected []PermissionObservation) (string, e
 		}
 		return !canonical[i].Granted && canonical[j].Granted
 	})
-	encoded, err := json.Marshal(canonical)
-	if err != nil {
-		return "", guardError(ErrPermissionProof, "expected", "could not be fingerprinted")
-	}
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:]), nil
+	return canonicalJSONFingerprint(canonical)
 }
 
 func validatePermissionObservation(path string, item PermissionObservation) error {
@@ -208,12 +197,4 @@ func permissionServiceAndAction(permission string) (string, string, bool) {
 		return "", "", false
 	}
 	return parts[0], parts[len(parts)-1], true
-}
-
-func isSHA256Fingerprint(value string) bool {
-	if len(value) != sha256.Size*2 {
-		return false
-	}
-	decoded, err := hex.DecodeString(value)
-	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }

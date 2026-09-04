@@ -17,7 +17,7 @@ func TestTESTISO01PermissionProofMatchesCallerSuppliedTuplesExactly(t *testing.T
 	expected := validPermissionExpectations()
 	observed := append([]isolation.PermissionObservation(nil), expected...)
 	observed[0], observed[1] = observed[1], observed[0]
-	if err := isolation.ValidatePermissionProof(permissionProofInput(expected, observed)); err != nil {
+	if err := isolation.ValidatePermissionProof(permissionPin(expected), permissionProofInput(expected, observed), operatorPrincipal()); err != nil {
 		t.Fatalf("ValidatePermissionProof() unexpected error: %v", err)
 	}
 }
@@ -49,7 +49,7 @@ func TestTESTISO09PermissionProofRejectsAmbiguousOrIncompleteEvidence(t *testing
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if err := isolation.ValidatePermissionProof(permissionProofInput(test.expected, test.observed)); !errors.Is(err, isolation.ErrPermissionProof) {
+			if err := isolation.ValidatePermissionProof(permissionPin(test.expected), permissionProofInput(test.expected, test.observed), operatorPrincipal()); !errors.Is(err, isolation.ErrPermissionProof) {
 				t.Fatalf("ValidatePermissionProof() error = %v; want ErrPermissionProof", err)
 			}
 		})
@@ -75,9 +75,9 @@ func TestTESTISO09PermissionProofRejectsForbiddenServiceWrites(t *testing.T) {
 			observation := isolation.PermissionObservation{
 				Identity: operatorPrincipal(), Resource: permissionResource("production-resource"), Permission: permission, Granted: true,
 			}
-			if err := isolation.ValidatePermissionProof(permissionProofInput(
+			if err := isolation.ValidatePermissionProof(permissionPin([]isolation.PermissionObservation{observation}), permissionProofInput(
 				[]isolation.PermissionObservation{observation}, []isolation.PermissionObservation{observation},
-			)); !errors.Is(err, isolation.ErrForbiddenPermission) {
+			), operatorPrincipal()); !errors.Is(err, isolation.ErrForbiddenPermission) {
 				t.Fatalf("ValidatePermissionProof() error = %v; want ErrForbiddenPermission", err)
 			}
 		})
@@ -88,7 +88,7 @@ func TestTESTISO09PermissionProofRejectsForbiddenServiceWrites(t *testing.T) {
 		{Identity: operatorPrincipal(), Resource: permissionResource("production-job"), Permission: "cloudscheduler.jobs.list", Granted: true},
 		{Identity: operatorPrincipal(), Resource: permissionResource("production-service"), Permission: "run.services.get", Granted: true},
 	}
-	if err := isolation.ValidatePermissionProof(permissionProofInput(reads, reads)); err != nil {
+	if err := isolation.ValidatePermissionProof(permissionPin(reads), permissionProofInput(reads, reads), operatorPrincipal()); err != nil {
 		t.Fatalf("ValidatePermissionProof(reads) unexpected error: %v", err)
 	}
 }
@@ -100,7 +100,7 @@ func TestPermissionProofErrorsDoNotExposeObservedValues(t *testing.T) {
 	expected := validPermissionExpectations()
 	observed := append([]isolation.PermissionObservation(nil), expected...)
 	observed[0].Resource = permissionResource(marker)
-	err := isolation.ValidatePermissionProof(permissionProofInput(expected, observed))
+	err := isolation.ValidatePermissionProof(permissionPin(expected), permissionProofInput(expected, observed), operatorPrincipal())
 	if !errors.Is(err, isolation.ErrPermissionProof) {
 		t.Fatalf("ValidatePermissionProof() error = %v; want ErrPermissionProof", err)
 	}
@@ -147,9 +147,9 @@ func TestPermissionProofRejectsAmbiguousPrincipalAndResourceIdentity(t *testing.
 			t.Parallel()
 			observation := validPermissionExpectations()[0]
 			test.mutate(&observation)
-			if err := isolation.ValidatePermissionProof(permissionProofInput(
+			if err := isolation.ValidatePermissionProof(permissionPin([]isolation.PermissionObservation{observation}), permissionProofInput(
 				[]isolation.PermissionObservation{observation}, []isolation.PermissionObservation{observation},
-			)); !errors.Is(err, isolation.ErrPermissionProof) {
+			), operatorPrincipal()); !errors.Is(err, isolation.ErrPermissionProof) {
 				t.Fatalf("ValidatePermissionProof() error = %v; want ErrPermissionProof", err)
 			}
 		})
@@ -160,16 +160,26 @@ func TestPermissionProofRequiresNamedVersionedCompleteInventory(t *testing.T) {
 	t.Parallel()
 
 	valid := validPermissionProofInput()
+	validPin := permissionPin(valid.Expected)
 	tests := []struct {
 		name   string
-		mutate func(*isolation.PermissionProofInput)
+		mutate func(*isolation.PolicyInventoryPin, *isolation.PermissionProofInput, *isolation.Principal)
 	}{
-		{name: "missing ID", mutate: func(input *isolation.PermissionProofInput) { input.Inventory.ID = "" }},
-		{name: "missing version", mutate: func(input *isolation.PermissionProofInput) { input.Inventory.Version = "" }},
-		{name: "missing fingerprint", mutate: func(input *isolation.PermissionProofInput) { input.Inventory.Fingerprint = "" }},
-		{name: "ad hoc subset", mutate: func(input *isolation.PermissionProofInput) {
+		{name: "missing ID", mutate: func(pin *isolation.PolicyInventoryPin, _ *isolation.PermissionProofInput, _ *isolation.Principal) {
+			pin.ID = ""
+		}},
+		{name: "missing version", mutate: func(pin *isolation.PolicyInventoryPin, _ *isolation.PermissionProofInput, _ *isolation.Principal) {
+			pin.Version = ""
+		}},
+		{name: "missing fingerprint", mutate: func(pin *isolation.PolicyInventoryPin, _ *isolation.PermissionProofInput, _ *isolation.Principal) {
+			pin.Fingerprint = ""
+		}},
+		{name: "ad hoc subset", mutate: func(_ *isolation.PolicyInventoryPin, input *isolation.PermissionProofInput, _ *isolation.Principal) {
 			input.Expected = input.Expected[:1]
 			input.Observed = input.Observed[:1]
+		}},
+		{name: "wrong mutation principal", mutate: func(_ *isolation.PolicyInventoryPin, _ *isolation.PermissionProofInput, principal *isolation.Principal) {
+			*principal = harnessPrincipal()
 		}},
 	}
 	for _, test := range tests {
@@ -177,8 +187,10 @@ func TestPermissionProofRequiresNamedVersionedCompleteInventory(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			input := valid
-			test.mutate(&input)
-			if err := isolation.ValidatePermissionProof(input); !errors.Is(err, isolation.ErrPermissionProof) {
+			pin := validPin
+			principal := operatorPrincipal()
+			test.mutate(&pin, &input, &principal)
+			if err := isolation.ValidatePermissionProof(pin, input, principal); !errors.Is(err, isolation.ErrPermissionProof) {
 				t.Fatalf("ValidatePermissionProof() error = %v; want ErrPermissionProof", err)
 			}
 		})
@@ -202,13 +214,13 @@ func validPermissionProofInput() isolation.PermissionProofInput {
 }
 
 func permissionProofInput(expected, observed []isolation.PermissionObservation) isolation.PermissionProofInput {
+	return isolation.PermissionProofInput{Expected: expected, Observed: observed}
+}
+
+func permissionPin(expected []isolation.PermissionObservation) isolation.PolicyInventoryPin {
 	fingerprint, err := isolation.PermissionInventoryFingerprint(expected)
 	if err != nil {
 		fingerprint = strings.Repeat("0", 64)
 	}
-	return isolation.PermissionProofInput{
-		Inventory: isolation.PermissionInventory{ID: "perm-test-operator", Version: "v1", Fingerprint: fingerprint},
-		Expected:  expected,
-		Observed:  observed,
-	}
+	return isolation.PolicyInventoryPin{ID: "perm-test-operator", Version: "v1", Fingerprint: fingerprint}
 }

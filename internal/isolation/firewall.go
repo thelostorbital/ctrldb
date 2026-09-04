@@ -10,14 +10,14 @@ import (
 )
 
 const (
-	TestVPCName                   = "ctrldb-test-vpc"
-	IAPTCPSourceCIDR              = "35.235.240.0/20"
-	IAPSSHFirewallRuleName        = "ctrldb-test-iap-ssh"
-	MongoFirewallRuleName         = "ctrldb-test-internal"
-	TestNodeTag                   = "ctrldb-test-node"
-	FirewallProtocolTCP           = "tcp"
-	FirewallPortSSH        uint16 = 22
-	FirewallPortMongo      uint16 = 27017
+	TestVPCName                     = "ctrldb-test-vpc"
+	IAPTCPSourceCIDR                = "35.235.240.0/20"
+	FirewallProtocolTCP             = "tcp"
+	FirewallPortSSH          uint16 = 22
+	FirewallPortMongo        uint16 = 27017
+	iapSSHFirewallRuleSuffix        = "iap-ssh"
+	mongoFirewallRuleSuffix         = "internal"
+	testNodeTagSuffix               = "node"
 )
 
 var (
@@ -37,10 +37,12 @@ const (
 )
 
 // FirewallRule is the normalized, local input used to prove a proposed test
-// firewall rule. Provider-specific adapters are outside this package.
+// firewall rule. Identity and Network are complete explicit provider
+// identities; provider-specific adapters are outside this package.
 type FirewallRule struct {
-	Name        string
-	Network     string
+	Identity    ResourceIdentity
+	Network     ResourceIdentity
+	RunID       string
 	Purpose     FirewallPurpose
 	Protocol    string
 	Ports       []uint16
@@ -50,11 +52,25 @@ type FirewallRule struct {
 }
 
 // ValidateFirewallRules requires exactly one IAP SSH rule and exactly one
-// internal MongoDB rule, and rejects any source range overlapping a CIDR
-// discovered for production.
-func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string) error {
+// internal MongoDB rule, binds both rule identities to the exact selected
+// mutation targets, and rejects any source range overlapping a CIDR discovered
+// for production.
+func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, runID string, targets []MutationTarget) error {
 	if len(rules) != 2 {
 		return guardError(ErrUnsafeFirewall, "firewallRules", "must contain both required purpose proofs")
+	}
+	selected, err := SelectRunMutationTargets(runID, targets)
+	if err != nil {
+		return err
+	}
+	targetKeys := make(map[string]struct{}, len(selected))
+	for _, target := range selected {
+		if target.Identity.Service == ComputeServiceName && target.Identity.Kind == ComputeFirewallKind {
+			targetKeys[target.Identity.CanonicalKey] = struct{}{}
+		}
+	}
+	if len(targetKeys) != len(rules) {
+		return guardError(ErrUnsafeFirewall, "targets", "must contain exactly the two proved firewall mutations")
 	}
 	seen := make(map[FirewallPurpose]struct{}, len(rules))
 	for index, rule := range rules {
@@ -63,8 +79,11 @@ func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string) error
 			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier firewall purpose")
 		}
 		seen[rule.Purpose] = struct{}{}
-		if err := ValidateFirewallRule(rule, productionCIDRs); err != nil {
+		if err := ValidateFirewallRule(rule, productionCIDRs, runID); err != nil {
 			return guardError(err, path, "failed its purpose proof")
+		}
+		if _, exists := targetKeys[rule.Identity.CanonicalKey]; !exists {
+			return guardError(ErrUnsafeFirewall, path, "is not one of the selected exact mutation targets")
 		}
 	}
 	if _, ok := seen[FirewallPurposeIAPSSH]; !ok {
@@ -78,9 +97,23 @@ func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string) error
 
 // ValidateFirewallRule validates the exact shape allowed for its declared
 // purpose. Errors identify only structural fields and never discovered values.
-func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string) error {
-	if rule.Network != TestVPCName {
-		return guardError(ErrUnsafeFirewall, "network", "must be the dedicated test VPC")
+func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string, runID string) error {
+	if err := ValidateRunID(runID); err != nil {
+		return err
+	}
+	if rule.RunID != runID {
+		return guardError(ErrUnsafeFirewall, "runID", "does not match the owning run")
+	}
+	if err := validateResourceIdentity(rule.Identity); err != nil {
+		return guardError(ErrUnsafeFirewall, "identity", "must be a complete canonical firewall identity")
+	}
+	if err := validateResourceIdentity(rule.Network); err != nil {
+		return guardError(ErrUnsafeFirewall, "network", "must be a complete canonical network identity")
+	}
+	if rule.Identity.Service != ComputeServiceName || rule.Identity.Kind != ComputeFirewallKind || rule.Identity.Scope != ResourceScopeGlobal ||
+		rule.Network.Service != ComputeServiceName || rule.Network.Kind != ComputeNetworkKind || rule.Network.Scope != ResourceScopeGlobal ||
+		rule.Network.Name != TestVPCName || rule.Identity.Project != rule.Network.Project {
+		return guardError(ErrUnsafeFirewall, "identity", "must bind a global Compute firewall to the explicit test VPC project")
 	}
 	if rule.Protocol != FirewallProtocolTCP || len(rule.Ports) != 1 {
 		return guardError(ErrUnsafeFirewall, "allow", "must contain one purpose-specific TCP port")
@@ -106,19 +139,23 @@ func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string) error {
 
 	switch rule.Purpose {
 	case FirewallPurposeIAPSSH:
-		if rule.Name != IAPSSHFirewallRuleName || rule.Ports[0] != FirewallPortSSH || len(rule.SourceTags) != 0 ||
+		expectedName, _ := RunFirewallRuleName(runID, FirewallPurposeIAPSSH)
+		expectedTag, _ := RunNodeTag(runID)
+		if rule.Identity.Name != expectedName || rule.Ports[0] != FirewallPortSSH || len(rule.SourceTags) != 0 ||
 			len(rule.SourceCIDRs) != 1 || rule.SourceCIDRs[0] != IAPTCPSourceCIDR ||
-			!slices.Equal(rule.TargetTags, []string{TestNodeTag}) {
+			!slices.Equal(rule.TargetTags, []string{expectedTag}) {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the IAP SSH purpose")
 		}
 	case FirewallPurposeInternalMongo:
-		if rule.Name != MongoFirewallRuleName || rule.Ports[0] != FirewallPortMongo || len(rule.SourceCIDRs) != 0 {
+		expectedName, _ := RunFirewallRuleName(runID, FirewallPurposeInternalMongo)
+		expectedTag, _ := RunNodeTag(runID)
+		if rule.Identity.Name != expectedName || rule.Ports[0] != FirewallPortMongo || len(rule.SourceCIDRs) != 0 {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the internal MongoDB purpose")
 		}
 		if err := validateTestTags("sourceTags", rule.SourceTags, true); err != nil {
 			return err
 		}
-		if !slices.Equal(rule.SourceTags, []string{TestNodeTag}) || !slices.Equal(rule.TargetTags, []string{TestNodeTag}) {
+		if !slices.Equal(rule.SourceTags, []string{expectedTag}) || !slices.Equal(rule.TargetTags, []string{expectedTag}) {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the internal MongoDB purpose")
 		}
 	default:
@@ -126,6 +163,32 @@ func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string) error {
 	}
 
 	return nil
+}
+
+// RunFirewallRuleName derives the only firewall rule name accepted for a
+// purpose and run, preventing one run's rule from selecting another run.
+func RunFirewallRuleName(runID string, purpose FirewallPurpose) (string, error) {
+	prefix, err := RunResourcePrefix(runID)
+	if err != nil {
+		return "", err
+	}
+	switch purpose {
+	case FirewallPurposeIAPSSH:
+		return prefix + iapSSHFirewallRuleSuffix, nil
+	case FirewallPurposeInternalMongo:
+		return prefix + mongoFirewallRuleSuffix, nil
+	default:
+		return "", guardError(ErrUnsafeFirewall, "purpose", "is not recognized")
+	}
+}
+
+// RunNodeTag derives the only node tag admitted for one run.
+func RunNodeTag(runID string) (string, error) {
+	prefix, err := RunResourcePrefix(runID)
+	if err != nil {
+		return "", err
+	}
+	return prefix + testNodeTagSuffix, nil
 }
 
 // ValidateFirewallTags is retained as the shared tag-shape primitive. Full

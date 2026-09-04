@@ -243,6 +243,30 @@ func TestRunMutationTargetsBindCompleteCrossProjectIdentity(t *testing.T) {
 	}
 }
 
+func TestResourceIdentityAcceptsDiscoveredMultiDigitRegionsAndKnownComputeScopes(t *testing.T) {
+	t.Parallel()
+
+	multiDigitZone := testResourceIdentity("ctrldb-test-run1-vm", isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "europe-west10-a")
+	if _, err := isolation.SelectRunMutationTargets("run1", []isolation.MutationTarget{testTargetWithIdentity(multiDigitZone, "run1")}); err != nil {
+		t.Fatalf("SelectRunMutationTargets(multi-digit zone) unexpected error: %v", err)
+	}
+	regionalDisk := testResourceIdentity("ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeRegion, "europe-west10")
+	if _, err := isolation.SelectRunMutationTargets("run1", []isolation.MutationTarget{testTargetWithIdentity(regionalDisk, "run1")}); err != nil {
+		t.Fatalf("SelectRunMutationTargets(regional disk) unexpected error: %v", err)
+	}
+
+	invalid := []isolation.ResourceIdentity{
+		{Project: "example-test-project", Service: isolation.ComputeServiceName, Kind: isolation.ComputeInstanceKind, Scope: isolation.ResourceScopeGlobal, Location: "global", Name: "ctrldb-test-run1-vm"},
+		{Project: "example-test-project", Service: isolation.ComputeServiceName, Kind: isolation.ComputeInstanceKind, Scope: isolation.ResourceScopeRegion, Location: "europe-west10", Name: "ctrldb-test-run1-vm"},
+		{Project: "example-test-project", Service: isolation.ComputeServiceName, Kind: isolation.ComputeDiskKind, Scope: isolation.ResourceScopeGlobal, Location: "global", Name: "ctrldb-test-run1-disk"},
+	}
+	for _, identity := range invalid {
+		if _, err := isolation.CanonicalTargetKey(identity); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+			t.Errorf("CanonicalTargetKey(impossible Compute scope) error = %v; want ErrInvalidGuardInput", err)
+		}
+	}
+}
+
 func TestSelectExpiredTargetsFailsClosedAndReturnsDetachedSortedResults(t *testing.T) {
 	t.Parallel()
 
@@ -451,15 +475,16 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 	t.Parallel()
 
 	input := validPreMutationInput()
-	decision, err := isolation.AuthorizePreMutation(input)
+	policy := validPreMutationPolicy()
+	decision, err := isolation.AuthorizePreMutation(policy, input, authorizationNow())
 	if err != nil {
 		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
 	}
-	targets, err := isolation.RevalidatePreMutation(decision, freshPreMutationInput())
+	boundary, err := isolation.RevalidatePreMutation(decision, policy, freshPreMutationInput(), revalidationNow())
 	if err != nil {
 		t.Fatalf("RevalidatePreMutation() unexpected error: %v", err)
 	}
-	targets[0].Labels[config.LabelPurpose] = "changed"
+	boundary.Targets[0].Labels[config.LabelPurpose] = "changed"
 	if input.Targets[0].Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
 		t.Fatal("RevalidatePreMutation() targets alias authorization input")
 	}
@@ -469,14 +494,21 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 		mutate func(*isolation.PreMutationInput)
 		kind   error
 	}{
+		{name: "operation attempt proof", mutate: func(value *isolation.PreMutationInput) { value.Operation.Attempt = 0 }, kind: isolation.ErrInvalidGuardInput},
+		{name: "operation ID proof", mutate: func(value *isolation.PreMutationInput) { value.Operation.OperationID = "Operation 1" }, kind: isolation.ErrInvalidGuardInput},
+		{name: "step ID proof", mutate: func(value *isolation.PreMutationInput) { value.Operation.StepID = "create/test" }, kind: isolation.ErrInvalidGuardInput},
 		{name: "selector proof", mutate: func(value *isolation.PreMutationInput) { value.RunID = "different" }, kind: isolation.ErrUnsafeTarget},
-		{name: "capacity proof", mutate: func(value *isolation.PreMutationInput) { value.Capacity.Instances[0].Machine.VCPUs = 8 }, kind: isolation.ErrCapacityExceeded},
+		{name: "capacity proof", mutate: func(value *isolation.PreMutationInput) {
+			value.Capacity.Instances[0].Machine.VCPUs = 8
+			refreshCapacityFingerprint(&value.Capacity)
+		}, kind: isolation.ErrCapacityExceeded},
 		{name: "network proof", mutate: func(value *isolation.PreMutationInput) { value.TestCIDR = "10.80.1.0/24" }, kind: isolation.ErrNetworkOverlap},
 		{name: "lock proof", mutate: func(value *isolation.PreMutationInput) {
 			value.Locks[0].Active = true
 			value.Locks[0].Holder = value.HarnessPrincipal
 		}, kind: isolation.ErrNonDisposableLock},
 		{name: "permission proof", mutate: func(value *isolation.PreMutationInput) { value.Permissions.Observed = nil }, kind: isolation.ErrPermissionProof},
+		{name: "mutation principal proof", mutate: func(value *isolation.PreMutationInput) { value.MutationPrincipal = value.HarnessPrincipal }, kind: isolation.ErrPermissionProof},
 		{name: "firewall proof", mutate: func(value *isolation.PreMutationInput) { value.FirewallRules = value.FirewallRules[:1] }, kind: isolation.ErrUnsafeFirewall},
 		{name: "freshness proof", mutate: func(value *isolation.PreMutationInput) { value.Freshness.ValidUntil = value.Freshness.ObservedAt }, kind: isolation.ErrStaleProof},
 	}
@@ -486,7 +518,7 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 			t.Parallel()
 			value := validPreMutationInput()
 			test.mutate(&value)
-			if _, err := isolation.AuthorizePreMutation(value); !errors.Is(err, test.kind) {
+			if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), value, authorizationNow()); !errors.Is(err, test.kind) {
 				t.Fatalf("AuthorizePreMutation() error = %v; want %v", err, test.kind)
 			}
 		})
@@ -523,56 +555,231 @@ func TestPreMutationCapacityProofUsesTheFullPlannedInventory(t *testing.T) {
 			t.Parallel()
 			input := validPreMutationInput()
 			test.mutate(&input)
-			if _, err := isolation.AuthorizePreMutation(input); !errors.Is(err, test.kind) {
+			if test.name != "empty instances" {
+				refreshCapacityFingerprint(&input.Capacity)
+			}
+			if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), input, authorizationNow()); !errors.Is(err, test.kind) {
 				t.Fatalf("AuthorizePreMutation() error = %v; want %v", err, test.kind)
 			}
 		})
 	}
 
 	input := validPreMutationInput()
-	input.Targets = []isolation.MutationTarget{testTargetWithIdentity(testResourceIdentity(
-		"ctrldb-test-run1-firewall", isolation.ResourceKind("firewalls"), isolation.ResourceScopeGlobal, "global",
-	), "run1")}
-	if _, err := isolation.AuthorizePreMutation(input); err != nil {
+	input.Targets = firewallTargets("run1")
+	if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), input, authorizationNow()); err != nil {
 		t.Fatalf("AuthorizePreMutation(firewall-only mutation with planned instance capacity) unexpected error: %v", err)
 	}
+	regionalDisk := validPreMutationInput()
+	regionalDisk.Capacity.Disks[0].Identity = testResourceIdentity(
+		"ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeRegion, "europe-west10",
+	)
+	refreshCapacityFingerprint(&regionalDisk.Capacity)
+	if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), regionalDisk, authorizationNow()); err != nil {
+		t.Fatalf("AuthorizePreMutation(regional disk inventory) unexpected error: %v", err)
+	}
+}
+
+func TestCapacitySnapshotFingerprintBindsTypedPlanAndCapacityValues(t *testing.T) {
+	t.Parallel()
+
+	base := validPreMutationInput().Capacity
+	baseline := base.SnapshotFingerprint
+	tests := []struct {
+		name   string
+		mutate func(*isolation.CapacityProofInput)
+	}{
+		{name: "plan ID", mutate: func(value *isolation.CapacityProofInput) { value.Plan.ID = "plan-fedcba9876543210" }},
+		{name: "plan hash", mutate: func(value *isolation.CapacityProofInput) { value.Plan.Hash = strings.Repeat("c", 64) }},
+		{name: "machine shape", mutate: func(value *isolation.CapacityProofInput) { value.Instances[0].Machine.VCPUs++ }},
+		{name: "disk size", mutate: func(value *isolation.CapacityProofInput) { value.Disks[0].SizeGiB++ }},
+		{name: "lifetime", mutate: func(value *isolation.CapacityProofInput) { value.Lifetime++ }},
+		{name: "cost", mutate: func(value *isolation.CapacityProofInput) { value.EstimatedCostMicros++ }},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			value := validPreMutationInput().Capacity
+			test.mutate(&value)
+			fingerprint, err := isolation.CapacitySnapshotFingerprint(value)
+			if err != nil {
+				t.Fatalf("CapacitySnapshotFingerprint() unexpected error: %v", err)
+			}
+			if fingerprint == baseline {
+				t.Fatal("CapacitySnapshotFingerprint() did not change with typed snapshot")
+			}
+		})
+	}
+
+	tampered := validPreMutationInput()
+	tampered.Capacity.Instances[0].Machine.MemoryMB++
+	if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), tampered, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(tampered capacity snapshot) error = %v; want ErrInvalidGuardInput", err)
+	}
+	invalidPlan := validPreMutationInput()
+	invalidPlan.Capacity.Plan.ID = "plan-1"
+	if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), invalidPlan, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(malformed plan identity) error = %v; want ErrInvalidGuardInput", err)
+	}
+}
+
+func TestPreMutationPolicyPinsRejectIncompleteCallerSets(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	tests := []struct {
+		name   string
+		mutate func(*isolation.PreMutationInput)
+		kind   error
+	}{
+		{name: "omitted production CIDR", mutate: func(value *isolation.PreMutationInput) { value.ProductionCIDRs = []string{"10.90.0.0/16"} }, kind: isolation.ErrInvalidGuardInput},
+		{name: "omitted environment", mutate: func(value *isolation.PreMutationInput) {
+			value.ExpectedNonDisposableEnvironments = []isolation.EnvironmentIdentity{{Environment: "staging", Class: domain.EnvironmentStaging}}
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "truncated permissions", mutate: func(value *isolation.PreMutationInput) {
+			value.Permissions.Expected = value.Permissions.Expected[:1]
+			value.Permissions.Observed = value.Permissions.Observed[:1]
+		}, kind: isolation.ErrPermissionProof},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			input := validPreMutationInput()
+			test.mutate(&input)
+			if _, err := isolation.AuthorizePreMutation(policy, input, authorizationNow()); !errors.Is(err, test.kind) {
+				t.Fatalf("AuthorizePreMutation() error = %v; want %v", err, test.kind)
+			}
+		})
+	}
+
+	invalidPolicy := policy
+	invalidPolicy.ProductionCIDRInventory.Version = ""
+	if _, err := isolation.AuthorizePreMutation(invalidPolicy, validPreMutationInput(), authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(malformed policy pin) error = %v; want ErrInvalidGuardInput", err)
+	}
+}
+
+func TestPolicyInventoryFingerprintsAreOrderIndependentAndRejectDuplicates(t *testing.T) {
+	t.Parallel()
+
+	environments := []isolation.EnvironmentIdentity{
+		{Environment: "production", Class: domain.EnvironmentProduction},
+		{Environment: "staging", Class: domain.EnvironmentStaging},
+	}
+	first, err := isolation.NonDisposableEnvironmentInventoryFingerprint(environments)
+	if err != nil {
+		t.Fatalf("NonDisposableEnvironmentInventoryFingerprint() unexpected error: %v", err)
+	}
+	second, err := isolation.NonDisposableEnvironmentInventoryFingerprint([]isolation.EnvironmentIdentity{environments[1], environments[0]})
+	if err != nil || first != second {
+		t.Fatalf("environment fingerprint is not canonical: second=%q error=%v", second, err)
+	}
+	if _, err := isolation.NonDisposableEnvironmentInventoryFingerprint(append(environments, environments[0])); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("NonDisposableEnvironmentInventoryFingerprint(duplicate) error = %v; want ErrInvalidGuardInput", err)
+	}
+
+	cidrs := []string{"10.80.0.0/16", "10.90.0.0/16"}
+	first, err = isolation.ProductionCIDRInventoryFingerprint(cidrs)
+	if err != nil {
+		t.Fatalf("ProductionCIDRInventoryFingerprint() unexpected error: %v", err)
+	}
+	second, err = isolation.ProductionCIDRInventoryFingerprint([]string{cidrs[1], cidrs[0]})
+	if err != nil || first != second {
+		t.Fatalf("production CIDR fingerprint is not canonical: second=%q error=%v", second, err)
+	}
+	if _, err := isolation.ProductionCIDRInventoryFingerprint(append(cidrs, cidrs[0])); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ProductionCIDRInventoryFingerprint(duplicate) error = %v; want ErrInvalidGuardInput", err)
+	}
+}
+
+func TestPreMutationUsesIndependentBoundaryTime(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	future := validPreMutationInput()
+	if _, err := isolation.AuthorizePreMutation(policy, future, future.Freshness.ObservedAt.Add(-time.Second)); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("AuthorizePreMutation(future observation) error = %v; want ErrStaleProof", err)
+	}
+	expired := validPreMutationInput()
+	if _, err := isolation.AuthorizePreMutation(policy, expired, expired.Freshness.ValidUntil); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("AuthorizePreMutation(expired observation) error = %v; want ErrStaleProof", err)
+	}
+	if _, err := isolation.AuthorizePreMutation(policy, validPreMutationInput(), time.Time{}); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(zero boundary time) error = %v; want ErrInvalidGuardInput", err)
+	}
+	decision, err := isolation.AuthorizePreMutation(policy, validPreMutationInput(), authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	fresh := freshPreMutationInput()
+	if _, err := isolation.RevalidatePreMutation(decision, policy, fresh, fresh.Freshness.ObservedAt.Add(-time.Nanosecond)); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(future rediscovery) error = %v; want ErrStaleProof", err)
+	}
+}
+
+func TestPreMutationBindsDurableAttemptButRequiresExternalAtomicConsumption(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	decision, err := isolation.AuthorizePreMutation(policy, validPreMutationInput(), authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	changed := freshPreMutationInput()
+	changed.Operation.Attempt++
+	if _, err := isolation.RevalidatePreMutation(decision, policy, changed, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(changed attempt) error = %v; want ErrProofMismatch", err)
+	}
+	for iteration := 0; iteration < 2; iteration++ {
+		boundary, err := isolation.RevalidatePreMutation(decision, policy, freshPreMutationInput(), revalidationNow())
+		if err != nil {
+			t.Fatalf("RevalidatePreMutation() unexpected error: %v", err)
+		}
+		if boundary.Operation != validPreMutationInput().Operation {
+			t.Fatal("RevalidatePreMutation() returned the wrong durable attempt binding")
+		}
+	}
+	// Repeated pure validation intentionally succeeds: the caller must atomically
+	// claim the returned binding in its durable journal before provider mutation.
 }
 
 func TestPreMutationDecisionRejectsStaleSwappedAndExpiredEvidence(t *testing.T) {
 	t.Parallel()
 
-	decision, err := isolation.AuthorizePreMutation(validPreMutationInput())
+	policy := validPreMutationPolicy()
+	decision, err := isolation.AuthorizePreMutation(policy, validPreMutationInput(), authorizationNow())
 	if err != nil {
 		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
 	}
-	if _, err := isolation.RevalidatePreMutation(decision, validPreMutationInput()); !errors.Is(err, isolation.ErrStaleProof) {
+	if _, err := isolation.RevalidatePreMutation(decision, policy, validPreMutationInput(), revalidationNow()); !errors.Is(err, isolation.ErrStaleProof) {
 		t.Fatalf("RevalidatePreMutation(reused observation) error = %v; want ErrStaleProof", err)
 	}
 	expired := freshPreMutationInput()
-	expired.Freshness.CheckedAt = validPreMutationInput().Freshness.ValidUntil
-	if _, err := isolation.RevalidatePreMutation(decision, expired); !errors.Is(err, isolation.ErrStaleProof) {
+	if _, err := isolation.RevalidatePreMutation(decision, policy, expired, expired.Freshness.ValidUntil); !errors.Is(err, isolation.ErrStaleProof) {
 		t.Fatalf("RevalidatePreMutation(expired) error = %v; want ErrStaleProof", err)
 	}
 	extended := freshPreMutationInput()
 	extended.Freshness.ValidUntil = extended.Freshness.ValidUntil.Add(time.Second)
-	if _, err := isolation.RevalidatePreMutation(decision, extended); !errors.Is(err, isolation.ErrStaleProof) {
+	if _, err := isolation.RevalidatePreMutation(decision, policy, extended, revalidationNow()); !errors.Is(err, isolation.ErrStaleProof) {
 		t.Fatalf("RevalidatePreMutation(extended expiry) error = %v; want ErrStaleProof", err)
 	}
 	swapped := freshPreMutationInput()
 	swapped.Targets[0].Identity.Project = "another-test-project"
 	swapped.Targets[0].Identity.CanonicalKey = mustCanonicalTargetKey(swapped.Targets[0].Identity)
 	swapped.Capacity.Instances[0].Identity = swapped.Targets[0].Identity
-	if _, err := isolation.RevalidatePreMutation(decision, swapped); !errors.Is(err, isolation.ErrProofMismatch) {
+	refreshCapacityFingerprint(&swapped.Capacity)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, swapped, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(swapped target) error = %v; want ErrProofMismatch", err)
 	}
 	drifted := freshPreMutationInput()
 	drifted.Freshness.Revision = strings.Repeat("c", 64)
-	if _, err := isolation.RevalidatePreMutation(decision, drifted); !errors.Is(err, isolation.ErrProofMismatch) {
+	if _, err := isolation.RevalidatePreMutation(decision, policy, drifted, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(drift) error = %v; want ErrProofMismatch", err)
 	}
-	inventorySwap := freshPreMutationInput()
-	inventorySwap.Permissions.Inventory.Version = "v2"
-	if _, err := isolation.RevalidatePreMutation(decision, inventorySwap); !errors.Is(err, isolation.ErrProofMismatch) {
+	inventorySwap := policy
+	inventorySwap.PermissionInventory.Version = "v2"
+	if _, err := isolation.RevalidatePreMutation(decision, inventorySwap, freshPreMutationInput(), revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(inventory swap) error = %v; want ErrProofMismatch", err)
 	}
 }
@@ -608,35 +815,78 @@ func validPreMutationInput() isolation.PreMutationInput {
 	observedAt := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
 	instance := testResourceIdentity("ctrldb-test-run1-vm", isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "asia-south1-a")
 	disk := testResourceIdentity("ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeZone, "asia-south1-a")
-	return isolation.PreMutationInput{
-		RunID:   "run1",
-		Targets: []isolation.MutationTarget{testTargetWithIdentity(instance, "run1")},
+	input := isolation.PreMutationInput{
+		Operation: isolation.OperationBinding{OperationID: "op-0123456789abcdef", StepID: "create-test-resources", Attempt: 1},
+		RunID:     "run1",
+		Targets: append([]isolation.MutationTarget{testTargetWithIdentity(instance, "run1")},
+			firewallTargets("run1")...),
 		Capacity: isolation.CapacityProofInput{
-			PlanFingerprint: strings.Repeat("a", 64),
-			Limits:          defaultLimits(),
-			Instances:       []isolation.PlannedInstance{{Identity: instance, RunID: "run1", Machine: isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024}}},
-			Disks:           []isolation.PlannedDisk{{Identity: disk, RunID: "run1", SizeGiB: 100}},
-			Lifetime:        time.Hour, EstimatedCostMicros: 1_000_000,
+			Plan:      isolation.PlanIdentity{ID: "plan-0123456789abcdef", Hash: strings.Repeat("a", 64)},
+			Limits:    defaultLimits(),
+			Instances: []isolation.PlannedInstance{{Identity: instance, RunID: "run1", Machine: isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024}}},
+			Disks:     []isolation.PlannedDisk{{Identity: disk, RunID: "run1", SizeGiB: 100}},
+			Lifetime:  time.Hour, EstimatedCostMicros: 1_000_000,
 		},
 		TestCIDR:                          "10.20.0.0/24",
 		ProductionCIDRs:                   []string{"10.80.0.0/16"},
 		ExpectedNonDisposableEnvironments: expectedEnvironments,
 		Locks:                             locks,
 		HarnessPrincipal:                  harnessPrincipal(),
+		MutationPrincipal:                 operatorPrincipal(),
 		Permissions:                       permissions,
 		FirewallRules:                     validFirewallRules(),
 		Freshness: isolation.EvidenceFreshness{
 			Revision: strings.Repeat("b", 64), ObservedAt: observedAt,
-			ValidUntil: observedAt.Add(4 * time.Minute), CheckedAt: observedAt,
+			ValidUntil: observedAt.Add(4 * time.Minute),
 		},
 	}
+	refreshCapacityFingerprint(&input.Capacity)
+	return input
 }
 
 func freshPreMutationInput() isolation.PreMutationInput {
 	input := validPreMutationInput()
 	input.Freshness.ObservedAt = input.Freshness.ObservedAt.Add(time.Second)
-	input.Freshness.CheckedAt = input.Freshness.ObservedAt
 	return input
+}
+
+func authorizationNow() time.Time {
+	return validPreMutationInput().Freshness.ObservedAt.Add(30 * time.Second)
+}
+
+func revalidationNow() time.Time {
+	return validPreMutationInput().Freshness.ObservedAt.Add(90 * time.Second)
+}
+
+func validPreMutationPolicy() isolation.PreMutationPolicy {
+	input := validPreMutationInput()
+	permissions, err := isolation.PermissionInventoryFingerprint(input.Permissions.Expected)
+	if err != nil {
+		panic(err)
+	}
+	environments, err := isolation.NonDisposableEnvironmentInventoryFingerprint(input.ExpectedNonDisposableEnvironments)
+	if err != nil {
+		panic(err)
+	}
+	cidrs, err := isolation.ProductionCIDRInventoryFingerprint(input.ProductionCIDRs)
+	if err != nil {
+		panic(err)
+	}
+	return isolation.PreMutationPolicy{
+		PermissionInventory: isolation.PolicyInventoryPin{ID: "permission-inventory", Version: "v1", Fingerprint: permissions},
+		NonDisposableEnvironmentInventory: isolation.PolicyInventoryPin{
+			ID: "environment-inventory", Version: "v1", Fingerprint: environments,
+		},
+		ProductionCIDRInventory: isolation.PolicyInventoryPin{ID: "production-cidr-inventory", Version: "v1", Fingerprint: cidrs},
+	}
+}
+
+func refreshCapacityFingerprint(capacity *isolation.CapacityProofInput) {
+	fingerprint, err := isolation.CapacitySnapshotFingerprint(*capacity)
+	if err != nil {
+		panic(err)
+	}
+	capacity.SnapshotFingerprint = fingerprint
 }
 
 func testTarget(name, runID string) isolation.MutationTarget {

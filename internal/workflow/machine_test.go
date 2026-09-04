@@ -84,11 +84,6 @@ func TestMachineFailureBranches(t *testing.T) {
 			path:  []domain.OperationState{domain.OperationFailedCleanup},
 		},
 		{
-			name:  "cancel after verified unwind",
-			start: domain.OperationRollback,
-			path:  []domain.OperationState{domain.OperationCancelled},
-		},
-		{
 			name:  "cancel before mutation",
 			start: domain.OperationExecute,
 			path:  []domain.OperationState{domain.OperationCancelled},

@@ -66,6 +66,9 @@ func (controller CancellationController) Request(current domain.OperationState, 
 	if !current.Valid() || current.Terminal() {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q cannot accept cancellation", ErrInvalidCancellation, current)
 	}
+	if !cancellationRouteExists(current) {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q has no safe cancellation route", ErrInvalidCancellation, current)
+	}
 	if !cancelSafe {
 		return CancellationController{queued: true}, CancellationDecision{
 			Action:  CancellationQueued,
@@ -103,4 +106,8 @@ func routeCancellation(controller CancellationController, current domain.Operati
 	}
 
 	return CancellationController{}, CancellationDecision{Action: action, Target: target, UIState: uiState}, nil
+}
+
+func cancellationRouteExists(current domain.OperationState) bool {
+	return CanTransition(current, domain.OperationCancelled) || CanTransition(current, domain.OperationRollback)
 }

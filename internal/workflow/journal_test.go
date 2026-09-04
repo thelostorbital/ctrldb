@@ -379,9 +379,15 @@ func TestJournalCancellationRequiresRollbackAfterPossibleMutation(t *testing.T) 
 	rollback.RecordedAt = afterRollback[5].RecordedAt.Add(time.Second)
 	cancelled = validTransitionEntry(8, domain.OperationCancelled)
 	cancelled.RecordedAt = rollback.RecordedAt.Add(time.Second)
-	afterRollback = append(afterRollback, rollback, cancelled)
+	unsafeTerminal := append(afterRollback, rollback, cancelled)
+	if err := workflow.ValidateJournal(unsafeTerminal); !errors.Is(err, workflow.ErrInvalidJournalStream) {
+		t.Fatalf("ROLLBACK -> CANCELLED error = %v, want ErrInvalidJournalStream", err)
+	}
+	verified := validTransitionEntry(8, domain.OperationVerifiedRollback)
+	verified.RecordedAt = rollback.RecordedAt.Add(time.Second)
+	afterRollback = append(afterRollback, rollback, verified)
 	if err := workflow.ValidateJournal(afterRollback); err != nil {
-		t.Fatalf("CANCELLED through verified ROLLBACK returned an error: %v", err)
+		t.Fatalf("ROLLBACK -> VERIFIED_ROLLBACK returned an error: %v", err)
 	}
 }
 
@@ -398,6 +404,40 @@ func TestJournalPauseCannotDiscardObservedMutation(t *testing.T) {
 
 	if err := workflow.ValidateJournal(entries); !errors.Is(err, workflow.ErrInvalidJournalStream) {
 		t.Fatalf("ValidateJournal() error = %v, want ErrInvalidJournalStream", err)
+	}
+}
+
+func TestJournalResumeEnforcesPauseDeadlineAndReapproval(t *testing.T) {
+	t.Parallel()
+
+	makePaused := func() []domain.JournalEntry {
+		entries := validJournal()[:6]
+		pause := validPausedEntry()
+		pause.RecordedAt = entries[5].RecordedAt.Add(time.Second)
+		pause.Pause.PausedAt = pause.RecordedAt
+		pause.Pause.ResumeBy = pause.RecordedAt.Add(time.Hour)
+		return append(entries, pause)
+	}
+
+	valid := makePaused()
+	valid[6].Pause.ReapprovalRequired = false
+	resume := validTransitionEntry(8, domain.OperationDiscover)
+	resume.RecordedAt = valid[6].Pause.ResumeBy.Add(-time.Nanosecond)
+	if err := workflow.ValidateJournal(append(valid, resume)); err != nil {
+		t.Fatalf("fresh resume returned an error: %v", err)
+	}
+
+	expired := makePaused()
+	expired[6].Pause.ReapprovalRequired = false
+	resume.RecordedAt = expired[6].Pause.ResumeBy
+	if err := workflow.ValidateJournal(append(expired, resume)); !errors.Is(err, workflow.ErrInvalidJournalStream) {
+		t.Fatalf("expired resume error = %v, want ErrInvalidJournalStream", err)
+	}
+
+	reapproval := makePaused()
+	resume.RecordedAt = reapproval[6].Pause.ResumeBy.Add(-time.Second)
+	if err := workflow.ValidateJournal(append(reapproval, resume)); !errors.Is(err, workflow.ErrInvalidJournalStream) {
+		t.Fatalf("resume without typed reapproval error = %v, want ErrInvalidJournalStream", err)
 	}
 }
 

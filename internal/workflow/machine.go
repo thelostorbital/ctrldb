@@ -73,7 +73,6 @@ var transitions = map[domain.OperationState]map[domain.OperationState]struct{}{
 	},
 	domain.OperationRollback: {
 		domain.OperationVerifiedRollback: {},
-		domain.OperationCancelled:        {},
 		domain.OperationFailedCleanup:    {},
 	},
 }

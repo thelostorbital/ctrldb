@@ -7,6 +7,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
 	"github.com/thelostorbital/ctrldb/internal/policy"
@@ -17,11 +18,13 @@ func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
 
 	plan := validPlan()
 	plan.Preconditions = append(plan.Preconditions, domain.PlanPrecondition{ID: "quota-ready", OK: false})
-	checks, err := policy.PermissionChecks(
-		domain.IdentityProvisioner,
-		[]string{"compute.instances.create", "compute.instances.get"},
-		[]string{"compute.instances.get"},
-	)
+	checks, err := policy.PermissionChecks(policy.PermissionProbe{
+		StepID:   plan.Steps[0].ID,
+		Identity: domain.IdentityOperator,
+		Resource: plan.Resources[0],
+		Required: []string{"compute.instances.get"},
+		Granted:  nil,
+	})
 	if err != nil {
 		t.Fatalf("PermissionChecks() returned an error: %v", err)
 	}
@@ -34,9 +37,9 @@ func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
 		t.Fatalf("blocked review artifact was not serializable: %v", err)
 	}
 
-	err = policy.ValidatePlanForExecutionAt(plan, plan.CreatedAt.Add(5))
+	err = policy.ValidatePlanForExecution(plan, validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute)))
 	if !errors.Is(err, policy.ErrPlanBlocked) {
-		t.Fatalf("ValidatePlanForExecutionAt() error = %v, want ErrPlanBlocked", err)
+		t.Fatalf("ValidatePlanForExecution() error = %v, want ErrPlanBlocked", err)
 	}
 	var blocked *policy.BlockedPlanError
 	if !errors.As(err, &blocked) {
@@ -47,7 +50,7 @@ func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
 	}
 	want := []policy.PlanBlocker{
 		{Kind: policy.BlockerPrecondition, ID: "quota-ready"},
-		{Kind: policy.BlockerPermission, ID: "compute.instances.create", Identity: domain.IdentityProvisioner},
+		{Kind: policy.BlockerPermission, ID: "compute.instances.get", Identity: domain.IdentityOperator},
 	}
 	if got := blocked.Blockers(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Blockers() = %#v, want %#v", got, want)
@@ -59,39 +62,323 @@ func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
 	}
 }
 
-func TestPermissionChecksRejectsAmbiguousProbeEvidence(t *testing.T) {
+func TestExecutionGateAcceptsCompleteFreshEvidence(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	evidence := validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute))
+	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+		t.Fatalf("ValidatePlanForExecution() returned an error: %v", err)
+	}
+}
+
+func TestExecutionGateRejectsMissingStaleOrMismatchedEvidence(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
-		identity domain.ExecutionIdentity
-		required []string
-		granted  []string
+		name   string
+		kind   policy.PlanBlockerKind
+		mutate func(*domain.Plan, *policy.ExecutionEvidence)
 	}{
-		{name: "unknown identity", identity: "root", required: []string{"compute.instances.get"}},
-		{name: "empty required", identity: domain.IdentityOperator},
-		{name: "malformed required", identity: domain.IdentityOperator, required: []string{"instances.get"}},
-		{name: "duplicate required", identity: domain.IdentityOperator, required: []string{"compute.instances.get", "compute.instances.get"}},
-		{name: "unexpected granted", identity: domain.IdentityOperator, required: []string{"compute.instances.get"}, granted: []string{"compute.instances.stop"}},
-		{name: "duplicate granted", identity: domain.IdentityOperator, required: []string{"compute.instances.get"}, granted: []string{"compute.instances.get", "compute.instances.get"}},
+		{name: "before plan creation", kind: policy.BlockerPlanTime, mutate: func(plan *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.CheckedAt = plan.CreatedAt.Add(-time.Second)
+			evidence.ObservedAt = evidence.CheckedAt
+		}},
+		{name: "observation predates plan", kind: policy.BlockerPlanTime, mutate: func(plan *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.ObservedAt = plan.CreatedAt.Add(-time.Nanosecond)
+		}},
+		{name: "wrong principal binding", kind: policy.BlockerPlanBinding, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Principal = "other@example.com"
+		}},
+		{name: "missing approval", kind: policy.BlockerApproval, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Approval = nil
+		}},
+		{name: "approval from another plan", kind: policy.BlockerApproval, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Approval.PlanID = "plan-fedcba9876543210"
+		}},
+		{name: "resource drift", kind: policy.BlockerResource, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Resources[0].Fingerprint = "generation-8"
+		}},
+		{name: "revoked permission", kind: policy.BlockerPermission, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Permissions[0].Granted = false
+		}},
+		{name: "false fresh precondition", kind: policy.BlockerPrecondition, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Preconditions[0].OK = false
+		}},
 	}
 
 	for _, test := range tests {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := policy.PermissionChecks(test.identity, test.required, test.granted); !errors.Is(err, policy.ErrInvalidPermissionProbe) {
+			plan := validPlan()
+			evidence := validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute))
+			test.mutate(&plan, &evidence)
+			expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), test.kind)
+		})
+	}
+}
+
+func TestExecutionGateUsesServerApprovalTimeForCoolingOff(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	plan.CoolingOffSeconds = 600
+	plan, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+	checkedAt := plan.CreatedAt.Add(30 * time.Minute)
+	evidence := validExecutionEvidence(plan, checkedAt)
+	evidence.Approval.ServerTimeCreated = checkedAt.Add(-5 * time.Minute)
+
+	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerCoolingOff)
+	evidence.Approval.ServerTimeCreated = checkedAt.Add(-10 * time.Minute)
+	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+		t.Fatalf("cooling boundary should use server approval time: %v", err)
+	}
+	evidence.ObservedAt = checkedAt.Add(-10*time.Minute - time.Nanosecond)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerCoolingOff)
+}
+
+func TestExecutionGateEnforcesIntentWindowAndBinding(t *testing.T) {
+	t.Parallel()
+
+	base := validPlan()
+	base.ExpiresAt = base.CreatedAt.Add(4 * time.Hour)
+	base.Intent = &domain.PlanIntent{
+		WindowStart: base.CreatedAt.Add(time.Hour),
+		ValidUntil:  base.CreatedAt.Add(3 * time.Hour),
+	}
+	plan, err := policy.SealPlan(base)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		at     time.Time
+		mutate func(*policy.ExecutionEvidence)
+	}{
+		{name: "before window", at: plan.Intent.WindowStart.Add(-time.Nanosecond)},
+		{name: "after validity", at: plan.Intent.ValidUntil.Add(time.Nanosecond)},
+		{name: "not sole active", at: plan.Intent.WindowStart, mutate: func(evidence *policy.ExecutionEvidence) {
+			evidence.Intent.SoleActive = false
+		}},
+		{name: "wrong policy binding", at: plan.Intent.WindowStart, mutate: func(evidence *policy.ExecutionEvidence) {
+			evidence.Intent.PolicyHash = "different"
+		}},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			evidence := validExecutionEvidence(plan, test.at)
+			if test.mutate != nil {
+				test.mutate(&evidence)
+			}
+			expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerIntent)
+		})
+	}
+
+	evidence := validExecutionEvidence(plan, plan.Intent.WindowStart)
+	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+		t.Fatalf("valid intent boundary returned an error: %v", err)
+	}
+}
+
+func TestExecutionGateBlocksUnapprovedPolicy(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	plan.PolicyHash.Approved = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	plan.PolicyHash.Match = false
+	plan, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+	evidence := validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute))
+
+	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerPolicy)
+}
+
+func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	plan.ApprovalClass = domain.ApprovalDataDestructive
+	plan.StepUpRequired = true
+	plan.CoolingOffSeconds = 600
+	plan, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+	checkedAt := plan.CreatedAt.Add(30 * time.Minute)
+	evidence := validExecutionEvidence(plan, checkedAt)
+	evidence.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
+	evidence.ObservedAt = checkedAt.Add(-10 * time.Minute)
+	evidence.StepUp.ServerTimeCreated = checkedAt.Add(-9*time.Minute - 59*time.Second)
+	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+		t.Fatalf("fresh step-up returned an error: %v", err)
+	}
+
+	for _, mutate := range []func(*policy.ExecutionEvidence){
+		func(evidence *policy.ExecutionEvidence) { evidence.StepUp = nil },
+		func(evidence *policy.ExecutionEvidence) { evidence.StepUp.PlanID = "plan-fedcba9876543210" },
+		func(evidence *policy.ExecutionEvidence) { evidence.StepUp.Principal = "other@example.com" },
+		func(evidence *policy.ExecutionEvidence) {
+			evidence.StepUp.ServerTimeCreated = evidence.ObservedAt.Add(-time.Nanosecond)
+		},
+		func(evidence *policy.ExecutionEvidence) {
+			evidence.StepUp.ServerTimeCreated = checkedAt.Add(-10 * time.Minute)
+		},
+	} {
+		changed := validExecutionEvidence(plan, checkedAt)
+		changed.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
+		mutate(&changed)
+		expectBlockedKind(t, policy.ValidatePlanForExecution(plan, changed), policy.BlockerStepUp)
+	}
+}
+
+func TestPermissionChecksRejectsAmbiguousProbeEvidence(t *testing.T) {
+	t.Parallel()
+
+	valid := policy.PermissionProbe{
+		StepID:   "stop-instance",
+		Identity: domain.IdentityOperator,
+		Resource: domain.PlanResource{Kind: "instance", Name: "example-instance", Fingerprint: "generation-7"},
+		Required: []string{"compute.instances.get"},
+		Granted:  []string{"compute.instances.get"},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*policy.PermissionProbe)
+	}{
+		{name: "missing step", mutate: func(probe *policy.PermissionProbe) { probe.StepID = "" }},
+		{name: "unknown identity", mutate: func(probe *policy.PermissionProbe) { probe.Identity = "root" }},
+		{name: "missing resource", mutate: func(probe *policy.PermissionProbe) { probe.Resource.Fingerprint = "" }},
+		{name: "empty required", mutate: func(probe *policy.PermissionProbe) { probe.Required = nil; probe.Granted = nil }},
+		{name: "malformed required", mutate: func(probe *policy.PermissionProbe) { probe.Required = []string{"instances.get"}; probe.Granted = nil }},
+		{name: "duplicate required", mutate: func(probe *policy.PermissionProbe) {
+			probe.Required = []string{"compute.instances.get", "compute.instances.get"}
+		}},
+		{name: "unexpected granted", mutate: func(probe *policy.PermissionProbe) { probe.Granted = []string{"compute.instances.stop"} }},
+		{name: "duplicate granted", mutate: func(probe *policy.PermissionProbe) {
+			probe.Granted = []string{"compute.instances.get", "compute.instances.get"}
+		}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			probe := valid
+			test.mutate(&probe)
+			if _, err := policy.PermissionChecks(probe); !errors.Is(err, policy.ErrInvalidPermissionProbe) {
 				t.Fatalf("PermissionChecks() error = %v, want ErrInvalidPermissionProbe", err)
 			}
 		})
 	}
 }
 
-func TestExecutionGateAcceptsSatisfiedChecks(t *testing.T) {
+func TestPlanPermissionCoverageIncludesEveryStepIdentityAndResource(t *testing.T) {
 	t.Parallel()
 
 	plan := validPlan()
-	if err := policy.ValidatePlanForExecutionAt(plan, plan.CreatedAt.Add(5)); err != nil {
-		t.Fatalf("ValidatePlanForExecutionAt() returned an error: %v", err)
+	secondResource := domain.PlanResource{Kind: "disk", Name: "example-disk", Fingerprint: "generation-2"}
+	plan.Resources = append(plan.Resources, secondResource)
+	if _, err := policy.SealPlan(plan); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("SealPlan() missing resource permission error = %v, want ErrInvalidPlan", err)
 	}
+	plan.Permissions = append(plan.Permissions, domain.PlanPermission{
+		StepID:     plan.Steps[0].ID,
+		Identity:   plan.Steps[0].ExecutingIdentity,
+		Permission: "compute.disks.use",
+		Resource:   secondResource,
+		Granted:    true,
+	})
+	if _, err := policy.SealPlan(plan); err != nil {
+		t.Fatalf("SealPlan() complete resource coverage returned an error: %v", err)
+	}
+
+	withoutResource := validPlan()
+	withoutResource.Resources = nil
+	withoutResource.Permissions = nil
+	if _, err := policy.SealPlan(withoutResource); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("SealPlan() resource-less mutation error = %v, want ErrInvalidPlan", err)
+	}
+
+	withoutIdentity := validPlan()
+	secondStep := withoutIdentity.Steps[0]
+	secondStep.ID = "delete-instance"
+	secondStep.ExecutingIdentity = domain.IdentityDestructive
+	withoutIdentity.Steps = append(withoutIdentity.Steps, secondStep)
+	if _, err := policy.SealPlan(withoutIdentity); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("SealPlan() missing step identity coverage error = %v, want ErrInvalidPlan", err)
+	}
+}
+
+func validExecutionEvidence(plan domain.Plan, checkedAt time.Time) policy.ExecutionEvidence {
+	evidence := policy.ExecutionEvidence{
+		PlanID:        plan.PlanID,
+		PlanHash:      plan.PlanHash,
+		Environment:   plan.Environment,
+		Principal:     plan.Principal,
+		CheckedAt:     checkedAt,
+		ObservedAt:    checkedAt,
+		PolicyHash:    plan.PolicyHash,
+		Preconditions: append([]domain.PlanPrecondition(nil), plan.Preconditions...),
+		Resources:     append([]domain.PlanResource(nil), plan.Resources...),
+		Permissions:   append([]domain.PlanPermission(nil), plan.Permissions...),
+	}
+	if plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil {
+		evidence.Approval = &policy.ApprovalEvidence{
+			PlanID:            plan.PlanID,
+			PlanHash:          plan.PlanHash,
+			Environment:       plan.Environment,
+			Principal:         plan.Principal,
+			RecordObject:      "plans/" + plan.Environment + "/" + plan.PlanID + "-approval.json",
+			ServerTimeCreated: checkedAt.Add(-time.Minute),
+		}
+	}
+	if plan.Intent != nil {
+		evidence.Approval.ServerTimeCreated = checkedAt
+		evidence.Intent = &policy.IntentEvidence{
+			PlanID:      plan.PlanID,
+			PlanHash:    plan.PlanHash,
+			PolicyHash:  plan.PolicyHash.Approved,
+			Environment: plan.Environment,
+			Principal:   plan.Principal,
+			WindowStart: plan.Intent.WindowStart,
+			ValidUntil:  plan.Intent.ValidUntil,
+			Active:      true,
+			SoleActive:  true,
+		}
+	}
+	if plan.StepUpRequired {
+		evidence.ObservedAt = checkedAt.Add(-2 * time.Minute)
+		evidence.StepUp = &policy.StepUpEvidence{
+			PlanID:            plan.PlanID,
+			PlanHash:          plan.PlanHash,
+			Environment:       plan.Environment,
+			Principal:         plan.Principal,
+			RecordObject:      "plans/" + plan.Environment + "/" + plan.PlanID + "-stepup-1.json",
+			ServerTimeCreated: checkedAt.Add(-time.Minute),
+		}
+	}
+
+	return evidence
+}
+
+func expectBlockedKind(t *testing.T, err error, kind policy.PlanBlockerKind) {
+	t.Helper()
+	var blocked *policy.BlockedPlanError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("error = %v, want *BlockedPlanError", err)
+	}
+	for _, blocker := range blocked.Blockers() {
+		if blocker.Kind == kind {
+			return
+		}
+	}
+	t.Fatalf("blockers = %#v, want kind %q", blocked.Blockers(), kind)
 }

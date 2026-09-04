@@ -134,6 +134,10 @@ func EncodePlan(plan domain.Plan) ([]byte, error) {
 // DecodePlan rejects unknown fields and trailing values, then validates the
 // complete plan before returning it.
 func DecodePlan(encoded []byte) (domain.Plan, error) {
+	if err := rejectDuplicateJSONKeys(encoded); err != nil {
+		return domain.Plan{}, err
+	}
+
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 
@@ -155,6 +159,67 @@ func DecodePlan(encoded []byte) (domain.Plan, error) {
 	}
 
 	return plan, nil
+}
+
+func rejectDuplicateJSONKeys(encoded []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	if err := consumeUniqueJSONValue(decoder, "plan"); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return invalid("decode", "trailing JSON value")
+	}
+
+	return nil
+}
+
+func consumeUniqueJSONValue(decoder *json.Decoder, path string) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return invalid("decode", err.Error())
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return invalid("decode", err.Error())
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return invalid(path, "contains a non-string object key")
+			}
+			if _, exists := seen[key]; exists {
+				return invalid(path+"."+key, "is duplicated")
+			}
+			seen[key] = struct{}{}
+			if err := consumeUniqueJSONValue(decoder, path+"."+key); err != nil {
+				return err
+			}
+		}
+		if _, err := decoder.Token(); err != nil {
+			return invalid("decode", err.Error())
+		}
+	case '[':
+		for index := 0; decoder.More(); index++ {
+			if err := consumeUniqueJSONValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+				return err
+			}
+		}
+		if _, err := decoder.Token(); err != nil {
+			return invalid("decode", err.Error())
+		}
+	default:
+		return invalid(path, "contains an unexpected delimiter")
+	}
+
+	return nil
 }
 
 func validateRequiredPlanJSON(encoded []byte) error {
@@ -185,8 +250,19 @@ func validateRequiredPlanJSON(encoded []byte) error {
 	if err := requireJSONArrayFields(plan["preconditions"], "preconditions", "id", "ok", "detail"); err != nil {
 		return err
 	}
-	if err := requireJSONArrayFields(plan["permissions"], "permissions", "identity", "permission", "granted"); err != nil {
+	if err := requireJSONArrayFields(plan["permissions"], "permissions", "stepId", "identity", "permission", "resource", "granted"); err != nil {
 		return err
+	}
+	var permissions []map[string]json.RawMessage
+	if err := json.Unmarshal(plan["permissions"], &permissions); err != nil {
+		return invalid("permissions", "must be an array")
+	}
+	for index, permission := range permissions {
+		if err := requireNestedJSONFields(permission["resource"], fmt.Sprintf("permissions[%d].resource", index),
+			"kind", "name", "fingerprint",
+		); err != nil {
+			return err
+		}
 	}
 
 	var steps []map[string]json.RawMessage
@@ -281,6 +357,9 @@ func validatePlanStructure(plan domain.Plan) error {
 	if plan.CoolingOffSeconds < 0 {
 		return invalid("coolingOffSeconds", "must not be negative")
 	}
+	if plan.CoolingOffSeconds > int64(plan.ExpiresAt.Sub(plan.CreatedAt)/time.Second) {
+		return invalid("coolingOffSeconds", "must fit within plan validity")
+	}
 	if err := validateIdentityPlan(plan.Identity); err != nil {
 		return err
 	}
@@ -298,13 +377,16 @@ func validatePlanStructure(plan domain.Plan) error {
 	if err := validateResources(plan.Resources); err != nil {
 		return err
 	}
+	if plan.ApprovalClass != domain.ApprovalRead && len(plan.Resources) == 0 {
+		return invalid("resources", "must identify at least one fingerprinted mutation target")
+	}
 	if err := validatePreconditions(plan.Preconditions); err != nil {
 		return err
 	}
-	if err := validatePermissions(plan.Permissions, plan.ApprovalClass); err != nil {
+	if err := validateSteps(plan.Steps, plan.PointOfNoReturn); err != nil {
 		return err
 	}
-	if err := validateSteps(plan.Steps, plan.PointOfNoReturn); err != nil {
+	if err := validatePermissions(plan.Permissions, plan.ApprovalClass, plan.Steps, plan.Resources); err != nil {
 		return err
 	}
 	if err := validateCost(plan.Cost); err != nil {
@@ -471,28 +553,79 @@ func validateSteps(steps []domain.PlanStep, pointOfNoReturn string) error {
 	return nil
 }
 
-func validatePermissions(permissions []domain.PlanPermission, approvalClass domain.ApprovalClass) error {
+func validatePermissions(
+	permissions []domain.PlanPermission,
+	approvalClass domain.ApprovalClass,
+	steps []domain.PlanStep,
+	resources []domain.PlanResource,
+) error {
 	if approvalClass != domain.ApprovalRead && len(permissions) == 0 {
 		return invalid("permissions", "must contain exact permission checks for a mutating plan")
 	}
 
+	stepsByID := make(map[string]domain.PlanStep, len(steps))
+	for _, step := range steps {
+		stepsByID[step.ID] = step
+	}
+	resourcesByKey := make(map[string]domain.PlanResource, len(resources))
+	for _, resource := range resources {
+		resourcesByKey[planResourceKey(resource)] = resource
+	}
 	seen := make(map[string]struct{}, len(permissions))
+	coveredSteps := make(map[string]struct{}, len(steps))
+	coveredIdentities := make(map[domain.ExecutionIdentity]struct{}, len(steps))
+	coveredResources := make(map[string]struct{}, len(resources))
 	for index, permission := range permissions {
 		path := fmt.Sprintf("permissions[%d]", index)
+		step, exists := stepsByID[permission.StepID]
+		if !exists {
+			return invalid(path+".stepId", "must name a step in this plan")
+		}
 		if !permission.Identity.Valid() {
 			return invalid(path+".identity", "unknown value")
+		}
+		if permission.Identity != step.ExecutingIdentity {
+			return invalid(path+".identity", "must match the named step")
 		}
 		if !permissionPattern.MatchString(permission.Permission) {
 			return invalid(path+".permission", "must be an exact permission name")
 		}
-		key := string(permission.Identity) + "\x00" + permission.Permission
+		resourceKey := planResourceKey(permission.Resource)
+		resource, exists := resourcesByKey[resourceKey]
+		if !exists || permission.Resource != resource {
+			return invalid(path+".resource", "must exactly match a fingerprinted plan resource")
+		}
+		key := permission.StepID + "\x00" + string(permission.Identity) + "\x00" + permission.Permission + "\x00" + resourceKey
 		if _, exists := seen[key]; exists {
-			return invalid(path, "duplicates an identity and permission")
+			return invalid(path, "duplicates a step, identity, permission, and resource")
 		}
 		seen[key] = struct{}{}
+		coveredSteps[permission.StepID] = struct{}{}
+		coveredIdentities[permission.Identity] = struct{}{}
+		coveredResources[resourceKey] = struct{}{}
+	}
+
+	if approvalClass != domain.ApprovalRead {
+		for _, step := range steps {
+			if _, exists := coveredSteps[step.ID]; !exists {
+				return invalid("permissions", "must cover every mutating-plan step")
+			}
+			if _, exists := coveredIdentities[step.ExecutingIdentity]; !exists {
+				return invalid("permissions", "must cover every executing identity")
+			}
+		}
+		for _, resource := range resources {
+			if _, exists := coveredResources[planResourceKey(resource)]; !exists {
+				return invalid("permissions", "must cover every affected resource")
+			}
+		}
 	}
 
 	return nil
+}
+
+func planResourceKey(resource domain.PlanResource) string {
+	return resource.Kind + "\x00" + resource.Name + "\x00" + resource.Fingerprint
 }
 
 func validateCost(cost domain.PlanCost) error {

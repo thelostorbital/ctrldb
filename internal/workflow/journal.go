@@ -161,6 +161,7 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 	attempts := make(map[string]uint32)
 	completed := make(map[string]struct{})
 	mutationMayHaveOccurred := false
+	var paused *domain.JournalPause
 
 	for index, entry := range entries {
 		if err := ValidateJournalEntry(entry); err != nil {
@@ -190,7 +191,18 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 				machine = NewMachine()
 				continue
 			}
-			if entry.OperationState == domain.OperationCancelled && mutationMayHaveOccurred && machine.State() != domain.OperationRollback {
+			if machine.State() == domain.OperationPaused {
+				if paused == nil {
+					return journalStreamError(index+1, "PAUSED state is missing its durable metadata")
+				}
+				if !entry.RecordedAt.Before(paused.ResumeBy) {
+					return journalStreamError(index+1, "transition leaves PAUSED at or after resumeBy")
+				}
+				if entry.OperationState == domain.OperationDiscover && paused.ReapprovalRequired {
+					return journalStreamError(index+1, "resume requires fresh approval evidence from the future resume coordinator")
+				}
+			}
+			if entry.OperationState == domain.OperationCancelled && mutationMayHaveOccurred {
 				return journalStreamError(index+1, "CANCELLED after possible mutation must route through ROLLBACK")
 			}
 			if err := machine.Transition(entry.OperationState); err != nil {
@@ -201,12 +213,19 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 					return journalStreamError(index+1, "PAUSED metadata must not discard observed mutation")
 				}
 				mutationMayHaveOccurred = mutationMayHaveOccurred || entry.Pause.MutationOccurred
+				pauseCopy := *entry.Pause
+				paused = &pauseCopy
+			} else {
+				paused = nil
 			}
 			continue
 		}
 
 		if machine == nil {
 			return journalStreamError(index+1, "step precedes the initial transition")
+		}
+		if machine.State() == domain.OperationPaused {
+			return journalStreamError(index+1, "step entry cannot execute while PAUSED")
 		}
 		if entry.OperationState != machine.State() {
 			return journalStreamError(index+1, "step operationState does not match the current state")

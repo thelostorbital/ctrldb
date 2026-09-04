@@ -7,7 +7,9 @@ package domain
 // that will execute it. A denied permission remains part of the reviewable
 // plan; the execution gate is responsible for blocking it.
 type PlanPermission struct {
+	StepID     string            `json:"stepId"`
 	Identity   ExecutionIdentity `json:"identity"`
 	Permission string            `json:"permission"`
+	Resource   PlanResource      `json:"resource"`
 	Granted    bool              `json:"granted"`
 }

@@ -62,4 +62,7 @@ func TestCancellationFailsClosedOnUnsafeRoutes(t *testing.T) {
 	if _, _, err := controller.Request(domain.OperationLock, true, true); !errors.Is(err, workflow.ErrInvalidCancellation) {
 		t.Fatalf("LOCK rollback error = %v, want ErrInvalidCancellation", err)
 	}
+	if _, _, err := controller.Request(domain.OperationDocument, false, false); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("unreachable queued cancellation error = %v, want ErrInvalidCancellation", err)
+	}
 }

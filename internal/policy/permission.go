@@ -6,15 +6,19 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
 )
 
-// ErrPlanBlocked identifies a structurally valid review artifact that must not
-// execute because one or more discovery-backed safety checks failed.
+const stepUpFreshness = 10 * time.Minute
+
 var (
-	ErrPlanBlocked            = errors.New("plan blocked")
+	// ErrPlanBlocked identifies a valid review artifact whose current execution
+	// evidence does not authorize mutation.
+	ErrPlanBlocked = errors.New("plan blocked")
+	// ErrInvalidPermissionProbe identifies ambiguous permission-probe input.
 	ErrInvalidPermissionProbe = errors.New("invalid permission probe")
 )
 
@@ -22,8 +26,16 @@ var (
 type PlanBlockerKind string
 
 const (
+	BlockerPlanBinding  PlanBlockerKind = "plan-binding"
+	BlockerPlanTime     PlanBlockerKind = "plan-time"
+	BlockerApproval     PlanBlockerKind = "approval"
+	BlockerCoolingOff   PlanBlockerKind = "cooling-off"
+	BlockerIntent       PlanBlockerKind = "intent"
+	BlockerPolicy       PlanBlockerKind = "policy"
 	BlockerPrecondition PlanBlockerKind = "precondition"
+	BlockerResource     PlanBlockerKind = "resource"
 	BlockerPermission   PlanBlockerKind = "permission"
+	BlockerStepUp       PlanBlockerKind = "step-up"
 )
 
 // PlanBlocker names one failed safety check without carrying provider output.
@@ -33,6 +45,70 @@ type PlanBlocker struct {
 	Identity domain.ExecutionIdentity
 }
 
+// PermissionProbe is one exact testIamPermissions-style observation request.
+type PermissionProbe struct {
+	StepID   string
+	Identity domain.ExecutionIdentity
+	Resource domain.PlanResource
+	Required []string
+	Granted  []string
+}
+
+// ApprovalEvidence is the create-only approval record read immediately before
+// execution. ServerTimeCreated is the storage service timestamp, never a
+// client-authored field or the plan creation time.
+type ApprovalEvidence struct {
+	PlanID            string
+	PlanHash          string
+	Environment       string
+	Principal         string
+	RecordObject      string
+	ServerTimeCreated time.Time
+}
+
+// IntentEvidence is the current authoritative view of a scheduled intent.
+type IntentEvidence struct {
+	PlanID      string
+	PlanHash    string
+	PolicyHash  string
+	Environment string
+	Principal   string
+	WindowStart time.Time
+	ValidUntil  time.Time
+	Active      bool
+	SoleActive  bool
+}
+
+// StepUpEvidence is the create-only fresh-login record for a destructive plan.
+type StepUpEvidence struct {
+	PlanID            string
+	PlanHash          string
+	Environment       string
+	Principal         string
+	RecordObject      string
+	ServerTimeCreated time.Time
+}
+
+// ExecutionEvidence is a typed, provider-independent revalidation snapshot.
+// CheckedAt is the authoritative gate time. ObservedAt is the authoritative
+// completion time of the resource, precondition, and permission revalidation
+// represented by this value; the gate verifies its required ordering.
+type ExecutionEvidence struct {
+	PlanID        string
+	PlanHash      string
+	Environment   string
+	Principal     string
+	CheckedAt     time.Time
+	ObservedAt    time.Time
+	Approval      *ApprovalEvidence
+	Intent        *IntentEvidence
+	PolicyHash    domain.PlanPolicyHash
+	Preconditions []domain.PlanPrecondition
+	Resources     []domain.PlanResource
+	Permissions   []domain.PlanPermission
+	StepUp        *StepUpEvidence
+}
+
 // BlockedPlanError is returned before any mutation for a reviewable but
 // non-executable plan. ExitCode is the stable command-mode validation code.
 type BlockedPlanError struct {
@@ -40,19 +116,21 @@ type BlockedPlanError struct {
 	blockers []PlanBlocker
 }
 
-// PermissionChecks converts an exact testIamPermissions-style response into
-// stable plan evidence. The response may contain only requested permissions;
-// omissions are recorded as denied rather than treated as a runtime error.
-func PermissionChecks(identity domain.ExecutionIdentity, required, granted []string) ([]domain.PlanPermission, error) {
-	if !identity.Valid() {
-		return nil, fmt.Errorf("%w: unknown identity", ErrInvalidPermissionProbe)
+// PermissionChecks converts a probe response into stable plan evidence. The
+// response may contain only requested permissions; omissions become denied.
+func PermissionChecks(probe PermissionProbe) ([]domain.PlanPermission, error) {
+	if probe.StepID == "" || !probe.Identity.Valid() {
+		return nil, fmt.Errorf("%w: invalid step or identity", ErrInvalidPermissionProbe)
 	}
-	if len(required) == 0 {
+	if probe.Resource.Kind == "" || probe.Resource.Name == "" || probe.Resource.Fingerprint == "" {
+		return nil, fmt.Errorf("%w: incomplete fingerprinted resource", ErrInvalidPermissionProbe)
+	}
+	if len(probe.Required) == 0 {
 		return nil, fmt.Errorf("%w: required set is empty", ErrInvalidPermissionProbe)
 	}
 
-	requiredSet := make(map[string]struct{}, len(required))
-	for _, permission := range required {
+	requiredSet := make(map[string]struct{}, len(probe.Required))
+	for _, permission := range probe.Required {
 		if !permissionPattern.MatchString(permission) {
 			return nil, fmt.Errorf("%w: malformed required permission", ErrInvalidPermissionProbe)
 		}
@@ -62,8 +140,8 @@ func PermissionChecks(identity domain.ExecutionIdentity, required, granted []str
 		requiredSet[permission] = struct{}{}
 	}
 
-	grantedSet := make(map[string]struct{}, len(granted))
-	for _, permission := range granted {
+	grantedSet := make(map[string]struct{}, len(probe.Granted))
+	for _, permission := range probe.Granted {
 		if _, requested := requiredSet[permission]; !requested {
 			return nil, fmt.Errorf("%w: response contains an unrequested permission", ErrInvalidPermissionProbe)
 		}
@@ -73,10 +151,16 @@ func PermissionChecks(identity domain.ExecutionIdentity, required, granted []str
 		grantedSet[permission] = struct{}{}
 	}
 
-	checks := make([]domain.PlanPermission, len(required))
-	for index, permission := range required {
+	checks := make([]domain.PlanPermission, len(probe.Required))
+	for index, permission := range probe.Required {
 		_, isGranted := grantedSet[permission]
-		checks[index] = domain.PlanPermission{Identity: identity, Permission: permission, Granted: isGranted}
+		checks[index] = domain.PlanPermission{
+			StepID:     probe.StepID,
+			Identity:   probe.Identity,
+			Permission: permission,
+			Resource:   probe.Resource,
+			Granted:    isGranted,
+		}
 	}
 
 	return checks, nil
@@ -106,7 +190,7 @@ func (err *BlockedPlanError) PlanID() string {
 	return err.planID
 }
 
-// Blockers returns a detached copy in deterministic plan order.
+// Blockers returns a detached copy in deterministic gate order.
 func (err *BlockedPlanError) Blockers() []PlanBlocker {
 	if err == nil {
 		return nil
@@ -118,32 +202,234 @@ func (err *BlockedPlanError) Blockers() []PlanBlocker {
 	return result
 }
 
-// ValidatePlanForExecutionAt validates integrity and expiry before converting
-// denied permissions and false preconditions into a typed, deterministic
-// execution blocker. It performs no I/O and has no mutation capability.
-func ValidatePlanForExecutionAt(plan domain.Plan, now time.Time) error {
-	if err := ValidatePlanAt(plan, now); err != nil {
+// ValidatePlanForExecution consumes only typed current evidence. It performs
+// no discovery or mutation and fails closed before an executor is reachable.
+func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence) error {
+	if err := ValidatePlan(plan); err != nil {
+		return err
+	}
+	if !validEvidenceTime(evidence.CheckedAt) {
+		return &BlockedPlanError{planID: plan.PlanID, blockers: []PlanBlocker{{Kind: BlockerPlanTime, ID: "checked-at"}}}
+	}
+	if err := ValidatePlanAt(plan, evidence.CheckedAt); err != nil {
 		return err
 	}
 
 	blockers := make([]PlanBlocker, 0)
-	for _, precondition := range plan.Preconditions {
-		if !precondition.OK {
-			blockers = append(blockers, PlanBlocker{Kind: BlockerPrecondition, ID: precondition.ID})
-		}
+	if !validEvidenceTime(evidence.ObservedAt) || evidence.ObservedAt.After(evidence.CheckedAt) ||
+		evidence.ObservedAt.Before(plan.CreatedAt) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanTime, ID: "fresh-observation"})
 	}
-	for _, permission := range plan.Permissions {
-		if !permission.Granted {
-			blockers = append(blockers, PlanBlocker{
-				Kind:     BlockerPermission,
-				ID:       permission.Permission,
-				Identity: permission.Identity,
-			})
-		}
+	if evidence.CheckedAt.Before(plan.CreatedAt) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanTime, ID: "before-plan-creation"})
 	}
+	if evidence.PlanID != plan.PlanID || evidence.PlanHash != plan.PlanHash ||
+		evidence.Environment != plan.Environment || evidence.Principal != plan.Principal {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanBinding, ID: "execution-evidence"})
+	}
+
+	requireApproval := plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil
+	if requireApproval {
+		blockers = validateApprovalEvidence(plan, evidence, blockers)
+	} else if evidence.Approval != nil {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerApproval, ID: "unexpected"})
+	}
+	blockers = validateIntentEvidence(plan, evidence, blockers)
+
+	if !plan.PolicyHash.Match || evidence.PolicyHash != plan.PolicyHash || !evidence.PolicyHash.Match {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerPolicy, ID: "approved-policy-hash"})
+	}
+	blockers = validatePreconditionEvidence(plan, evidence, blockers)
+	blockers = validateResourceEvidence(plan, evidence, blockers)
+	blockers = validatePermissionEvidence(plan, evidence, blockers)
+	blockers = validateStepUpEvidence(plan, evidence, blockers)
+
 	if len(blockers) != 0 {
 		return &BlockedPlanError{planID: plan.PlanID, blockers: blockers}
 	}
 
 	return nil
+}
+
+func validateApprovalEvidence(plan domain.Plan, evidence ExecutionEvidence, blockers []PlanBlocker) []PlanBlocker {
+	approval := evidence.Approval
+	if approval == nil {
+		return append(blockers, PlanBlocker{Kind: BlockerApproval, ID: "missing"})
+	}
+	if approval.PlanID != plan.PlanID || approval.PlanHash != plan.PlanHash ||
+		approval.Environment != plan.Environment || approval.Principal != plan.Principal ||
+		approval.RecordObject != fmt.Sprintf("plans/%s/%s-approval.json", plan.Environment, plan.PlanID) ||
+		!validEvidenceTime(approval.ServerTimeCreated) ||
+		approval.ServerTimeCreated.Before(plan.CreatedAt) || approval.ServerTimeCreated.After(evidence.CheckedAt) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerApproval, ID: "invalid-binding"})
+	}
+	readyAt := approval.ServerTimeCreated.Add(time.Duration(plan.CoolingOffSeconds) * time.Second)
+	if evidence.CheckedAt.Before(readyAt) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerCoolingOff, ID: "not-elapsed"})
+	}
+	if evidence.ObservedAt.Before(readyAt) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerCoolingOff, ID: "revalidation-before-elapse"})
+	}
+	if plan.Intent != nil && approval.ServerTimeCreated.Before(plan.Intent.WindowStart) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerApproval, ID: "window-confirmation"})
+	}
+
+	return blockers
+}
+
+func validateIntentEvidence(plan domain.Plan, evidence ExecutionEvidence, blockers []PlanBlocker) []PlanBlocker {
+	if plan.Intent == nil {
+		if evidence.Intent != nil {
+			return append(blockers, PlanBlocker{Kind: BlockerIntent, ID: "unexpected"})
+		}
+		return blockers
+	}
+	intent := evidence.Intent
+	if intent == nil {
+		return append(blockers, PlanBlocker{Kind: BlockerIntent, ID: "missing"})
+	}
+	if intent.PlanID != plan.PlanID || intent.PlanHash != plan.PlanHash ||
+		intent.PolicyHash != plan.PolicyHash.Approved || intent.Environment != plan.Environment ||
+		intent.Principal != plan.Principal || !intent.WindowStart.Equal(plan.Intent.WindowStart) ||
+		!intent.ValidUntil.Equal(plan.Intent.ValidUntil) || !intent.Active || !intent.SoleActive {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerIntent, ID: "invalid-binding"})
+	}
+	if evidence.CheckedAt.Before(intent.WindowStart) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerIntent, ID: "before-window"})
+	}
+	if evidence.CheckedAt.After(intent.ValidUntil) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerIntent, ID: "expired"})
+	}
+	if evidence.ObservedAt.Before(intent.WindowStart) || evidence.ObservedAt.After(intent.ValidUntil) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerIntent, ID: "revalidation-outside-window"})
+	}
+
+	return blockers
+}
+
+func validatePreconditionEvidence(plan domain.Plan, evidence ExecutionEvidence, blockers []PlanBlocker) []PlanBlocker {
+	observed := make(map[string]domain.PlanPrecondition, len(evidence.Preconditions))
+	for _, precondition := range evidence.Preconditions {
+		if _, duplicate := observed[precondition.ID]; duplicate {
+			blockers = append(blockers, PlanBlocker{Kind: BlockerPrecondition, ID: "duplicate-evidence"})
+		}
+		observed[precondition.ID] = precondition
+	}
+	if len(evidence.Preconditions) != len(plan.Preconditions) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerPrecondition, ID: "incomplete-evidence"})
+	}
+	for _, expected := range plan.Preconditions {
+		current, exists := observed[expected.ID]
+		if !expected.OK || !exists || !current.OK || current.Detail.String() != expected.Detail.String() {
+			blockers = append(blockers, PlanBlocker{Kind: BlockerPrecondition, ID: expected.ID})
+		}
+	}
+
+	return blockers
+}
+
+func validateResourceEvidence(plan domain.Plan, evidence ExecutionEvidence, blockers []PlanBlocker) []PlanBlocker {
+	observed := make(map[string]domain.PlanResource, len(evidence.Resources))
+	for _, resource := range evidence.Resources {
+		key := resource.Kind + "\x00" + resource.Name
+		if _, duplicate := observed[key]; duplicate {
+			blockers = append(blockers, PlanBlocker{Kind: BlockerResource, ID: "duplicate-evidence"})
+		}
+		observed[key] = resource
+	}
+	if len(evidence.Resources) != len(plan.Resources) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerResource, ID: "incomplete-evidence"})
+	}
+	for _, expected := range plan.Resources {
+		current, exists := observed[expected.Kind+"\x00"+expected.Name]
+		if !exists || current != expected {
+			blockers = append(blockers, PlanBlocker{Kind: BlockerResource, ID: expected.Kind + "/" + expected.Name})
+		}
+	}
+
+	return blockers
+}
+
+func validatePermissionEvidence(plan domain.Plan, evidence ExecutionEvidence, blockers []PlanBlocker) []PlanBlocker {
+	observed := make(map[string]domain.PlanPermission, len(evidence.Permissions))
+	for _, permission := range evidence.Permissions {
+		key := planPermissionKey(permission)
+		if _, duplicate := observed[key]; duplicate {
+			blockers = append(blockers, PlanBlocker{Kind: BlockerPermission, ID: "duplicate-evidence"})
+		}
+		observed[key] = permission
+	}
+	if len(evidence.Permissions) != len(plan.Permissions) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerPermission, ID: "incomplete-evidence"})
+	}
+	for _, expected := range plan.Permissions {
+		current, exists := observed[planPermissionKey(expected)]
+		if !expected.Granted || !exists || !current.Granted || current != expected {
+			blockers = append(blockers, PlanBlocker{
+				Kind: BlockerPermission, ID: expected.Permission, Identity: expected.Identity,
+			})
+		}
+	}
+
+	return blockers
+}
+
+func validateStepUpEvidence(plan domain.Plan, evidence ExecutionEvidence, blockers []PlanBlocker) []PlanBlocker {
+	if !plan.StepUpRequired {
+		if evidence.StepUp != nil {
+			return append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "unexpected"})
+		}
+		return blockers
+	}
+	stepUp := evidence.StepUp
+	if stepUp == nil {
+		return append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "missing"})
+	}
+	if stepUp.PlanID != plan.PlanID || stepUp.PlanHash != plan.PlanHash ||
+		stepUp.Environment != plan.Environment || stepUp.Principal != plan.Principal ||
+		!validStepUpObject(stepUp.RecordObject, plan) || !validEvidenceTime(stepUp.ServerTimeCreated) ||
+		stepUp.ServerTimeCreated.Before(evidence.ObservedAt) ||
+		stepUp.ServerTimeCreated.After(evidence.CheckedAt) ||
+		evidence.CheckedAt.Sub(stepUp.ServerTimeCreated) >= stepUpFreshness {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "invalid-or-stale"})
+	}
+	if evidence.Approval == nil || stepUp.ServerTimeCreated.Before(
+		evidence.Approval.ServerTimeCreated.Add(time.Duration(plan.CoolingOffSeconds)*time.Second),
+	) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "before-revalidation"})
+	}
+
+	return blockers
+}
+
+func planPermissionKey(permission domain.PlanPermission) string {
+	return permission.StepID + "\x00" + string(permission.Identity) + "\x00" + permission.Permission + "\x00" +
+		permission.Resource.Kind + "\x00" + permission.Resource.Name + "\x00" + permission.Resource.Fingerprint
+}
+
+func validEvidenceTime(value time.Time) bool {
+	if value.IsZero() {
+		return false
+	}
+	_, offset := value.Zone()
+
+	return offset == 0
+}
+
+func validStepUpObject(object string, plan domain.Plan) bool {
+	prefix := fmt.Sprintf("plans/%s/%s-stepup-", plan.Environment, plan.PlanID)
+	if !strings.HasPrefix(object, prefix) || !strings.HasSuffix(object, ".json") {
+		return false
+	}
+	sequence := strings.TrimSuffix(strings.TrimPrefix(object, prefix), ".json")
+	if sequence == "" {
+		return false
+	}
+	for _, character := range sequence {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+
+	return true
 }

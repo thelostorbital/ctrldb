@@ -162,14 +162,6 @@ func scan(root string) ([]finding, error) {
 			})
 			return nil
 		}
-		matches, matchErr := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
-		if matchErr != nil {
-			return fmt.Errorf("evaluate build constraints for %s: %w", path, matchErr)
-		}
-		if !matches {
-			return nil
-		}
-
 		contents, err := os.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
@@ -186,6 +178,13 @@ func scan(root string) ([]finding, error) {
 			return err
 		}
 		findings = append(findings, fileFindings...)
+		matches, matchErr := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+		if matchErr != nil {
+			return fmt.Errorf("evaluate build constraints for %s: %w", path, matchErr)
+		}
+		if !matches {
+			return nil
+		}
 		sourcesByDirectory[filepath.Dir(path)] = append(sourcesByDirectory[filepath.Dir(path)], sourceFile{
 			filename: path,
 			contents: contents,
@@ -610,6 +609,7 @@ func (loader *architectureImporter) importRepositoryPackage(importPath string) (
 
 func (loader *architectureImporter) summarizeRepositoryPackage(parsedFiles []*ast.File, information *types.Info, imported *types.Package) {
 	actual := findFlowFacts(parsedFiles, information, imported, loader.summaries, nil)
+	summarizeParameterFlows(parsedFiles, information, actual, loader.summaries)
 	for object := range actual.secretObjects {
 		if object.Pkg() == imported {
 			loader.summaries.secretObjects[object] = true
@@ -684,6 +684,126 @@ func (loader *architectureImporter) summarizeRepositoryPackage(parsedFiles []*as
 			}
 		}
 	}
+}
+
+func summarizeParameterFlows(parsedFiles []*ast.File, information *types.Info, facts *flowFacts, summaries *flowSummaries) {
+	for _, parsed := range parsedFiles {
+		for _, declaration := range parsed.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			object := information.Defs[function.Name]
+			parameters := facts.functionParameters[object]
+			parameterIndexes := make(map[types.Object]int, len(parameters))
+			for index, parameter := range parameters {
+				if parameter != nil {
+					parameterIndexes[parameter] = index
+				}
+			}
+			receiver := facts.functionReceivers[object]
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				if _, nested := node.(*ast.FuncLit); nested {
+					return false
+				}
+				switch statement := node.(type) {
+				case *ast.CallExpr:
+					callbackIndex, callbackParameter := expressionParameterIndex(statement.Fun, information, parameterIndexes, facts.aliases)
+					if !callbackParameter {
+						return true
+					}
+					invocation := callbackInvocation{callbackParameter: callbackIndex, argumentParameters: make([]int, len(statement.Args))}
+					for index, argument := range statement.Args {
+						parameterIndex, found := expressionParameterIndex(argument, information, parameterIndexes, facts.aliases)
+						if !found {
+							parameterIndex = -1
+						}
+						invocation.argumentParameters[index] = parameterIndex
+					}
+					summaries.callbackInvocations[object] = appendUniqueCallbackInvocation(summaries.callbackInvocations[object], invocation)
+				case *ast.AssignStmt:
+					if receiver == nil || len(statement.Lhs) != len(statement.Rhs) {
+						return true
+					}
+					for index, target := range statement.Lhs {
+						if !objectsRelated(flowRootObject(target, information), receiver, facts.aliases) {
+							continue
+						}
+						parameterIndex, found := expressionParameterIndex(statement.Rhs[index], information, parameterIndexes, facts.aliases)
+						if found {
+							summaries.receiverMutations[object] = appendUniqueInt(summaries.receiverMutations[object], parameterIndex)
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+}
+
+func expressionParameterIndex(expression ast.Expr, information *types.Info, indexes map[types.Object]int, aliases map[types.Object]map[types.Object]bool) (int, bool) {
+	for _, object := range []types.Object{expressionObject(expression, information), flowRootObject(expression, information)} {
+		if index, found := relatedParameterIndex(object, indexes, aliases); found {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+func relatedParameterIndex(root types.Object, indexes map[types.Object]int, aliases map[types.Object]map[types.Object]bool) (int, bool) {
+	seen := make(map[types.Object]bool)
+	pending := []types.Object{root}
+	for len(pending) != 0 {
+		object := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if object == nil || seen[object] {
+			continue
+		}
+		seen[object] = true
+		if index, found := indexes[object]; found {
+			return index, true
+		}
+		for alias := range aliases[object] {
+			pending = append(pending, alias)
+		}
+	}
+	return 0, false
+}
+
+func objectsRelated(left, right types.Object, aliases map[types.Object]map[types.Object]bool) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	_, found := relatedParameterIndex(left, map[types.Object]int{right: 0}, aliases)
+	return found
+}
+
+func appendUniqueCallbackInvocation(existing []callbackInvocation, candidate callbackInvocation) []callbackInvocation {
+	for _, invocation := range existing {
+		if invocation.callbackParameter != candidate.callbackParameter || len(invocation.argumentParameters) != len(candidate.argumentParameters) {
+			continue
+		}
+		equal := true
+		for index := range invocation.argumentParameters {
+			if invocation.argumentParameters[index] != candidate.argumentParameters[index] {
+				equal = false
+				break
+			}
+		}
+		if equal {
+			return existing
+		}
+	}
+	return append(existing, candidate)
+}
+
+func appendUniqueInt(existing []int, candidate int) []int {
+	for _, value := range existing {
+		if value == candidate {
+			return existing
+		}
+	}
+	return append(existing, candidate)
 }
 
 func functionBodyFormatsSecret(body *ast.BlockStmt, information *types.Info, facts *flowFacts) bool {
@@ -809,7 +929,14 @@ type flowFacts struct {
 	literalFormatterReturns map[*ast.FuncLit]bool
 	literalLiteralReturns   map[*ast.FuncLit]map[*ast.FuncLit]bool
 	formatterLiterals       map[*ast.FuncLit]bool
+	callbackInvocations     map[types.Object][]callbackInvocation
+	receiverMutations       map[types.Object][]int
 	literals                []*ast.FuncLit
+}
+
+type callbackInvocation struct {
+	callbackParameter  int
+	argumentParameters []int
 }
 
 type flowSummaries struct {
@@ -817,6 +944,8 @@ type flowSummaries struct {
 	secretReturns       map[types.Object]bool
 	formatterReturns    map[types.Object]bool
 	formattingFunctions map[types.Object]bool
+	callbackInvocations map[types.Object][]callbackInvocation
+	receiverMutations   map[types.Object][]int
 }
 
 func newFlowSummaries() *flowSummaries {
@@ -825,6 +954,8 @@ func newFlowSummaries() *flowSummaries {
 		secretReturns:       make(map[types.Object]bool),
 		formatterReturns:    make(map[types.Object]bool),
 		formattingFunctions: make(map[types.Object]bool),
+		callbackInvocations: make(map[types.Object][]callbackInvocation),
+		receiverMutations:   make(map[types.Object][]int),
 	}
 }
 
@@ -846,6 +977,8 @@ func newFlowFacts(summaries *flowSummaries) *flowFacts {
 		literalFormatterReturns: make(map[*ast.FuncLit]bool),
 		literalLiteralReturns:   make(map[*ast.FuncLit]map[*ast.FuncLit]bool),
 		formatterLiterals:       make(map[*ast.FuncLit]bool),
+		callbackInvocations:     make(map[types.Object][]callbackInvocation),
+		receiverMutations:       make(map[types.Object][]int),
 	}
 	if summaries == nil {
 		return facts
@@ -861,6 +994,12 @@ func newFlowFacts(summaries *flowSummaries) *flowFacts {
 	}
 	for object := range summaries.formattingFunctions {
 		facts.formatterObjects[object] = true
+	}
+	for object, invocations := range summaries.callbackInvocations {
+		facts.callbackInvocations[object] = append([]callbackInvocation(nil), invocations...)
+	}
+	for object, parameters := range summaries.receiverMutations {
+		facts.receiverMutations[object] = append([]int(nil), parameters...)
 	}
 	return facts
 }
@@ -1070,13 +1209,47 @@ func propagateCallArguments(call *ast.CallExpr, information *types.Info, checked
 	functions := calledFunctionCandidates(call.Fun, information, facts)
 	receiverExpression, explicitArguments := callReceiverAndArguments(call, information)
 	for _, function := range functions {
-		if function.Pkg() == nil || checkedPackage == nil || function.Pkg() != checkedPackage {
-			continue
+		if function.Pkg() != nil && checkedPackage != nil && function.Pkg() == checkedPackage {
+			if receiver := facts.functionReceivers[function]; receiver != nil && receiverExpression != nil {
+				changed = propagateReceiver(receiver, receiverExpression, information, facts) || changed
+			}
+			changed = propagateParameters(facts.functionParameters[function], explicitArguments, information, facts) || changed
 		}
-		if receiver := facts.functionReceivers[function]; receiver != nil && receiverExpression != nil {
-			changed = propagateReceiver(receiver, receiverExpression, information, facts) || changed
+
+		for _, invocation := range facts.callbackInvocations[function] {
+			if invocation.callbackParameter < 0 || invocation.callbackParameter >= len(explicitArguments) {
+				continue
+			}
+			callback := explicitArguments[invocation.callbackParameter]
+			for _, literal := range expressionFunctionLiterals(callback, information, facts) {
+				parameters := facts.literalParameters[literal]
+				for callbackArgument, sourceParameter := range invocation.argumentParameters {
+					if callbackArgument >= len(parameters) || sourceParameter < 0 || sourceParameter >= len(explicitArguments) {
+						continue
+					}
+					changed = propagateParameters(
+						[]types.Object{parameters[callbackArgument]},
+						[]ast.Expr{explicitArguments[sourceParameter]},
+						information,
+						facts,
+					) || changed
+				}
+			}
+			if expressionIsFormatter(callback, information, facts) {
+				for _, sourceParameter := range invocation.argumentParameters {
+					if sourceParameter >= 0 && sourceParameter < len(explicitArguments) && expressionContainsSecret(explicitArguments[sourceParameter], information, facts) {
+						changed = markObject(function, facts.formatterObjects) || changed
+					}
+				}
+			}
 		}
-		changed = propagateParameters(facts.functionParameters[function], explicitArguments, information, facts) || changed
+		if receiverExpression != nil {
+			for _, sourceParameter := range facts.receiverMutations[function] {
+				if sourceParameter >= 0 && sourceParameter < len(explicitArguments) && expressionContainsSecret(explicitArguments[sourceParameter], information, facts) {
+					changed = markFlowTarget(receiverExpression, information, facts.secretObjects, facts.aliases) || changed
+				}
+			}
+		}
 	}
 
 	if len(functions) == 1 && checkedPackage != nil && functions[0].Pkg() == checkedPackage && facts.functionParameters[functions[0]] == nil {
@@ -1352,6 +1525,11 @@ func expressionIsFormatter(expression ast.Expr, information *types.Info, facts *
 			return true
 		}
 	}
+	for _, literal := range expressionFunctionLiterals(expression, information, facts) {
+		if facts.formatterLiterals[literal] {
+			return true
+		}
+	}
 	switch value := expression.(type) {
 	case *ast.ParenExpr:
 		return expressionIsFormatter(value.X, information, facts)
@@ -1533,6 +1711,27 @@ func collectExpressionFunctionLiterals(expression ast.Expr, information *types.I
 		for _, element := range value.Elts {
 			collectExpressionFunctionLiterals(element, information, facts, found)
 		}
+		return
+	case *ast.IndexExpr:
+		collectExpressionFunctionLiterals(value.X, information, facts, found)
+		return
+	case *ast.IndexListExpr:
+		collectExpressionFunctionLiterals(value.X, information, facts, found)
+		return
+	case *ast.SelectorExpr:
+		collectExpressionFunctionLiterals(value.X, information, facts, found)
+		return
+	case *ast.SliceExpr:
+		collectExpressionFunctionLiterals(value.X, information, facts, found)
+		return
+	case *ast.StarExpr:
+		collectExpressionFunctionLiterals(value.X, information, facts, found)
+		return
+	case *ast.UnaryExpr:
+		collectExpressionFunctionLiterals(value.X, information, facts, found)
+		return
+	case *ast.TypeAssertExpr:
+		collectExpressionFunctionLiterals(value.X, information, facts, found)
 		return
 	case *ast.CallExpr:
 		for _, function := range calledFunctionCandidates(value.Fun, information, facts) {

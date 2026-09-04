@@ -445,7 +445,7 @@ func expose(value *secret.Value) {
 	printer(value)
 }
 `,
-			want:    1,
+			want:    2,
 			message: "secret.Value must not be passed to fmt or log",
 		},
 		{
@@ -681,7 +681,7 @@ import (
 func invoke(printer func(any), value any) { printer(value) }
 func expose(value *secret.Value) { invoke(func(argument any) { fmt.Print(argument) }, value.Reveal()) }
 `,
-			want:    1,
+			want:    2,
 			message: "secret.Value must not be passed to fmt or log",
 		},
 		{
@@ -696,7 +696,21 @@ func expose(value *secret.Value) {
 	printers[0](value.Reveal())
 }
 `,
-			want:    1,
+			want:    2,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "unassigned composite-held function literal",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) {
+	[]func(any){func(argument any) { fmt.Print(argument) }}[0](value.Reveal())
+}
+`,
+			want:    2,
 			message: "secret.Value must not be passed to fmt or log",
 		},
 		{
@@ -1121,6 +1135,66 @@ func safe() { provider.Print("[redacted]") }
 `,
 		},
 		{
+			name: "callback wrapper propagates revealed secret",
+			provider: `package provider
+func Invoke(callback func(any), value any) { callback(value) }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func expose(value *secret.Value) {
+	provider.Invoke(func(argument any) { fmt.Print(argument) }, value.Reveal())
+}
+`,
+			want: 2,
+		},
+		{
+			name: "callback wrapper accepts safe value",
+			provider: `package provider
+func Invoke(callback func(any), value any) { callback(value) }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func safe() { provider.Invoke(func(argument any) { fmt.Print(argument) }, "[redacted]") }
+`,
+		},
+		{
+			name: "method mutation propagates into receiver",
+			provider: `package provider
+type Box struct { Value any }
+func (box *Box) Put(value any) { box.Value = value }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func expose(value *secret.Value) { var box provider.Box; box.Put(value.Reveal()); fmt.Print(box) }
+`,
+			want: 1,
+		},
+		{
+			name: "method mutation accepts safe value",
+			provider: `package provider
+type Box struct { Value any }
+func (box *Box) Put(value any) { box.Value = value }
+`,
+			consumer: `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func safe() { var box provider.Box; box.Put("[redacted]"); fmt.Print(box) }
+`,
+		},
+		{
 			name: "exported formatting closure rejects revealed secret",
 			provider: `package provider
 import "fmt"
@@ -1410,6 +1484,44 @@ func TestScanEnforcesVerifierBoundaryThroughObservationContract(t *testing.T) {
 				t.Fatalf("finding path = %q, want observation contract", findings[0].filename)
 			}
 		})
+	}
+}
+
+func TestScanChecksUniversalRulesInInactiveDarwinSources(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	files := map[string]string{
+		"internal/example/launch_darwin.go": `//go:build !darwin
+
+package example
+
+import _ "os/exec"
+`,
+		"internal/observation/network_darwin.go": `//go:build !darwin
+
+package observation
+
+import _ "net/http"
+`,
+	}
+	writeScanFixtureFiles(t, root, files)
+
+	findings, err := scan(root)
+	if err != nil {
+		t.Fatalf("scan inactive Darwin sources: %v", err)
+	}
+	if len(findings) != len(files) {
+		t.Fatalf("got %d findings (%v), want %d universal-rule findings", len(findings), findings, len(files))
+	}
+	foundByPath := make(map[string]bool, len(findings))
+	for _, finding := range findings {
+		foundByPath[filepath.ToSlash(finding.filename)] = true
+	}
+	for name := range files {
+		if !foundByPath[filepath.ToSlash(filepath.Join(root, name))] {
+			t.Errorf("missing universal-rule finding for %s", name)
+		}
 	}
 }
 

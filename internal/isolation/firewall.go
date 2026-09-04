@@ -63,10 +63,13 @@ type FirewallRule struct {
 // prevent a reused run ID from adopting an earlier run's exposure while still
 // allowing later steps and retries of that same operation to use the rule.
 //
-// A future provider adapter writes the canonical run, plan, operation, record
-// identity, generation, expiry, revocation workflow, and resulting fingerprint
-// into the IAP firewall description. WF-TEST-01 teardown and its nightly cleanup
-// path consume that metadata and remove the rule no later than ExpiresAt.
+// A future provider adapter must persist the canonical run, plan, operation,
+// record identity, generation, expiry, revocation workflow, and exact resulting
+// fingerprint in both run-scoped firewall rule descriptions, then parse and
+// observe that fingerprint when rediscovering either rule. The WF-TEST-01
+// teardown and nightly-cleanup adapter consumes the metadata and removes each
+// rule no later than ExpiresAt. This pure package performs no provider or
+// durable-record I/O.
 type RunLifetimeContract struct {
 	RunID                string
 	Plan                 PlanIdentity
@@ -93,8 +96,9 @@ type FirewallValidationContext struct {
 }
 
 // RunLifetimeContractFingerprint returns the canonical identity a future
-// adapter persists in the IAP rule description. Time and policy bounds are
-// evaluated separately at each independent mutation boundary.
+// adapter persists in, and parses back from, both run-scoped rule descriptions.
+// Time and policy bounds are evaluated separately at each independent mutation
+// boundary; this function performs no provider or durable-record I/O.
 func RunLifetimeContractFingerprint(contract RunLifetimeContract) (string, error) {
 	if err := ValidateRunID(contract.RunID); err != nil {
 		return "", err

@@ -324,6 +324,46 @@ func TestStandaloneFirewallValidationBindsLifetimeCreationToObservation(t *testi
 	}
 }
 
+func TestStandaloneFirewallValidationRequiresRemainingMutationWindow(t *testing.T) {
+	t.Parallel()
+
+	valid := validFirewallValidationContext("run1")
+	valid.Now = valid.RunLifetime.ExpiresAt.Add(-valid.FirewallMutationWindow)
+	if err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{"10.80.0.0/16"}, valid); err != nil {
+		t.Fatalf("ValidateFirewallRule(exact remaining window) unexpected error: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*isolation.FirewallValidationContext)
+		kind   error
+	}{
+		{name: "one nanosecond short", mutate: func(value *isolation.FirewallValidationContext) {
+			value.Now = value.RunLifetime.ExpiresAt.Add(-value.FirewallMutationWindow).Add(time.Nanosecond)
+		}, kind: isolation.ErrStaleProof},
+		{name: "zero window", mutate: func(value *isolation.FirewallValidationContext) {
+			value.FirewallMutationWindow = 0
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "over planned lifetime", mutate: func(value *isolation.FirewallValidationContext) {
+			value.FirewallMutationWindow = value.PlannedLifetime + time.Nanosecond
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "over policy maximum", mutate: func(value *isolation.FirewallValidationContext) {
+			value.PlannedLifetime = value.RunLimits.MaxLifetime + time.Hour
+			value.FirewallMutationWindow = value.RunLimits.MaxLifetime + time.Nanosecond
+		}, kind: isolation.ErrInvalidGuardInput},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			context := validFirewallValidationContext("run1")
+			test.mutate(&context)
+			if err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{"10.80.0.0/16"}, context); !errors.Is(err, test.kind) {
+				t.Fatalf("ValidateFirewallRule() error = %v; want %v", err, test.kind)
+			}
+		})
+	}
+}
+
 func TestRunLifetimeContractFingerprintRejectsIncompleteMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -458,7 +498,7 @@ func validFirewallValidationContext(runID string) isolation.FirewallValidationCo
 		Operation: isolation.OperationBinding{
 			OperationID: contract.OperationID, StepID: "create-test-resources", Attempt: 1,
 		},
-		PlannedLifetime: time.Hour, RunLimits: defaultLimits(),
+		PlannedLifetime: time.Hour, RunLimits: defaultLimits(), FirewallMutationWindow: time.Minute,
 		RunLifetime: contract, ObservedAt: contract.CreatedAt, Now: authorizationNow(),
 	}
 }

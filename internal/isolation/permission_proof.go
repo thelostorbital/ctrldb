@@ -23,6 +23,8 @@ var (
 	permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
 )
 
+const computeFirewallCreatePermission = "compute.firewalls.create"
+
 // PermissionObservation is one exact testIamPermissions-style observation.
 // Expected and observed slices use the same tuple shape so callers, rather
 // than this package, remain authoritative for the permission inventory.
@@ -113,6 +115,57 @@ func ValidatePermissionProof(pin PolicyInventoryPin, input PermissionProofInput,
 	}
 	if len(seen) != len(expectedByKey) {
 		return guardError(ErrPermissionProof, "observed", "is missing an expected tuple")
+	}
+	return nil
+}
+
+// ProjectAuthorizationResource returns the exact Cloud Resource Manager
+// project identity against which testIamPermissions evidence must be observed.
+func ProjectAuthorizationResource(projectID string) (ResourceIdentity, error) {
+	if !projectIDPattern.MatchString(projectID) {
+		return ResourceIdentity{}, guardError(ErrInvalidGuardInput, "projectID", "must be a canonical explicit project ID")
+	}
+	identity := ResourceIdentity{
+		Project: projectID, Service: CloudResourceManagerServiceName,
+		Kind: CloudResourceManagerProjectKind, Scope: ResourceScopeGlobal,
+		Location: "global", Name: projectID,
+	}
+	key, err := CanonicalTargetKey(identity)
+	if err != nil {
+		return ResourceIdentity{}, err
+	}
+	identity.CanonicalKey = key
+	return identity, nil
+}
+
+func validateEmittedIntentPermissions(projectID string, proof PermissionProofInput, principal Principal, intents []MutationIntent) error {
+	requiresFirewallCreate := false
+	for _, intent := range intents {
+		if intent.Action == MutationActionComputeFirewallInsert {
+			requiresFirewallCreate = true
+		}
+	}
+	if !requiresFirewallCreate {
+		return nil
+	}
+	resource, err := ProjectAuthorizationResource(projectID)
+	if err != nil {
+		return err
+	}
+	required := permissionObservationKey{
+		identityKind: principal.Kind, identitySubject: principal.Subject,
+		resource: resource.CanonicalKey, permission: computeFirewallCreatePermission,
+	}
+	hasGranted := func(values []PermissionObservation) bool {
+		for _, observation := range values {
+			if newPermissionObservationKey(observation) == required && observation.Resource == resource && observation.Granted {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasGranted(proof.Expected) || !hasGranted(proof.Observed) {
+		return guardError(ErrPermissionProof, "permissions", "does not grant the exact emitted firewall-create action on the configured project")
 	}
 	return nil
 }

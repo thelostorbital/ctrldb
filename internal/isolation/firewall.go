@@ -147,14 +147,15 @@ type RunLifetimeContract struct {
 // trusted policy, the immutable plan, the durable operation, and their own
 // boundary clock; it is not serialized into each firewall rule.
 type FirewallValidationContext struct {
-	RunID           string
-	Plan            PlanIdentity
-	Operation       OperationBinding
-	PlannedLifetime time.Duration
-	RunLimits       RunLimits
-	RunLifetime     RunLifetimeContract
-	ObservedAt      time.Time
-	Now             time.Time
+	RunID                  string
+	Plan                   PlanIdentity
+	Operation              OperationBinding
+	PlannedLifetime        time.Duration
+	RunLimits              RunLimits
+	RunLifetime            RunLifetimeContract
+	FirewallMutationWindow time.Duration
+	ObservedAt             time.Time
+	Now                    time.Time
 }
 
 // RunLifetimeContractFingerprint returns the canonical identity a future
@@ -205,6 +206,7 @@ func validateRunLifetimeContract(
 	operation OperationBinding,
 	plannedLifetime time.Duration,
 	limits RunLimits,
+	mutationWindow time.Duration,
 	observedAt time.Time,
 	now time.Time,
 ) (string, error) {
@@ -239,11 +241,17 @@ func validateRunLifetimeContract(
 	if plannedLifetime <= 0 || limits.MaxLifetime <= 0 {
 		return "", guardError(ErrInvalidGuardInput, "runLifetime", "requires positive trusted lifetime bounds")
 	}
+	if mutationWindow <= 0 || mutationWindow > plannedLifetime || mutationWindow > limits.MaxLifetime {
+		return "", guardError(ErrInvalidGuardInput, "firewallMutationWindow", "must be positive and within planned and configured lifetimes")
+	}
 	if contract.CreatedAt.After(now) {
 		return "", guardError(ErrStaleProof, "runLifetime.createdAt", "must not be after the mutation-boundary time")
 	}
 	if !now.Before(contract.ExpiresAt) {
 		return "", guardError(ErrStaleProof, "runLifetime.expiresAt", "must be strictly after the mutation-boundary time")
+	}
+	if contract.ExpiresAt.Sub(now) < mutationWindow {
+		return "", guardError(ErrStaleProof, "runLifetime.expiresAt", "does not leave the approved firewall mutation and verification window")
 	}
 	duration := contract.ExpiresAt.Sub(contract.CreatedAt)
 	if duration <= 0 {
@@ -267,6 +275,7 @@ func ValidateFirewallRules(rules []FirewallRule, observations []FirewallObservat
 		context.Operation,
 		context.PlannedLifetime,
 		context.RunLimits,
+		context.FirewallMutationWindow,
 		context.ObservedAt,
 		context.Now,
 	)
@@ -371,6 +380,7 @@ func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string, context F
 		context.Operation,
 		context.PlannedLifetime,
 		context.RunLimits,
+		context.FirewallMutationWindow,
 		context.ObservedAt,
 		context.Now,
 	)

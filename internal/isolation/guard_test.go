@@ -135,7 +135,7 @@ func TestValidateCleanupTargetsRequiresPrefixAndAllLabels(t *testing.T) {
 	t.Parallel()
 
 	valid := testTarget("ctrldb-test-run1-vm", "run1")
-	if err := isolation.ValidateCleanupTargets([]isolation.MutationTarget{valid}); err != nil {
+	if err := isolation.ValidateCleanupTargets(validCleanupPolicy(), []isolation.MutationTarget{valid}); err != nil {
 		t.Fatalf("ValidateCleanupTargets() unexpected error: %v", err)
 	}
 
@@ -158,11 +158,19 @@ func TestValidateCleanupTargetsRequiresPrefixAndAllLabels(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := isolation.ValidateCleanupTargets([]isolation.MutationTarget{test.resource})
+			err := isolation.ValidateCleanupTargets(validCleanupPolicy(), []isolation.MutationTarget{test.resource})
 			if !errors.Is(err, isolation.ErrUnsafeTarget) {
 				t.Fatalf("ValidateCleanupTargets() error = %v; want ErrUnsafeTarget", err)
 			}
 		})
+	}
+	if err := isolation.ValidateCleanupTargets(isolation.CleanupPolicy{}, []isolation.MutationTarget{valid}); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateCleanupTargets(missing project policy) error = %v; want ErrInvalidGuardInput", err)
+	}
+	crossProject := valid
+	moveResourceProject(&crossProject.Identity, "another-test-project")
+	if err := isolation.ValidateCleanupTargets(validCleanupPolicy(), []isolation.MutationTarget{crossProject}); !errors.Is(err, isolation.ErrUnsafeTarget) {
+		t.Fatalf("ValidateCleanupTargets(cross-project target) error = %v; want ErrUnsafeTarget", err)
 	}
 }
 
@@ -367,7 +375,7 @@ func TestSelectExpiredTargetsFailsClosedAndReturnsDetachedSortedResults(t *testi
 		{Target: testTarget("ctrldb-test-run1-young", "run1"), CreatedAt: now.Add(-time.Hour)},
 		{Target: testTarget("ctrldb-test-run1-a", "run1"), CreatedAt: now.Add(-6 * time.Hour)},
 	}
-	selected, err := isolation.SelectExpiredTargets(candidates, now, 6*time.Hour)
+	selected, err := isolation.SelectExpiredTargets(validCleanupPolicy(), candidates, now, 6*time.Hour)
 	if err != nil {
 		t.Fatalf("SelectExpiredTargets() unexpected error: %v", err)
 	}
@@ -390,8 +398,13 @@ func TestSelectExpiredTargetsFailsClosedAndReturnsDetachedSortedResults(t *testi
 		}(),
 		CreatedAt: now.Add(-time.Minute),
 	}}
-	if _, err := isolation.SelectExpiredTargets(unsafeYoung, now, 6*time.Hour); !errors.Is(err, isolation.ErrUnsafeTarget) {
+	if _, err := isolation.SelectExpiredTargets(validCleanupPolicy(), unsafeYoung, now, 6*time.Hour); !errors.Is(err, isolation.ErrUnsafeTarget) {
 		t.Fatalf("SelectExpiredTargets(unsafe young target) error = %v; want ErrUnsafeTarget", err)
+	}
+	mixedProjects := append([]isolation.ExpirableTarget(nil), candidates...)
+	moveResourceProject(&mixedProjects[1].Target.Identity, "another-test-project")
+	if _, err := isolation.SelectExpiredTargets(validCleanupPolicy(), mixedProjects, now, 6*time.Hour); !errors.Is(err, isolation.ErrUnsafeTarget) {
+		t.Fatalf("SelectExpiredTargets(cross-project young target) error = %v; want ErrUnsafeTarget", err)
 	}
 }
 
@@ -400,14 +413,14 @@ func TestSelectExpiredTargetsRejectsInvalidTimeBoundaries(t *testing.T) {
 
 	now := time.Date(2026, 9, 3, 8, 0, 0, 0, time.UTC)
 	valid := []isolation.ExpirableTarget{{Target: testTarget("ctrldb-test-run1-vm", "run1"), CreatedAt: now.Add(-time.Hour)}}
-	if _, err := isolation.SelectExpiredTargets(valid, time.Time{}, time.Hour); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if _, err := isolation.SelectExpiredTargets(validCleanupPolicy(), valid, time.Time{}, time.Hour); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("SelectExpiredTargets(zero now) error = %v; want ErrInvalidGuardInput", err)
 	}
-	if _, err := isolation.SelectExpiredTargets(valid, now, 0); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if _, err := isolation.SelectExpiredTargets(validCleanupPolicy(), valid, now, 0); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("SelectExpiredTargets(zero lifetime) error = %v; want ErrInvalidGuardInput", err)
 	}
 	future := []isolation.ExpirableTarget{{Target: testTarget("ctrldb-test-run1-vm", "run1"), CreatedAt: now.Add(time.Second)}}
-	if _, err := isolation.SelectExpiredTargets(future, now, time.Hour); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if _, err := isolation.SelectExpiredTargets(validCleanupPolicy(), future, now, time.Hour); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("SelectExpiredTargets(future target) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
@@ -769,6 +782,90 @@ func TestPreMutationFirewallRetryEmitsOnlyAbsentRulesAndReportsConvergence(t *te
 	}
 	if boundary.Disposition() != isolation.MutationDispositionConverged || len(boundary.Intents()) != 0 {
 		t.Fatal("fully present retry did not return an explicit no-mutation converged boundary")
+	}
+}
+
+func TestPreMutationRequiresExactPermissionForEachEmittedFirewallInsert(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*isolation.PreMutationInput)
+	}{
+		{name: "missing", mutate: func(input *isolation.PreMutationInput) {
+			input.Permissions.Expected = withoutFirewallCreatePermission(input.Permissions.Expected)
+			input.Permissions.Observed = withoutFirewallCreatePermission(input.Permissions.Observed)
+		}},
+		{name: "denied", mutate: func(input *isolation.PreMutationInput) {
+			mutateFirewallCreatePermission(input, func(value *isolation.PermissionObservation) { value.Granted = false })
+		}},
+		{name: "wrong principal", mutate: func(input *isolation.PreMutationInput) {
+			mutateFirewallCreatePermission(input, func(value *isolation.PermissionObservation) {
+				value.Identity = destructivePrincipal()
+			})
+		}},
+		{name: "wrong project", mutate: func(input *isolation.PreMutationInput) {
+			resource, _ := isolation.ProjectAuthorizationResource("another-test-project")
+			mutateFirewallCreatePermission(input, func(value *isolation.PermissionObservation) { value.Resource = resource })
+		}},
+		{name: "wrong resource", mutate: func(input *isolation.PreMutationInput) {
+			mutateFirewallCreatePermission(input, func(value *isolation.PermissionObservation) {
+				value.Resource = permissionResource("ctrldb-test-run1-vm")
+			})
+		}},
+		{name: "get lookalike", mutate: func(input *isolation.PreMutationInput) {
+			mutateFirewallCreatePermission(input, func(value *isolation.PermissionObservation) { value.Permission = "compute.firewalls.get" })
+		}},
+		{name: "update lookalike", mutate: func(input *isolation.PreMutationInput) {
+			mutateFirewallCreatePermission(input, func(value *isolation.PermissionObservation) { value.Permission = "compute.firewalls.update" })
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			input := validPreMutationInput()
+			test.mutate(&input)
+			policy := validPreMutationPolicy()
+			refreshPermissionInventory(&policy, input.Permissions.Expected)
+			if _, err := isolation.AuthorizePreMutation(policy, input, authorizationNow()); err == nil {
+				t.Fatal("AuthorizePreMutation() accepted insufficient firewall-create permission evidence")
+			}
+		})
+	}
+
+	partial := validPreMutationInput()
+	present := cloneFirewallRule(partial.FirewallRules[0])
+	partial.FirewallObservations[0] = isolation.FirewallObservation{
+		Identity: partial.FirewallRules[0].Identity, State: isolation.FirewallObservationPresent, PresentRule: &present,
+	}
+	partial.Targets = partial.Targets[1:]
+	partial.MutationIntents = validMutationIntents(partial)
+	partial.Permissions.Expected = withoutFirewallCreatePermission(partial.Permissions.Expected)
+	partial.Permissions.Observed = withoutFirewallCreatePermission(partial.Permissions.Observed)
+	partialPolicy := validPreMutationPolicy()
+	refreshPermissionInventory(&partialPolicy, partial.Permissions.Expected)
+	if _, err := isolation.AuthorizePreMutation(partialPolicy, partial, authorizationNow()); !errors.Is(err, isolation.ErrPermissionProof) {
+		t.Fatalf("AuthorizePreMutation(partial retry without create grant) error = %v; want ErrPermissionProof", err)
+	}
+
+	converged := validPreMutationInput()
+	converged.FirewallObservations = presentFirewallObservations(converged.FirewallRules)
+	converged.Targets = nil
+	converged.MutationIntents = nil
+	converged.Permissions.Expected = withoutFirewallCreatePermission(converged.Permissions.Expected)
+	converged.Permissions.Observed = withoutFirewallCreatePermission(converged.Permissions.Observed)
+	convergedPolicy := validPreMutationPolicy()
+	refreshPermissionInventory(&convergedPolicy, converged.Permissions.Expected)
+	decision, err := isolation.AuthorizePreMutation(convergedPolicy, converged, authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation(converged without create grant) unexpected error: %v", err)
+	}
+	fresh := converged
+	fresh.Freshness.ObservedAt = fresh.Freshness.ObservedAt.Add(45 * time.Second)
+	boundary, err := isolation.RevalidatePreMutation(decision, convergedPolicy, fresh, revalidationNow())
+	if err != nil || boundary.Disposition() != isolation.MutationDispositionConverged {
+		t.Fatalf("RevalidatePreMutation(converged without create grant) = (%v, %v); want converged success", boundary.Disposition(), err)
 	}
 }
 
@@ -1433,11 +1530,11 @@ func TestRunLifetimeAllowsExactConfiguredBoundaryAndCannotChangeAtRevalidation(t
 	if err != nil {
 		t.Fatalf("AuthorizePreMutation(exact lifetime boundary) unexpected error: %v", err)
 	}
-	earliest := validPreMutationInput()
-	earliest.RunLifetime.ExpiresAt = authorizationNow().Add(time.Nanosecond)
-	refreshRunLifetimeFingerprint(&earliest)
-	if _, err := isolation.AuthorizePreMutation(policy, earliest, authorizationNow()); err != nil {
-		t.Fatalf("AuthorizePreMutation(strictly-positive lifetime boundary) unexpected error: %v", err)
+	exactWindow := validPreMutationInput()
+	exactWindow.RunLifetime.ExpiresAt = authorizationNow().Add(policy.FirewallMutationWindow)
+	refreshRunLifetimeFingerprint(&exactWindow)
+	if _, err := isolation.AuthorizePreMutation(policy, exactWindow, authorizationNow()); err != nil {
+		t.Fatalf("AuthorizePreMutation(exact remaining mutation window) unexpected error: %v", err)
 	}
 	laterStep := validPreMutationInput()
 	laterStep.Operation.StepID = "create-test-vm"
@@ -1474,6 +1571,56 @@ func TestRunLifetimeAllowsExactConfiguredBoundaryAndCannotChangeAtRevalidation(t
 	refreshRunLifetimeFingerprint(&createdAfterObservation)
 	if _, err := isolation.RevalidatePreMutation(decision, policy, createdAfterObservation, revalidationNow()); !errors.Is(err, isolation.ErrStaleProof) {
 		t.Fatalf("RevalidatePreMutation(lifetime created after fresh observation) error = %v; want ErrStaleProof", err)
+	}
+}
+
+func TestPreMutationRequiresTrustedRemainingFirewallWindow(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*isolation.PreMutationPolicy, *isolation.PreMutationInput)
+		kind   error
+	}{
+		{name: "zero policy window", mutate: func(policy *isolation.PreMutationPolicy, _ *isolation.PreMutationInput) {
+			policy.FirewallMutationWindow = 0
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "over planned lifetime", mutate: func(policy *isolation.PreMutationPolicy, input *isolation.PreMutationInput) {
+			policy.FirewallMutationWindow = input.Capacity.Lifetime + time.Nanosecond
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "over policy maximum", mutate: func(policy *isolation.PreMutationPolicy, _ *isolation.PreMutationInput) {
+			policy.FirewallMutationWindow = policy.RunLimits.MaxLifetime + time.Nanosecond
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "one nanosecond short", mutate: func(policy *isolation.PreMutationPolicy, input *isolation.PreMutationInput) {
+			input.RunLifetime.ExpiresAt = authorizationNow().Add(policy.FirewallMutationWindow - time.Nanosecond)
+			refreshRunLifetimeFingerprint(input)
+		}, kind: isolation.ErrStaleProof},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			policy := validPreMutationPolicy()
+			input := validPreMutationInput()
+			test.mutate(&policy, &input)
+			if _, err := isolation.AuthorizePreMutation(policy, input, authorizationNow()); !errors.Is(err, test.kind) {
+				t.Fatalf("AuthorizePreMutation() error = %v; want %v", err, test.kind)
+			}
+		})
+	}
+
+	policy := validPreMutationPolicy()
+	input := validPreMutationInput()
+	input.RunLifetime.ExpiresAt = authorizationNow().Add(90 * time.Second)
+	refreshRunLifetimeFingerprint(&input)
+	decision, err := isolation.AuthorizePreMutation(policy, input, authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	fresh := input
+	fresh.Freshness.ObservedAt = input.Freshness.ObservedAt.Add(45 * time.Second)
+	nearExpiry := input.RunLifetime.ExpiresAt.Add(-policy.FirewallMutationWindow).Add(time.Nanosecond)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, fresh, nearExpiry); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(remaining window elapsed) error = %v; want ErrStaleProof", err)
 	}
 }
 
@@ -1518,6 +1665,11 @@ func TestPreMutationDecisionRejectsStaleSwappedAndExpiredEvidence(t *testing.T) 
 	if _, err := isolation.RevalidatePreMutation(decision, limitsSwap, freshPreMutationInput(), revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(limit swap) error = %v; want ErrProofMismatch", err)
 	}
+	windowSwap := policy
+	windowSwap.FirewallMutationWindow += time.Second
+	if _, err := isolation.RevalidatePreMutation(decision, windowSwap, freshPreMutationInput(), revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(mutation-window swap) error = %v; want ErrProofMismatch", err)
+	}
 	cidrSwap := policy
 	cidrSwap.TestCIDR = "10.30.0.0/24"
 	freshCIDR := freshPreMutationInput()
@@ -1533,7 +1685,7 @@ func TestGuardErrorsDoNotRenderDiscoveredValues(t *testing.T) {
 	const marker = "sensitive-resource-name"
 	resource := testTarget("ctrldb-"+marker, "run1")
 	resource.Labels[config.LabelEnvironment] = "production"
-	err := isolation.ValidateCleanupTargets([]isolation.MutationTarget{resource})
+	err := isolation.ValidateCleanupTargets(validCleanupPolicy(), []isolation.MutationTarget{resource})
 	if !errors.Is(err, isolation.ErrUnsafeTarget) {
 		t.Fatalf("ValidateCleanupTargets() error = %v; want ErrUnsafeTarget", err)
 	}
@@ -1619,6 +1771,7 @@ func validPreMutationPolicy() isolation.PreMutationPolicy {
 		ProjectID:                "example-test-project",
 		RunLimits:                defaultLimits(),
 		TestCIDR:                 input.TestCIDR,
+		FirewallMutationWindow:   time.Minute,
 		TestOperatorPrincipal:    operatorPrincipal(),
 		TestDestructivePrincipal: destructivePrincipal(),
 		PermissionInventory:      isolation.PolicyInventoryPin{ID: "permission-inventory", Version: "v1", Fingerprint: permissions},
@@ -1627,6 +1780,10 @@ func validPreMutationPolicy() isolation.PreMutationPolicy {
 		},
 		ProductionCIDRInventory: isolation.PolicyInventoryPin{ID: "production-cidr-inventory", Version: "v1", Fingerprint: cidrs},
 	}
+}
+
+func validCleanupPolicy() isolation.CleanupPolicy {
+	return isolation.CleanupPolicy{ProjectID: "example-test-project"}
 }
 
 func refreshCapacityFingerprint(capacity *isolation.CapacityProofInput) {
@@ -1643,6 +1800,29 @@ func refreshPermissionInventory(policy *isolation.PreMutationPolicy, expected []
 		panic(err)
 	}
 	policy.PermissionInventory.Fingerprint = fingerprint
+}
+
+func withoutFirewallCreatePermission(values []isolation.PermissionObservation) []isolation.PermissionObservation {
+	filtered := make([]isolation.PermissionObservation, 0, len(values))
+	for _, value := range values {
+		if value.Permission != "compute.firewalls.create" {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
+}
+
+func mutateFirewallCreatePermission(input *isolation.PreMutationInput, mutate func(*isolation.PermissionObservation)) {
+	for index := range input.Permissions.Expected {
+		if input.Permissions.Expected[index].Permission == "compute.firewalls.create" {
+			mutate(&input.Permissions.Expected[index])
+		}
+	}
+	for index := range input.Permissions.Observed {
+		if input.Permissions.Observed[index].Permission == "compute.firewalls.create" {
+			mutate(&input.Permissions.Observed[index])
+		}
+	}
 }
 
 func refreshRunLifetimeFingerprint(input *isolation.PreMutationInput) {
@@ -1710,6 +1890,9 @@ func cloneFirewallRulesForTest(rules []isolation.FirewallRule) []isolation.Firew
 
 func moveResourceProject(identity *isolation.ResourceIdentity, project string) {
 	identity.Project = project
+	if identity.Service == isolation.CloudResourceManagerServiceName && identity.Kind == isolation.CloudResourceManagerProjectKind {
+		identity.Name = project
+	}
 	identity.CanonicalKey = mustCanonicalTargetKey(*identity)
 }
 

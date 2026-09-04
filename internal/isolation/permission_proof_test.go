@@ -243,9 +243,14 @@ func TestPermissionProofRequiresNamedVersionedCompleteInventory(t *testing.T) {
 }
 
 func validPermissionExpectations() []isolation.PermissionObservation {
+	project, err := isolation.ProjectAuthorizationResource("example-test-project")
+	if err != nil {
+		panic(err)
+	}
 	return []isolation.PermissionObservation{
 		{Identity: operatorPrincipal(), Resource: permissionResource("ctrldb-test-run1-vm"), Permission: "compute.instances.get", Granted: true},
 		{Identity: operatorPrincipal(), Resource: permissionResource("production-instance"), Permission: "compute.instances.update", Granted: false},
+		{Identity: operatorPrincipal(), Resource: project, Permission: "compute.firewalls.create", Granted: true},
 	}
 }
 

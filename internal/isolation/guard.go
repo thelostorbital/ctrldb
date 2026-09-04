@@ -198,14 +198,16 @@ type ProviderService string
 type ResourceKind string
 
 const (
-	ResourceScopeGlobal ResourceScope   = "global"
-	ResourceScopeRegion ResourceScope   = "region"
-	ResourceScopeZone   ResourceScope   = "zone"
-	ComputeServiceName  ProviderService = "compute.googleapis.com"
-	ComputeInstanceKind ResourceKind    = "instances"
-	ComputeDiskKind     ResourceKind    = "disks"
-	ComputeFirewallKind ResourceKind    = "firewalls"
-	ComputeNetworkKind  ResourceKind    = "networks"
+	ResourceScopeGlobal             ResourceScope   = "global"
+	ResourceScopeRegion             ResourceScope   = "region"
+	ResourceScopeZone               ResourceScope   = "zone"
+	ComputeServiceName              ProviderService = "compute.googleapis.com"
+	ComputeInstanceKind             ResourceKind    = "instances"
+	ComputeDiskKind                 ResourceKind    = "disks"
+	ComputeFirewallKind             ResourceKind    = "firewalls"
+	ComputeNetworkKind              ResourceKind    = "networks"
+	CloudResourceManagerServiceName ProviderService = "cloudresourcemanager.googleapis.com"
+	CloudResourceManagerProjectKind ResourceKind    = "projects"
 )
 
 // ResourceIdentity is the complete explicit identity a future provider adapter
@@ -301,15 +303,26 @@ func SelectRunMutationTargets(runID string, resources []MutationTarget) ([]Mutat
 	return selected, nil
 }
 
+// CleanupPolicy is the trusted boundary for global-prefix teardown discovery.
+type CleanupPolicy struct {
+	ProjectID string
+}
+
 // ValidateCleanupTargets validates the global-prefix selector reserved for
 // teardown and nightly cleanup. Run mutations must use
 // SelectRunMutationTargets instead.
-func ValidateCleanupTargets(resources []MutationTarget) error {
+func ValidateCleanupTargets(policy CleanupPolicy, resources []MutationTarget) error {
+	if !projectIDPattern.MatchString(policy.ProjectID) {
+		return guardError(ErrInvalidGuardInput, "cleanupPolicy.projectID", "must be a canonical explicit project ID")
+	}
 	seen := make(map[string]struct{}, len(resources))
 	for index, resource := range resources {
 		path := indexedField("targets", index)
 		if err := validateMutationTarget(resource); err != nil {
 			return guardError(err, path, "has invalid full identity")
+		}
+		if resource.Identity.Project != policy.ProjectID {
+			return guardError(ErrUnsafeTarget, path, "does not belong to the configured cleanup project")
 		}
 		if !config.IsTestResource(config.GeneratedResource{Name: resource.Identity.Name, Labels: resource.Labels}) {
 			return guardError(ErrUnsafeTarget, path, "does not have exact disposable identity")
@@ -331,7 +344,7 @@ type ExpirableTarget struct {
 // SelectExpiredTargets returns a detached, name-sorted set whose age has
 // reached maxLifetime. Any ambiguous candidate makes the entire selection
 // fail; it is never silently skipped.
-func SelectExpiredTargets(candidates []ExpirableTarget, now time.Time, maxLifetime time.Duration) ([]ExpirableTarget, error) {
+func SelectExpiredTargets(policy CleanupPolicy, candidates []ExpirableTarget, now time.Time, maxLifetime time.Duration) ([]ExpirableTarget, error) {
 	if now.IsZero() {
 		return nil, guardError(ErrInvalidGuardInput, "now", "must not be zero")
 	}
@@ -343,7 +356,7 @@ func SelectExpiredTargets(candidates []ExpirableTarget, now time.Time, maxLifeti
 	for index, candidate := range candidates {
 		resources[index] = candidate.Target
 	}
-	if err := ValidateCleanupTargets(resources); err != nil {
+	if err := ValidateCleanupTargets(policy, resources); err != nil {
 		return nil, err
 	}
 
@@ -588,6 +601,7 @@ type PreMutationPolicy struct {
 	ProjectID                         string
 	RunLimits                         RunLimits
 	TestCIDR                          string
+	FirewallMutationWindow            time.Duration
 	TestOperatorPrincipal             Principal
 	TestDestructivePrincipal          Principal
 	PermissionInventory               PolicyInventoryPin
@@ -747,12 +761,16 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	if err := ValidateFirewallRules(input.FirewallRules, input.FirewallObservations, input.ProductionCIDRs, targets, FirewallValidationContext{
 		RunID: input.RunID, Plan: input.Capacity.Plan, Operation: input.Operation,
 		PlannedLifetime: input.Capacity.Lifetime, RunLimits: policy.RunLimits,
-		RunLifetime: input.RunLifetime, ObservedAt: input.Freshness.ObservedAt, Now: now,
+		RunLifetime: input.RunLifetime, FirewallMutationWindow: policy.FirewallMutationWindow,
+		ObservedAt: input.Freshness.ObservedAt, Now: now,
 	}); err != nil {
 		return nil, zero, err
 	}
 	intents, err := validateMutationIntents(policy, input, targets)
 	if err != nil {
+		return nil, zero, err
+	}
+	if err := validateEmittedIntentPermissions(policy.ProjectID, input.Permissions, input.MutationPrincipal, intents); err != nil {
 		return nil, zero, err
 	}
 	fingerprint, err := preMutationFingerprint(policy, input, targets, intents)
@@ -1100,6 +1118,9 @@ func validatePreMutationPolicy(policy PreMutationPolicy, input PreMutationInput)
 	}
 	if err := validateRunLimits(policy.RunLimits); err != nil {
 		return err
+	}
+	if policy.FirewallMutationWindow <= 0 || policy.FirewallMutationWindow > policy.RunLimits.MaxLifetime {
+		return guardError(ErrInvalidGuardInput, "policy.firewallMutationWindow", "must be positive and within the configured maximum lifetime")
 	}
 	for _, principal := range []struct {
 		path  string

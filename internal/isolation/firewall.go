@@ -141,6 +141,9 @@ func validateRunLifetimeContract(
 	if contract.Plan != plan {
 		return "", guardError(ErrUnsafeFirewall, "runLifetime.plan", "does not match the immutable test plan")
 	}
+	if err := validateOperationBinding(operation); err != nil {
+		return "", err
+	}
 	if contract.OperationID != operation.OperationID {
 		return "", guardError(ErrUnsafeFirewall, "runLifetime.operationID", "does not match the durable operation")
 	}
@@ -296,7 +299,7 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 		expectedName, _ := RunFirewallRuleName(runID, FirewallPurposeInternalMongo)
 		expectedTag, _ := RunNodeTag(runID)
 		if rule.Identity.Name != expectedName || rule.Ports[0] != FirewallPortMongo || len(rule.SourceCIDRs) != 0 ||
-			rule.LifetimeContractFingerprint != "" {
+			rule.LifetimeContractFingerprint != lifetimeFingerprint {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the internal MongoDB purpose")
 		}
 		if err := validateTestTags("sourceTags", rule.SourceTags, true); err != nil {

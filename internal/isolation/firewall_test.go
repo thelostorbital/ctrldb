@@ -108,7 +108,7 @@ func TestFirewallRuleIdentityMustBeAnExactSelectedMutationTarget(t *testing.T) {
 	}
 }
 
-func TestIAPFirewallRuleRequiresExactRunLifetimeFingerprint(t *testing.T) {
+func TestFirewallRulesRequireExactRunLifetimeFingerprint(t *testing.T) {
 	t.Parallel()
 
 	rules := validFirewallRules()
@@ -126,10 +126,41 @@ func TestIAPFirewallRuleRequiresExactRunLifetimeFingerprint(t *testing.T) {
 		t.Fatalf("ValidateFirewallRule(stale lifetime) error = %v; want ErrUnsafeFirewall", err)
 	}
 
-	internal := cloneFirewallRule(rules[1])
-	internal.LifetimeContractFingerprint = validLifetimeFingerprint("run1")
-	if err := isolation.ValidateFirewallRule(internal, []string{"10.80.0.0/16"}, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
-		t.Fatalf("ValidateFirewallRule(duplicated internal lifetime) error = %v; want ErrUnsafeFirewall", err)
+	reusedRunRules := []isolation.FirewallRule{cloneFirewallRule(rules[0]), cloneFirewallRule(rules[1])}
+	updatedContract := validRunLifetimeContract("run1")
+	updatedContract.RecordGeneration++
+	updatedFingerprint, err := isolation.RunLifetimeContractFingerprint(updatedContract)
+	if err != nil {
+		t.Fatalf("RunLifetimeContractFingerprint(updated record) unexpected error: %v", err)
+	}
+	reusedRunRules[0].LifetimeContractFingerprint = updatedFingerprint
+	updatedContext := validFirewallValidationContext("run1")
+	updatedContext.RunLifetime = updatedContract
+	if err := isolation.ValidateFirewallRules(reusedRunRules, []string{"10.80.0.0/16"}, firewallTargets("run1"), updatedContext); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+		t.Fatalf("ValidateFirewallRules(stale internal rule after reused run) error = %v; want ErrUnsafeFirewall", err)
+	}
+}
+
+func TestStandaloneFirewallValidationRejectsMalformedMutationAttempt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*isolation.FirewallValidationContext)
+	}{
+		{name: "missing step", mutate: func(value *isolation.FirewallValidationContext) { value.Operation.StepID = "" }},
+		{name: "zero attempt", mutate: func(value *isolation.FirewallValidationContext) { value.Operation.Attempt = 0 }},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			context := validFirewallValidationContext("run1")
+			test.mutate(&context)
+			if err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{"10.80.0.0/16"}, context); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+				t.Fatalf("ValidateFirewallRule() error = %v; want ErrInvalidGuardInput", err)
+			}
+		})
 	}
 }
 
@@ -229,7 +260,7 @@ func firewallRulesForRun(runID string) []isolation.FirewallRule {
 			Identity: testResourceIdentity(mongoName, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"), Network: network, RunID: runID,
 			Purpose: isolation.FirewallPurposeInternalMongo, Protocol: isolation.FirewallProtocolTCP,
 			Ports: []uint16{isolation.FirewallPortMongo}, SourceTags: []string{nodeTag},
-			TargetTags: []string{nodeTag},
+			TargetTags: []string{nodeTag}, LifetimeContractFingerprint: validLifetimeFingerprint(runID),
 		},
 	}
 }

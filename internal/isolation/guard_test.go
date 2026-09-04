@@ -1141,9 +1141,7 @@ func refreshRunLifetimeFingerprint(input *isolation.PreMutationInput) {
 		panic(err)
 	}
 	for index := range input.FirewallRules {
-		if input.FirewallRules[index].Purpose == isolation.FirewallPurposeIAPSSH {
-			input.FirewallRules[index].LifetimeContractFingerprint = fingerprint
-		}
+		input.FirewallRules[index].LifetimeContractFingerprint = fingerprint
 	}
 }
 

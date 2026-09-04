@@ -282,7 +282,7 @@ func TestComputeResourceIdentityEnforcesProviderNameGrammar(t *testing.T) {
 		{kind: isolation.ComputeNetworkKind, scope: isolation.ResourceScopeGlobal, location: "global"},
 		{kind: "snapshots", scope: isolation.ResourceScopeGlobal, location: "global"},
 	}
-	validNames := []string{"a", "1", "a-" + strings.Repeat("b", 60) + "9"}
+	validNames := []string{"a", "a-" + strings.Repeat("b", 60) + "9"}
 	for _, shape := range shapes {
 		for _, name := range validNames {
 			identity := isolation.ResourceIdentity{
@@ -296,6 +296,7 @@ func TestComputeResourceIdentityEnforcesProviderNameGrammar(t *testing.T) {
 	}
 
 	invalidNames := []string{
+		"1-ctrldb-test-run1-vm",
 		"ctrldb-test-run1_vm",
 		"CtrlDB-test-run1-vm",
 		"-ctrldb-test-run1-vm",
@@ -589,6 +590,9 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 		{name: "selector proof", mutate: func(value *isolation.PreMutationInput) { value.RunID = "different" }, kind: isolation.ErrUnsafeTarget},
 		{name: "Compute target underscore", mutate: func(value *isolation.PreMutationInput) {
 			value.Targets[0].Identity.Name = "ctrldb-test-run1_vm"
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "Compute target leading digit", mutate: func(value *isolation.PreMutationInput) {
+			value.Targets[0].Identity.Name = "1-ctrldb-test-run1-vm"
 		}, kind: isolation.ErrInvalidGuardInput},
 		{name: "Compute target overlong", mutate: func(value *isolation.PreMutationInput) {
 			value.Targets[0].Identity.Name = "ctrldb-test-run1-" + strings.Repeat("a", 47)

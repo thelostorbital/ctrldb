@@ -47,6 +47,10 @@ func EncodeJournalEntry(entry domain.JournalEntry) ([]byte, error) {
 // DecodeJournalEntry strictly decodes one entry and sanitizes persisted result
 // text through redact.Text's JSON boundary.
 func DecodeJournalEntry(encoded []byte) (domain.JournalEntry, error) {
+	if err := rejectDuplicateJournalJSONKeys(encoded); err != nil {
+		return domain.JournalEntry{}, err
+	}
+
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 
@@ -68,6 +72,67 @@ func DecodeJournalEntry(encoded []byte) (domain.JournalEntry, error) {
 	}
 
 	return entry, nil
+}
+
+func rejectDuplicateJournalJSONKeys(encoded []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	if err := consumeUniqueJournalJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return journalEntryError("decode", "trailing JSON value")
+	}
+
+	return nil
+}
+
+func consumeUniqueJournalJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return journalEntryError("decode", err.Error())
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return journalEntryError("decode", err.Error())
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return journalEntryError("decode", "object key must be a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return journalEntryError("decode", "object contains a duplicate key")
+			}
+			seen[key] = struct{}{}
+			if err := consumeUniqueJournalJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		if _, err := decoder.Token(); err != nil {
+			return journalEntryError("decode", err.Error())
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeUniqueJournalJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		if _, err := decoder.Token(); err != nil {
+			return journalEntryError("decode", err.Error())
+		}
+	default:
+		return journalEntryError("decode", "contains an unexpected delimiter")
+	}
+
+	return nil
 }
 
 func validateRequiredPauseJSON(encoded []byte, entry domain.JournalEntry) error {

@@ -12,7 +12,10 @@ import (
 	"github.com/thelostorbital/ctrldb/internal/domain"
 )
 
-const stepUpFreshness = 10 * time.Minute
+const (
+	executionEvidenceFreshness = 10 * time.Minute
+	stepUpFreshness            = 10 * time.Minute
+)
 
 var (
 	// ErrPlanBlocked identifies a valid review artifact whose current execution
@@ -47,11 +50,12 @@ type PlanBlocker struct {
 
 // PermissionProbe is one exact testIamPermissions-style observation request.
 type PermissionProbe struct {
-	StepID   string
-	Identity domain.ExecutionIdentity
-	Resource domain.PlanResource
-	Required []string
-	Granted  []string
+	ProjectID string
+	StepID    string
+	Identity  domain.ExecutionIdentity
+	Resource  domain.PlanResource
+	Required  []string
+	Granted   []string
 }
 
 // ApprovalEvidence is the create-only approval record read immediately before
@@ -60,7 +64,9 @@ type PermissionProbe struct {
 type ApprovalEvidence struct {
 	PlanID            string
 	PlanHash          string
+	ProjectID         string
 	Environment       string
+	EnvironmentClass  domain.EnvironmentClass
 	Principal         string
 	RecordObject      string
 	ServerTimeCreated time.Time
@@ -68,22 +74,26 @@ type ApprovalEvidence struct {
 
 // IntentEvidence is the current authoritative view of a scheduled intent.
 type IntentEvidence struct {
-	PlanID      string
-	PlanHash    string
-	PolicyHash  string
-	Environment string
-	Principal   string
-	WindowStart time.Time
-	ValidUntil  time.Time
-	Active      bool
-	SoleActive  bool
+	PlanID           string
+	PlanHash         string
+	ProjectID        string
+	PolicyHash       string
+	Environment      string
+	EnvironmentClass domain.EnvironmentClass
+	Principal        string
+	WindowStart      time.Time
+	ValidUntil       time.Time
+	Active           bool
+	SoleActive       bool
 }
 
 // StepUpEvidence is the create-only fresh-login record for a destructive plan.
 type StepUpEvidence struct {
 	PlanID            string
 	PlanHash          string
+	ProjectID         string
 	Environment       string
+	EnvironmentClass  domain.EnvironmentClass
 	Principal         string
 	RecordObject      string
 	ServerTimeCreated time.Time
@@ -92,21 +102,25 @@ type StepUpEvidence struct {
 // ExecutionEvidence is a typed, provider-independent revalidation snapshot.
 // CheckedAt is the authoritative gate time. ObservedAt is the authoritative
 // completion time of the resource, precondition, and permission revalidation
-// represented by this value; the gate verifies its required ordering.
+// represented by this value; the gate verifies its required ordering. The
+// browser-login interval consumes the bounded revalidation freshness budget;
+// executors must still enforce their per-step fingerprints and etags.
 type ExecutionEvidence struct {
-	PlanID        string
-	PlanHash      string
-	Environment   string
-	Principal     string
-	CheckedAt     time.Time
-	ObservedAt    time.Time
-	Approval      *ApprovalEvidence
-	Intent        *IntentEvidence
-	PolicyHash    domain.PlanPolicyHash
-	Preconditions []domain.PlanPrecondition
-	Resources     []domain.PlanResource
-	Permissions   []domain.PlanPermission
-	StepUp        *StepUpEvidence
+	PlanID           string
+	PlanHash         string
+	ProjectID        string
+	Environment      string
+	EnvironmentClass domain.EnvironmentClass
+	Principal        string
+	CheckedAt        time.Time
+	ObservedAt       time.Time
+	Approval         *ApprovalEvidence
+	Intent           *IntentEvidence
+	PolicyHash       domain.PlanPolicyHash
+	Preconditions    []domain.PlanPrecondition
+	Resources        []domain.PlanResource
+	Permissions      []domain.PlanPermission
+	StepUp           *StepUpEvidence
 }
 
 // BlockedPlanError is returned before any mutation for a reviewable but
@@ -119,10 +133,11 @@ type BlockedPlanError struct {
 // PermissionChecks converts a probe response into stable plan evidence. The
 // response may contain only requested permissions; omissions become denied.
 func PermissionChecks(probe PermissionProbe) ([]domain.PlanPermission, error) {
-	if probe.StepID == "" || !probe.Identity.Valid() {
+	if !projectIDPattern.MatchString(probe.ProjectID) || !identifierPattern.MatchString(probe.StepID) ||
+		!probe.Identity.Valid() {
 		return nil, fmt.Errorf("%w: invalid step or identity", ErrInvalidPermissionProbe)
 	}
-	if probe.Resource.Kind == "" || probe.Resource.Name == "" || probe.Resource.Fingerprint == "" {
+	if err := validateResources([]domain.PlanResource{probe.Resource}, probe.ProjectID); err != nil {
 		return nil, fmt.Errorf("%w: incomplete fingerprinted resource", ErrInvalidPermissionProbe)
 	}
 	if len(probe.Required) == 0 {
@@ -220,11 +235,15 @@ func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence) erro
 		evidence.ObservedAt.Before(plan.CreatedAt) {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanTime, ID: "fresh-observation"})
 	}
+	if evidence.CheckedAt.Sub(evidence.ObservedAt) > executionEvidenceFreshness {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanTime, ID: "stale-observation"})
+	}
 	if evidence.CheckedAt.Before(plan.CreatedAt) {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanTime, ID: "before-plan-creation"})
 	}
-	if evidence.PlanID != plan.PlanID || evidence.PlanHash != plan.PlanHash ||
-		evidence.Environment != plan.Environment || evidence.Principal != plan.Principal {
+	if evidence.PlanID != plan.PlanID || evidence.PlanHash != plan.PlanHash || evidence.ProjectID != plan.ProjectID ||
+		evidence.Environment != plan.Environment || evidence.EnvironmentClass != plan.EnvironmentClass ||
+		evidence.Principal != plan.Principal {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanBinding, ID: "execution-evidence"})
 	}
 
@@ -256,8 +275,9 @@ func validateApprovalEvidence(plan domain.Plan, evidence ExecutionEvidence, bloc
 	if approval == nil {
 		return append(blockers, PlanBlocker{Kind: BlockerApproval, ID: "missing"})
 	}
-	if approval.PlanID != plan.PlanID || approval.PlanHash != plan.PlanHash ||
-		approval.Environment != plan.Environment || approval.Principal != plan.Principal ||
+	if approval.PlanID != plan.PlanID || approval.PlanHash != plan.PlanHash || approval.ProjectID != plan.ProjectID ||
+		approval.Environment != plan.Environment || approval.EnvironmentClass != plan.EnvironmentClass ||
+		approval.Principal != plan.Principal ||
 		approval.RecordObject != fmt.Sprintf("plans/%s/%s-approval.json", plan.Environment, plan.PlanID) ||
 		!validEvidenceTime(approval.ServerTimeCreated) ||
 		approval.ServerTimeCreated.Before(plan.CreatedAt) || approval.ServerTimeCreated.After(evidence.CheckedAt) {
@@ -288,9 +308,10 @@ func validateIntentEvidence(plan domain.Plan, evidence ExecutionEvidence, blocke
 	if intent == nil {
 		return append(blockers, PlanBlocker{Kind: BlockerIntent, ID: "missing"})
 	}
-	if intent.PlanID != plan.PlanID || intent.PlanHash != plan.PlanHash ||
+	if intent.PlanID != plan.PlanID || intent.PlanHash != plan.PlanHash || intent.ProjectID != plan.ProjectID ||
 		intent.PolicyHash != plan.PolicyHash.Approved || intent.Environment != plan.Environment ||
-		intent.Principal != plan.Principal || !intent.WindowStart.Equal(plan.Intent.WindowStart) ||
+		intent.EnvironmentClass != plan.EnvironmentClass || intent.Principal != plan.Principal ||
+		!intent.WindowStart.Equal(plan.Intent.WindowStart) ||
 		!intent.ValidUntil.Equal(plan.Intent.ValidUntil) || !intent.Active || !intent.SoleActive {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerIntent, ID: "invalid-binding"})
 	}
@@ -331,7 +352,7 @@ func validatePreconditionEvidence(plan domain.Plan, evidence ExecutionEvidence, 
 func validateResourceEvidence(plan domain.Plan, evidence ExecutionEvidence, blockers []PlanBlocker) []PlanBlocker {
 	observed := make(map[string]domain.PlanResource, len(evidence.Resources))
 	for _, resource := range evidence.Resources {
-		key := resource.Kind + "\x00" + resource.Name
+		key := resource.Scope + "\x00" + resource.Kind + "\x00" + resource.Name
 		if _, duplicate := observed[key]; duplicate {
 			blockers = append(blockers, PlanBlocker{Kind: BlockerResource, ID: "duplicate-evidence"})
 		}
@@ -341,7 +362,7 @@ func validateResourceEvidence(plan domain.Plan, evidence ExecutionEvidence, bloc
 		blockers = append(blockers, PlanBlocker{Kind: BlockerResource, ID: "incomplete-evidence"})
 	}
 	for _, expected := range plan.Resources {
-		current, exists := observed[expected.Kind+"\x00"+expected.Name]
+		current, exists := observed[expected.Scope+"\x00"+expected.Kind+"\x00"+expected.Name]
 		if !exists || current != expected {
 			blockers = append(blockers, PlanBlocker{Kind: BlockerResource, ID: expected.Kind + "/" + expected.Name})
 		}
@@ -385,12 +406,13 @@ func validateStepUpEvidence(plan domain.Plan, evidence ExecutionEvidence, blocke
 	if stepUp == nil {
 		return append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "missing"})
 	}
-	if stepUp.PlanID != plan.PlanID || stepUp.PlanHash != plan.PlanHash ||
-		stepUp.Environment != plan.Environment || stepUp.Principal != plan.Principal ||
+	if stepUp.PlanID != plan.PlanID || stepUp.PlanHash != plan.PlanHash || stepUp.ProjectID != plan.ProjectID ||
+		stepUp.Environment != plan.Environment || stepUp.EnvironmentClass != plan.EnvironmentClass ||
+		stepUp.Principal != plan.Principal ||
 		!validStepUpObject(stepUp.RecordObject, plan) || !validEvidenceTime(stepUp.ServerTimeCreated) ||
 		stepUp.ServerTimeCreated.Before(evidence.ObservedAt) ||
 		stepUp.ServerTimeCreated.After(evidence.CheckedAt) ||
-		evidence.CheckedAt.Sub(stepUp.ServerTimeCreated) >= stepUpFreshness {
+		evidence.CheckedAt.Sub(stepUp.ServerTimeCreated) > stepUpFreshness {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "invalid-or-stale"})
 	}
 	if evidence.Approval == nil || stepUp.ServerTimeCreated.Before(
@@ -404,7 +426,8 @@ func validateStepUpEvidence(plan domain.Plan, evidence ExecutionEvidence, blocke
 
 func planPermissionKey(permission domain.PlanPermission) string {
 	return permission.StepID + "\x00" + string(permission.Identity) + "\x00" + permission.Permission + "\x00" +
-		permission.Resource.Kind + "\x00" + permission.Resource.Name + "\x00" + permission.Resource.Fingerprint
+		permission.Resource.Scope + "\x00" + permission.Resource.Kind + "\x00" + permission.Resource.Name + "\x00" +
+		permission.Resource.Fingerprint
 }
 
 func validEvidenceTime(value time.Time) bool {

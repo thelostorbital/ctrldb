@@ -19,11 +19,12 @@ func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
 	plan := validPlan()
 	plan.Preconditions = append(plan.Preconditions, domain.PlanPrecondition{ID: "quota-ready", OK: false})
 	checks, err := policy.PermissionChecks(policy.PermissionProbe{
-		StepID:   plan.Steps[0].ID,
-		Identity: domain.IdentityOperator,
-		Resource: plan.Resources[0],
-		Required: []string{"compute.instances.get"},
-		Granted:  nil,
+		ProjectID: plan.ProjectID,
+		StepID:    plan.Steps[0].ID,
+		Identity:  domain.IdentityOperator,
+		Resource:  plan.Resources[0],
+		Required:  []string{"compute.instances.get"},
+		Granted:   nil,
 	})
 	if err != nil {
 		t.Fatalf("PermissionChecks() returned an error: %v", err)
@@ -87,6 +88,12 @@ func TestExecutionGateRejectsMissingStaleOrMismatchedEvidence(t *testing.T) {
 		{name: "observation predates plan", kind: policy.BlockerPlanTime, mutate: func(plan *domain.Plan, evidence *policy.ExecutionEvidence) {
 			evidence.ObservedAt = plan.CreatedAt.Add(-time.Nanosecond)
 		}},
+		{name: "stale observation", kind: policy.BlockerPlanTime, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.ObservedAt = evidence.CheckedAt.Add(-10*time.Minute - time.Nanosecond)
+		}},
+		{name: "wrong project binding", kind: policy.BlockerPlanBinding, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.ProjectID = "ctrldb-other-123"
+		}},
 		{name: "wrong principal binding", kind: policy.BlockerPlanBinding, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
 			evidence.Principal = "other@example.com"
 		}},
@@ -96,11 +103,20 @@ func TestExecutionGateRejectsMissingStaleOrMismatchedEvidence(t *testing.T) {
 		{name: "approval from another plan", kind: policy.BlockerApproval, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
 			evidence.Approval.PlanID = "plan-fedcba9876543210"
 		}},
+		{name: "approval from another project", kind: policy.BlockerApproval, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Approval.ProjectID = "ctrldb-other-123"
+		}},
 		{name: "resource drift", kind: policy.BlockerResource, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
 			evidence.Resources[0].Fingerprint = "generation-8"
 		}},
+		{name: "resource scope drift", kind: policy.BlockerResource, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Resources[0].Scope = "projects/ctrldb-prod-123/zones/us-central1-b"
+		}},
 		{name: "revoked permission", kind: policy.BlockerPermission, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
 			evidence.Permissions[0].Granted = false
+		}},
+		{name: "permission from another scope", kind: policy.BlockerPermission, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
+			evidence.Permissions[0].Resource.Scope = "projects/ctrldb-prod-123/zones/us-central1-b"
 		}},
 		{name: "false fresh precondition", kind: policy.BlockerPrecondition, mutate: func(_ *domain.Plan, evidence *policy.ExecutionEvidence) {
 			evidence.Preconditions[0].OK = false
@@ -117,6 +133,21 @@ func TestExecutionGateRejectsMissingStaleOrMismatchedEvidence(t *testing.T) {
 			expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), test.kind)
 		})
 	}
+}
+
+func TestExecutionEvidenceFreshnessBoundary(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	checkedAt := plan.CreatedAt.Add(30 * time.Minute)
+	evidence := validExecutionEvidence(plan, checkedAt)
+	evidence.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
+	evidence.ObservedAt = checkedAt.Add(-10 * time.Minute)
+	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+		t.Fatalf("exact ten-minute evidence boundary returned an error: %v", err)
+	}
+	evidence.ObservedAt = checkedAt.Add(-10*time.Minute - time.Nanosecond)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerPlanTime)
 }
 
 func TestExecutionGateUsesServerApprovalTimeForCoolingOff(t *testing.T) {
@@ -216,7 +247,7 @@ func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
 	evidence := validExecutionEvidence(plan, checkedAt)
 	evidence.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
 	evidence.ObservedAt = checkedAt.Add(-10 * time.Minute)
-	evidence.StepUp.ServerTimeCreated = checkedAt.Add(-9*time.Minute - 59*time.Second)
+	evidence.StepUp.ServerTimeCreated = checkedAt.Add(-10 * time.Minute)
 	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
 		t.Fatalf("fresh step-up returned an error: %v", err)
 	}
@@ -224,12 +255,14 @@ func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
 	for _, mutate := range []func(*policy.ExecutionEvidence){
 		func(evidence *policy.ExecutionEvidence) { evidence.StepUp = nil },
 		func(evidence *policy.ExecutionEvidence) { evidence.StepUp.PlanID = "plan-fedcba9876543210" },
+		func(evidence *policy.ExecutionEvidence) { evidence.StepUp.ProjectID = "ctrldb-other-123" },
 		func(evidence *policy.ExecutionEvidence) { evidence.StepUp.Principal = "other@example.com" },
 		func(evidence *policy.ExecutionEvidence) {
 			evidence.StepUp.ServerTimeCreated = evidence.ObservedAt.Add(-time.Nanosecond)
 		},
 		func(evidence *policy.ExecutionEvidence) {
-			evidence.StepUp.ServerTimeCreated = checkedAt.Add(-10 * time.Minute)
+			evidence.ObservedAt = checkedAt.Add(-10*time.Minute - time.Nanosecond)
+			evidence.StepUp.ServerTimeCreated = evidence.ObservedAt
 		},
 	} {
 		changed := validExecutionEvidence(plan, checkedAt)
@@ -243,9 +276,15 @@ func TestPermissionChecksRejectsAmbiguousProbeEvidence(t *testing.T) {
 	t.Parallel()
 
 	valid := policy.PermissionProbe{
-		StepID:   "stop-instance",
-		Identity: domain.IdentityOperator,
-		Resource: domain.PlanResource{Kind: "instance", Name: "example-instance", Fingerprint: "generation-7"},
+		ProjectID: "ctrldb-prod-123",
+		StepID:    "stop-instance",
+		Identity:  domain.IdentityOperator,
+		Resource: domain.PlanResource{
+			Kind:        "instance",
+			Scope:       "projects/ctrldb-prod-123/zones/us-central1-a",
+			Name:        "example-instance",
+			Fingerprint: "generation-7",
+		},
 		Required: []string{"compute.instances.get"},
 		Granted:  []string{"compute.instances.get"},
 	}
@@ -253,9 +292,13 @@ func TestPermissionChecksRejectsAmbiguousProbeEvidence(t *testing.T) {
 		name   string
 		mutate func(*policy.PermissionProbe)
 	}{
+		{name: "missing project", mutate: func(probe *policy.PermissionProbe) { probe.ProjectID = "" }},
 		{name: "missing step", mutate: func(probe *policy.PermissionProbe) { probe.StepID = "" }},
 		{name: "unknown identity", mutate: func(probe *policy.PermissionProbe) { probe.Identity = "root" }},
 		{name: "missing resource", mutate: func(probe *policy.PermissionProbe) { probe.Resource.Fingerprint = "" }},
+		{name: "foreign resource scope", mutate: func(probe *policy.PermissionProbe) {
+			probe.Resource.Scope = "projects/ctrldb-other-123/zones/us-central1-a"
+		}},
 		{name: "empty required", mutate: func(probe *policy.PermissionProbe) { probe.Required = nil; probe.Granted = nil }},
 		{name: "malformed required", mutate: func(probe *policy.PermissionProbe) { probe.Required = []string{"instances.get"}; probe.Granted = nil }},
 		{name: "duplicate required", mutate: func(probe *policy.PermissionProbe) {
@@ -284,7 +327,12 @@ func TestPlanPermissionCoverageIncludesEveryStepIdentityAndResource(t *testing.T
 	t.Parallel()
 
 	plan := validPlan()
-	secondResource := domain.PlanResource{Kind: "disk", Name: "example-disk", Fingerprint: "generation-2"}
+	secondResource := domain.PlanResource{
+		Kind:        "disk",
+		Scope:       "projects/ctrldb-prod-123/zones/us-central1-a",
+		Name:        "example-disk",
+		Fingerprint: "generation-2",
+	}
 	plan.Resources = append(plan.Resources, secondResource)
 	if _, err := policy.SealPlan(plan); !errors.Is(err, policy.ErrInvalidPlan) {
 		t.Fatalf("SealPlan() missing resource permission error = %v, want ErrInvalidPlan", err)
@@ -319,22 +367,26 @@ func TestPlanPermissionCoverageIncludesEveryStepIdentityAndResource(t *testing.T
 
 func validExecutionEvidence(plan domain.Plan, checkedAt time.Time) policy.ExecutionEvidence {
 	evidence := policy.ExecutionEvidence{
-		PlanID:        plan.PlanID,
-		PlanHash:      plan.PlanHash,
-		Environment:   plan.Environment,
-		Principal:     plan.Principal,
-		CheckedAt:     checkedAt,
-		ObservedAt:    checkedAt,
-		PolicyHash:    plan.PolicyHash,
-		Preconditions: append([]domain.PlanPrecondition(nil), plan.Preconditions...),
-		Resources:     append([]domain.PlanResource(nil), plan.Resources...),
-		Permissions:   append([]domain.PlanPermission(nil), plan.Permissions...),
+		PlanID:           plan.PlanID,
+		PlanHash:         plan.PlanHash,
+		ProjectID:        plan.ProjectID,
+		Environment:      plan.Environment,
+		EnvironmentClass: plan.EnvironmentClass,
+		Principal:        plan.Principal,
+		CheckedAt:        checkedAt,
+		ObservedAt:       checkedAt,
+		PolicyHash:       plan.PolicyHash,
+		Preconditions:    append([]domain.PlanPrecondition(nil), plan.Preconditions...),
+		Resources:        append([]domain.PlanResource(nil), plan.Resources...),
+		Permissions:      append([]domain.PlanPermission(nil), plan.Permissions...),
 	}
 	if plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil {
 		evidence.Approval = &policy.ApprovalEvidence{
 			PlanID:            plan.PlanID,
 			PlanHash:          plan.PlanHash,
+			ProjectID:         plan.ProjectID,
 			Environment:       plan.Environment,
+			EnvironmentClass:  plan.EnvironmentClass,
 			Principal:         plan.Principal,
 			RecordObject:      "plans/" + plan.Environment + "/" + plan.PlanID + "-approval.json",
 			ServerTimeCreated: checkedAt.Add(-time.Minute),
@@ -343,26 +395,30 @@ func validExecutionEvidence(plan domain.Plan, checkedAt time.Time) policy.Execut
 	if plan.Intent != nil {
 		evidence.Approval.ServerTimeCreated = checkedAt
 		evidence.Intent = &policy.IntentEvidence{
-			PlanID:      plan.PlanID,
-			PlanHash:    plan.PlanHash,
-			PolicyHash:  plan.PolicyHash.Approved,
-			Environment: plan.Environment,
-			Principal:   plan.Principal,
-			WindowStart: plan.Intent.WindowStart,
-			ValidUntil:  plan.Intent.ValidUntil,
-			Active:      true,
-			SoleActive:  true,
+			PlanID:           plan.PlanID,
+			PlanHash:         plan.PlanHash,
+			ProjectID:        plan.ProjectID,
+			PolicyHash:       plan.PolicyHash.Approved,
+			Environment:      plan.Environment,
+			EnvironmentClass: plan.EnvironmentClass,
+			Principal:        plan.Principal,
+			WindowStart:      plan.Intent.WindowStart,
+			ValidUntil:       plan.Intent.ValidUntil,
+			Active:           true,
+			SoleActive:       true,
 		}
 	}
 	if plan.StepUpRequired {
-		evidence.ObservedAt = checkedAt.Add(-2 * time.Minute)
+		evidence.ObservedAt = checkedAt.Add(-30 * time.Second)
 		evidence.StepUp = &policy.StepUpEvidence{
 			PlanID:            plan.PlanID,
 			PlanHash:          plan.PlanHash,
+			ProjectID:         plan.ProjectID,
 			Environment:       plan.Environment,
+			EnvironmentClass:  plan.EnvironmentClass,
 			Principal:         plan.Principal,
 			RecordObject:      "plans/" + plan.Environment + "/" + plan.PlanID + "-stepup-1.json",
-			ServerTimeCreated: checkedAt.Add(-time.Minute),
+			ServerTimeCreated: checkedAt.Add(-20 * time.Second),
 		}
 	}
 

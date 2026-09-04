@@ -72,7 +72,7 @@ func TestPlanSealAndHashVerification(t *testing.T) {
 		t.Fatalf("VerifyPlanHash() returned an error: %v", err)
 	}
 
-	const knownDigest = "69aae6ede47d1f4b4ead5d8614e61b4fbe154d44223306b281699b17f4ec4a85"
+	const knownDigest = "c58c6fe193e5a6c0b7f54a4884a66939b2506af5855ad0f78121a12ac6b3bddc"
 	if plan.PlanHash != knownDigest {
 		t.Fatalf("sealed plan digest = %q, want known vector %q", plan.PlanHash, knownDigest)
 	}
@@ -119,7 +119,13 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 	}{
 		{name: "plan id", mutate: func(plan *domain.Plan) { plan.PlanID = "plan-fedcba9876543210" }},
 		{name: "workflow", mutate: func(plan *domain.Plan) { plan.WorkflowID = "WF-DSK-01" }},
+		{name: "project", mutate: func(plan *domain.Plan) {
+			plan.ProjectID = "ctrldb-stage-123"
+			plan.Resources[0].Scope = "projects/ctrldb-stage-123/zones/us-central1-a"
+			plan.Permissions[0].Resource.Scope = plan.Resources[0].Scope
+		}},
 		{name: "environment", mutate: func(plan *domain.Plan) { plan.Environment = "staging" }},
+		{name: "environment class", mutate: func(plan *domain.Plan) { plan.EnvironmentClass = domain.EnvironmentStaging }},
 		{name: "principal", mutate: func(plan *domain.Plan) { plan.Principal = "reviewer@example.com" }},
 		{name: "creation time", mutate: func(plan *domain.Plan) { plan.CreatedAt = plan.CreatedAt.Add(time.Second) }},
 		{name: "approval", mutate: func(plan *domain.Plan) { plan.ApprovalClass = domain.ApprovalSecuritySensitive }},
@@ -138,6 +144,10 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 		{name: "resource", mutate: func(plan *domain.Plan) {
 			plan.Resources[0].Fingerprint = "generation-8"
 			plan.Permissions[0].Resource.Fingerprint = "generation-8"
+		}},
+		{name: "resource scope", mutate: func(plan *domain.Plan) {
+			plan.Resources[0].Scope = "projects/ctrldb-prod-123/zones/us-central1-b"
+			plan.Permissions[0].Resource.Scope = plan.Resources[0].Scope
 		}},
 		{name: "precondition", mutate: func(plan *domain.Plan) { plan.Preconditions[0].Detail = redact.Sanitize("ready") }},
 		{name: "precondition outcome", mutate: func(plan *domain.Plan) { plan.Preconditions[0].OK = false }},
@@ -268,6 +278,20 @@ func TestPlanDecodeRejectsDuplicateKeysAtEveryNestingLevel(t *testing.T) {
 	}
 }
 
+func TestPlanDuplicateKeyErrorDoesNotEchoHostileInput(t *testing.T) {
+	t.Parallel()
+
+	input := []byte("{\"\\u001b[31mSECRET_MARKER_HOSTILE\":false," +
+		"\"\\u001b[31mSECRET_MARKER_HOSTILE\":true}")
+	_, err := policy.DecodePlan(input)
+	if !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
+	}
+	if strings.Contains(err.Error(), "SECRET_MARKER_HOSTILE") || strings.ContainsRune(err.Error(), '\x1b') {
+		t.Fatalf("DecodePlan() error disclosed hostile key: %q", err)
+	}
+}
+
 func TestPlanDecodeRejectsMissingExecutionContractFields(t *testing.T) {
 	t.Parallel()
 
@@ -277,8 +301,8 @@ func TestPlanDecodeRejectsMissingExecutionContractFields(t *testing.T) {
 	}
 
 	for _, field := range []string{
-		"environment", "principal", "createdAt", "permissions", "retry",
-		"idempotent", "cancelSafe", "successCondition", "failureBehavior", "stepId", "resource",
+		"projectId", "environment", "environmentClass", "principal", "createdAt", "permissions", "retry",
+		"idempotent", "cancelSafe", "successCondition", "failureBehavior", "stepId", "resource", "scope",
 	} {
 		field := field
 		t.Run(field, func(t *testing.T) {
@@ -300,11 +324,13 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 		{name: "plan id", mutate: func(plan *domain.Plan) { plan.PlanID = "plan-production" }},
 		{name: "plan hash", mutate: func(plan *domain.Plan) { plan.PlanHash = "ABC" }},
 		{name: "workflow id", mutate: func(plan *domain.Plan) { plan.WorkflowID = "vm-resize" }},
+		{name: "project id", mutate: func(plan *domain.Plan) { plan.ProjectID = "ambient/default" }},
 		{name: "approval class", mutate: func(plan *domain.Plan) { plan.ApprovalClass = 255 }},
 		{name: "zero expiry", mutate: func(plan *domain.Plan) { plan.ExpiresAt = time.Time{} }},
 		{name: "zero creation", mutate: func(plan *domain.Plan) { plan.CreatedAt = time.Time{} }},
 		{name: "expiry before creation", mutate: func(plan *domain.Plan) { plan.ExpiresAt = plan.CreatedAt }},
 		{name: "environment", mutate: func(plan *domain.Plan) { plan.Environment = "Production" }},
+		{name: "environment class", mutate: func(plan *domain.Plan) { plan.EnvironmentClass = "prod" }},
 		{name: "principal", mutate: func(plan *domain.Plan) { plan.Principal = "operator example" }},
 		{name: "non UTC expiry", mutate: func(plan *domain.Plan) {
 			plan.ExpiresAt = time.Date(2026, 9, 3, 12, 0, 0, 0, time.FixedZone("offset", 3600))
@@ -314,7 +340,15 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 		{name: "local policy hash", mutate: func(plan *domain.Plan) { plan.PolicyHash.Local = "bad" }},
 		{name: "approved policy hash", mutate: func(plan *domain.Plan) { plan.PolicyHash.Approved = "bad" }},
 		{name: "policy match", mutate: func(plan *domain.Plan) { plan.PolicyHash.Match = false }},
-		{name: "step up class", mutate: func(plan *domain.Plan) { plan.StepUpRequired = true }},
+		{name: "unexpected step up", mutate: func(plan *domain.Plan) { plan.StepUpRequired = true }},
+		{name: "missing production data-destructive step up", mutate: func(plan *domain.Plan) {
+			plan.ApprovalClass = domain.ApprovalDataDestructive
+		}},
+		{name: "non-production step up", mutate: func(plan *domain.Plan) {
+			plan.EnvironmentClass = domain.EnvironmentStaging
+			plan.ApprovalClass = domain.ApprovalDataDestructive
+			plan.StepUpRequired = true
+		}},
 		{name: "intent window", mutate: func(plan *domain.Plan) {
 			plan.Intent = &domain.PlanIntent{ValidUntil: time.Date(2026, 9, 4, 13, 0, 0, 0, time.UTC)}
 		}},
@@ -326,8 +360,20 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 			plan.Intent = &domain.PlanIntent{WindowStart: start, ValidUntil: start}
 		}},
 		{name: "resource fields", mutate: func(plan *domain.Plan) { plan.Resources[0].Fingerprint = "" }},
+		{name: "resource scope", mutate: func(plan *domain.Plan) {
+			plan.Resources[0].Scope = "projects/other-project-123/zones/us-central1-a"
+		}},
+		{name: "hostile resource kind", mutate: func(plan *domain.Plan) {
+			plan.Resources[0].Kind = "instance\x1b[31mSECRET_MARKER"
+		}},
+		{name: "hostile resource name", mutate: func(plan *domain.Plan) {
+			plan.Resources[0].Name = "instance\nSECRET_MARKER"
+		}},
 		{name: "duplicate resource", mutate: func(plan *domain.Plan) { plan.Resources = append(plan.Resources, plan.Resources[0]) }},
 		{name: "precondition id", mutate: func(plan *domain.Plan) { plan.Preconditions[0].ID = "" }},
+		{name: "hostile precondition id", mutate: func(plan *domain.Plan) {
+			plan.Preconditions[0].ID = "ready\x1b[31mSECRET_MARKER"
+		}},
 		{name: "duplicate precondition", mutate: func(plan *domain.Plan) {
 			plan.Preconditions = append(plan.Preconditions, plan.Preconditions[0])
 		}},
@@ -336,13 +382,18 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 		{name: "permission step", mutate: func(plan *domain.Plan) { plan.Permissions[0].StepID = "missing-step" }},
 		{name: "permission name", mutate: func(plan *domain.Plan) { plan.Permissions[0].Permission = "instances.stop" }},
 		{name: "permission resource", mutate: func(plan *domain.Plan) { plan.Permissions[0].Resource.Fingerprint = "generation-8" }},
+		{name: "permission resource scope", mutate: func(plan *domain.Plan) {
+			plan.Permissions[0].Resource.Scope = "projects/ctrldb-prod-123/zones/us-central1-b"
+		}},
 		{name: "duplicate permission", mutate: func(plan *domain.Plan) {
 			plan.Permissions = append(plan.Permissions, plan.Permissions[0])
 		}},
 		{name: "missing steps", mutate: func(plan *domain.Plan) { plan.Steps = nil }},
 		{name: "step id", mutate: func(plan *domain.Plan) { plan.Steps[0].ID = "" }},
+		{name: "hostile step id", mutate: func(plan *domain.Plan) { plan.Steps[0].ID = "step\nSECRET_MARKER" }},
 		{name: "duplicate step", mutate: func(plan *domain.Plan) { plan.Steps = append(plan.Steps, plan.Steps[0]) }},
 		{name: "step executor", mutate: func(plan *domain.Plan) { plan.Steps[0].Executor = "" }},
+		{name: "hostile executor", mutate: func(plan *domain.Plan) { plan.Steps[0].Executor = "exec\x1b[31mSECRET_MARKER" }},
 		{name: "step identity", mutate: func(plan *domain.Plan) { plan.Steps[0].ExecutingIdentity = "root" }},
 		{name: "empty command", mutate: func(plan *domain.Plan) { plan.Steps[0].CommandRedacted = redact.Sanitize("") }},
 		{name: "zero retry attempts", mutate: func(plan *domain.Plan) { plan.Steps[0].Retry.MaxAttempts = 0 }},
@@ -398,6 +449,26 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 				t.Fatalf("SealPlan() error = %v, want ErrInvalidPlan", err)
 			}
 		})
+	}
+}
+
+func TestPlanIdentifierErrorsDoNotEchoHostileInput(t *testing.T) {
+	t.Parallel()
+
+	for _, mutate := range []func(*domain.Plan){
+		func(plan *domain.Plan) { plan.Preconditions[0].ID = "precondition\x1b[31mSECRET_MARKER_HOSTILE" },
+		func(plan *domain.Plan) { plan.Resources[0].Name = "resource\nSECRET_MARKER_HOSTILE" },
+		func(plan *domain.Plan) { plan.Steps[0].Executor = "executor\x1b[31mSECRET_MARKER_HOSTILE" },
+	} {
+		plan := validPlan()
+		mutate(&plan)
+		_, err := policy.SealPlan(plan)
+		if !errors.Is(err, policy.ErrInvalidPlan) {
+			t.Fatalf("SealPlan() error = %v, want ErrInvalidPlan", err)
+		}
+		if strings.Contains(err.Error(), "SECRET_MARKER_HOSTILE") || strings.ContainsRune(err.Error(), '\x1b') {
+			t.Fatalf("SealPlan() error disclosed hostile identifier: %q", err)
+		}
 	}
 }
 
@@ -463,6 +534,15 @@ func TestPlanAllowsScheduledDestructiveStepUp(t *testing.T) {
 	if err := policy.ValidatePlan(plan); err != nil {
 		t.Fatalf("ValidatePlan() returned an error: %v", err)
 	}
+
+	nonProduction := validPlan()
+	nonProduction.Environment = "staging"
+	nonProduction.EnvironmentClass = domain.EnvironmentStaging
+	nonProduction.ApprovalClass = domain.ApprovalDataDestructive
+	nonProduction.StepUpRequired = false
+	if _, err := policy.SealPlan(nonProduction); err != nil {
+		t.Fatalf("SealPlan() rejected non-production plan without step-up: %v", err)
+	}
 }
 
 func validPlan() domain.Plan {
@@ -471,7 +551,9 @@ func validPlan() domain.Plan {
 	plan := domain.Plan{
 		PlanID:            "plan-0123456789abcdef",
 		WorkflowID:        "WF-VM-02",
+		ProjectID:         "ctrldb-prod-123",
 		Environment:       "production",
+		EnvironmentClass:  domain.EnvironmentProduction,
 		Principal:         "operator@example.com",
 		CreatedAt:         time.Date(2026, 9, 3, 11, 0, 0, 0, time.UTC),
 		ApprovalClass:     domain.ApprovalProtected,
@@ -484,7 +566,12 @@ func validPlan() domain.Plan {
 			Match:    true,
 		},
 		Resources: []domain.PlanResource{
-			{Kind: "instance", Name: "example-instance", Fingerprint: "generation-7"},
+			{
+				Kind:        "instance",
+				Scope:       "projects/ctrldb-prod-123/zones/us-central1-a",
+				Name:        "example-instance",
+				Fingerprint: "generation-7",
+			},
 		},
 		Preconditions: []domain.PlanPrecondition{
 			{ID: "instance-healthy", OK: true, Detail: redact.Sanitize("healthy")},
@@ -494,8 +581,13 @@ func validPlan() domain.Plan {
 				StepID:     "stop-instance",
 				Identity:   domain.IdentityOperator,
 				Permission: "compute.instances.stop",
-				Resource:   domain.PlanResource{Kind: "instance", Name: "example-instance", Fingerprint: "generation-7"},
-				Granted:    true,
+				Resource: domain.PlanResource{
+					Kind:        "instance",
+					Scope:       "projects/ctrldb-prod-123/zones/us-central1-a",
+					Name:        "example-instance",
+					Fingerprint: "generation-7",
+				},
+				Granted: true,
 			},
 		},
 		Steps: []domain.PlanStep{

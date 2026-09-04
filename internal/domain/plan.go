@@ -15,7 +15,9 @@ type Plan struct {
 	PlanID            string             `json:"planId"`
 	PlanHash          string             `json:"planHash"`
 	WorkflowID        string             `json:"workflowId"`
+	ProjectID         string             `json:"projectId"`
 	Environment       string             `json:"environment"`
+	EnvironmentClass  EnvironmentClass   `json:"environmentClass"`
 	Principal         string             `json:"principal"`
 	CreatedAt         time.Time          `json:"createdAt"`
 	ApprovalClass     ApprovalClass      `json:"approvalClass"`
@@ -72,6 +74,7 @@ type PlanIntent struct {
 // PlanResource is a fingerprinted resource affected by a plan.
 type PlanResource struct {
 	Kind        string `json:"kind"`
+	Scope       string `json:"scope"`
 	Name        string `json:"name"`
 	Fingerprint string `json:"fingerprint"`
 }

@@ -27,6 +27,7 @@ const (
 const (
 	cancellationAvailableUI   = "Cancellation is available at this safe boundary."
 	cancellationUnavailableUI = "Cancellation is unavailable during this step; a request will be queued."
+	cancellationNoRouteUI     = "Cancellation is unavailable in this operation state."
 	cancellationQueuedUI      = "Cancellation queued; operation will stop at the next safe boundary."
 	cancellationCancelUI      = "Cancellation accepted; no mutation may have occurred."
 	cancellationRollbackUI    = "Cancellation accepted; rollback and independent verification are required."
@@ -49,7 +50,13 @@ type CancellationDecision struct {
 func (controller CancellationController) Pending() bool { return controller.queued }
 
 // UIState returns the stable operator-facing state for the current boundary.
-func (controller CancellationController) UIState(cancelSafe bool) string {
+func (controller CancellationController) UIState(current domain.OperationState, cancelSafe, mutationMayHaveOccurred bool) string {
+	target := cancellationTarget(mutationMayHaveOccurred)
+	if !current.Valid() || current.Terminal() ||
+		(cancelSafe && !CanTransition(current, target)) ||
+		(!cancelSafe && !cancellationRouteReachable(current, target)) {
+		return cancellationNoRouteUI
+	}
 	if controller.queued {
 		return cancellationQueuedUI
 	}
@@ -66,7 +73,8 @@ func (controller CancellationController) Request(current domain.OperationState, 
 	if !current.Valid() || current.Terminal() {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q cannot accept cancellation", ErrInvalidCancellation, current)
 	}
-	if !cancellationRouteExists(current) {
+	target := cancellationTarget(mutationMayHaveOccurred)
+	if !cancellationRouteReachable(current, target) {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q has no safe cancellation route", ErrInvalidCancellation, current)
 	}
 	if !cancelSafe {
@@ -85,6 +93,9 @@ func (controller CancellationController) AtBoundary(current domain.OperationStat
 	if !current.Valid() || current.Terminal() {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q cannot reach a cancellation boundary", ErrInvalidCancellation, current)
 	}
+	if !CanTransition(current, cancellationTarget(mutationMayHaveOccurred)) {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q has no safe cancellation route", ErrInvalidCancellation, current)
+	}
 	if !controller.queued {
 		return controller, CancellationDecision{Action: CancellationNone, UIState: cancellationAvailableUI}, nil
 	}
@@ -93,11 +104,10 @@ func (controller CancellationController) AtBoundary(current domain.OperationStat
 }
 
 func routeCancellation(controller CancellationController, current domain.OperationState, mutationMayHaveOccurred bool) (CancellationController, CancellationDecision, error) {
-	target := domain.OperationCancelled
+	target := cancellationTarget(mutationMayHaveOccurred)
 	action := CancellationCancel
 	uiState := cancellationCancelUI
 	if mutationMayHaveOccurred {
-		target = domain.OperationRollback
 		action = CancellationRollback
 		uiState = cancellationRollbackUI
 	}
@@ -108,6 +118,30 @@ func routeCancellation(controller CancellationController, current domain.Operati
 	return CancellationController{}, CancellationDecision{Action: action, Target: target, UIState: uiState}, nil
 }
 
-func cancellationRouteExists(current domain.OperationState) bool {
-	return CanTransition(current, domain.OperationCancelled) || CanTransition(current, domain.OperationRollback)
+func cancellationTarget(mutationMayHaveOccurred bool) domain.OperationState {
+	if mutationMayHaveOccurred {
+		return domain.OperationRollback
+	}
+
+	return domain.OperationCancelled
+}
+
+func cancellationRouteReachable(current, target domain.OperationState) bool {
+	visited := map[domain.OperationState]bool{current: true}
+	pending := []domain.OperationState{current}
+	for len(pending) != 0 {
+		state := pending[0]
+		pending = pending[1:]
+		if CanTransition(state, target) {
+			return true
+		}
+		for next := range transitions[state] {
+			if !next.Terminal() && !visited[next] {
+				visited[next] = true
+				pending = append(pending, next)
+			}
+		}
+	}
+
+	return false
 }

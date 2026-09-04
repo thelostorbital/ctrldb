@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,6 +84,68 @@ func TestJournalEntryDecodeRejectsOpenOrMalformedJSON(t *testing.T) {
 				t.Fatalf("DecodeJournalEntry() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestJournalEntryDecodeRejectsDuplicateKeysWithoutDisclosure(t *testing.T) {
+	t.Parallel()
+
+	step, err := workflow.EncodeJournalEntry(validStepEntry())
+	if err != nil {
+		t.Fatalf("EncodeJournalEntry(step) returned an error: %v", err)
+	}
+	pause, err := workflow.EncodeJournalEntry(validPausedEntry())
+	if err != nil {
+		t.Fatalf("EncodeJournalEntry(pause) returned an error: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		encoded    []byte
+		unique     string
+		duplicated string
+	}{
+		{
+			name:       "top level",
+			encoded:    step,
+			unique:     `"schema":"JournalEntryV1"`,
+			duplicated: `"schema":"JournalEntryV2","schema":"JournalEntryV1"`,
+		},
+		{
+			name:       "nested step",
+			encoded:    step,
+			unique:     `"attempt":1`,
+			duplicated: `"attempt":2,"attempt":1`,
+		},
+		{
+			name:       "nested pause",
+			encoded:    pause,
+			unique:     `"reapprovalRequired":true`,
+			duplicated: `"reapprovalRequired":false,"reapprovalRequired":true`,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			input := bytes.Replace(test.encoded, []byte(test.unique), []byte(test.duplicated), 1)
+			if bytes.Equal(input, test.encoded) {
+				t.Fatalf("test fixture did not contain %q", test.unique)
+			}
+			if _, err := workflow.DecodeJournalEntry(input); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+				t.Fatalf("DecodeJournalEntry() error = %v", err)
+			}
+		})
+	}
+
+	hostile := []byte("{\"\\u001b[31mSECRET_MARKER_HOSTILE\":false," +
+		"\"\\u001b[31mSECRET_MARKER_HOSTILE\":true}")
+	_, err = workflow.DecodeJournalEntry(hostile)
+	if !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry(hostile) error = %v", err)
+	}
+	if strings.Contains(err.Error(), "SECRET_MARKER_HOSTILE") || strings.ContainsRune(err.Error(), '\x1b') {
+		t.Fatalf("DecodeJournalEntry() error disclosed hostile key: %q", err)
 	}
 }
 

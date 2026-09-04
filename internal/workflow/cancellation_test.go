@@ -23,8 +23,8 @@ func TestCancellationQueuesUntilSafeBoundary_TEST_U_PLAN_05(t *testing.T) {
 	if !next.Pending() || decision.Action != workflow.CancellationQueued || decision.Target != "" {
 		t.Fatalf("unsafe cancellation decision = %#v, pending=%t", decision, next.Pending())
 	}
-	if decision.UIState != next.UIState(false) || !strings.Contains(decision.UIState, "queued") {
-		t.Fatalf("queued UI state mismatch: %q / %q", decision.UIState, next.UIState(false))
+	if decision.UIState != next.UIState(domain.OperationExecute, false, true) || !strings.Contains(decision.UIState, "queued") {
+		t.Fatalf("queued UI state mismatch: %q / %q", decision.UIState, next.UIState(domain.OperationExecute, false, true))
 	}
 
 	cleared, decision, err := next.AtBoundary(domain.OperationExecute, true)
@@ -64,5 +64,17 @@ func TestCancellationFailsClosedOnUnsafeRoutes(t *testing.T) {
 	}
 	if _, _, err := controller.Request(domain.OperationDocument, false, false); !errors.Is(err, workflow.ErrInvalidCancellation) {
 		t.Fatalf("unreachable queued cancellation error = %v, want ErrInvalidCancellation", err)
+	}
+	if _, _, err := controller.AtBoundary(domain.OperationDocument, false); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("unreachable boundary cancellation error = %v, want ErrInvalidCancellation", err)
+	}
+	if state := controller.UIState(domain.OperationDocument, true, false); !strings.Contains(state, "unavailable") {
+		t.Fatalf("DOCUMENT UI state = %q, want unavailable", state)
+	}
+	if _, _, err := controller.Request(domain.OperationVerify, false, false); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("VERIFY pre-mutation queued cancellation error = %v, want ErrInvalidCancellation", err)
+	}
+	if state := controller.UIState(domain.OperationVerify, false, false); !strings.Contains(state, "unavailable") {
+		t.Fatalf("VERIFY pre-mutation UI state = %q, want unavailable", state)
 	}
 }

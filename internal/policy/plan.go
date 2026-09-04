@@ -31,13 +31,18 @@ var (
 )
 
 var (
-	planIDPattern      = regexp.MustCompile(`^plan-[0-9a-f]{16}$`)
-	planHashPattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	workflowIDPattern  = regexp.MustCompile(`^WF-[A-Z0-9]+-[0-9]{2}$`)
-	environmentPattern = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	permissionPattern  = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
-	datePattern        = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
-	zeroPlanHash       = strings.Repeat("0", sha256.Size*2)
+	planIDPattern        = regexp.MustCompile(`^plan-[0-9a-f]{16}$`)
+	planHashPattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	workflowIDPattern    = regexp.MustCompile(`^WF-[A-Z0-9]+-[0-9]{2}$`)
+	projectIDPattern     = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
+	environmentPattern   = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	identifierPattern    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+	resourceScopePattern = regexp.MustCompile(
+		`^projects/([a-z][a-z0-9-]{4,28}[a-z0-9])/(?:global|regions/[a-z][a-z0-9-]{0,62}|zones/[a-z][a-z0-9-]{0,62}|locations/[a-z][a-z0-9-]{0,62})$`,
+	)
+	permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
+	datePattern       = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
+	zeroPlanHash      = strings.Repeat("0", sha256.Size*2)
 )
 
 // SealPlan structurally validates plan and returns a copy carrying the digest
@@ -163,7 +168,7 @@ func DecodePlan(encoded []byte) (domain.Plan, error) {
 
 func rejectDuplicateJSONKeys(encoded []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	if err := consumeUniqueJSONValue(decoder, "plan"); err != nil {
+	if err := consumeUniqueJSONValue(decoder); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
@@ -173,7 +178,7 @@ func rejectDuplicateJSONKeys(encoded []byte) error {
 	return nil
 }
 
-func consumeUniqueJSONValue(decoder *json.Decoder, path string) error {
+func consumeUniqueJSONValue(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return invalid("decode", err.Error())
@@ -193,13 +198,13 @@ func consumeUniqueJSONValue(decoder *json.Decoder, path string) error {
 			}
 			key, ok := keyToken.(string)
 			if !ok {
-				return invalid(path, "contains a non-string object key")
+				return invalid("decode", "object key must be a string")
 			}
 			if _, exists := seen[key]; exists {
-				return invalid(path+"."+key, "is duplicated")
+				return invalid("decode", "object contains a duplicate key")
 			}
 			seen[key] = struct{}{}
-			if err := consumeUniqueJSONValue(decoder, path+"."+key); err != nil {
+			if err := consumeUniqueJSONValue(decoder); err != nil {
 				return err
 			}
 		}
@@ -207,8 +212,8 @@ func consumeUniqueJSONValue(decoder *json.Decoder, path string) error {
 			return invalid("decode", err.Error())
 		}
 	case '[':
-		for index := 0; decoder.More(); index++ {
-			if err := consumeUniqueJSONValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+		for decoder.More() {
+			if err := consumeUniqueJSONValue(decoder); err != nil {
 				return err
 			}
 		}
@@ -216,7 +221,7 @@ func consumeUniqueJSONValue(decoder *json.Decoder, path string) error {
 			return invalid("decode", err.Error())
 		}
 	default:
-		return invalid(path, "contains an unexpected delimiter")
+		return invalid("decode", "contains an unexpected delimiter")
 	}
 
 	return nil
@@ -228,7 +233,7 @@ func validateRequiredPlanJSON(encoded []byte) error {
 		return invalid("decode", err.Error())
 	}
 	if err := requireJSONFields(plan, "plan",
-		"planId", "planHash", "workflowId", "environment", "principal", "createdAt",
+		"planId", "planHash", "workflowId", "projectId", "environment", "environmentClass", "principal", "createdAt",
 		"approvalClass", "expiresAt", "coolingOffSeconds", "identity", "policyHash",
 		"stepUpRequired", "resources", "preconditions", "permissions", "steps", "cost",
 		"downtime", "exposure", "protection", "rollback", "verification",
@@ -244,7 +249,7 @@ func validateRequiredPlanJSON(encoded []byte) error {
 	if err := requireNestedJSONFields(plan["policyHash"], "policyHash", "match"); err != nil {
 		return err
 	}
-	if err := requireJSONArrayFields(plan["resources"], "resources", "kind", "name", "fingerprint"); err != nil {
+	if err := requireJSONArrayFields(plan["resources"], "resources", "kind", "scope", "name", "fingerprint"); err != nil {
 		return err
 	}
 	if err := requireJSONArrayFields(plan["preconditions"], "preconditions", "id", "ok", "detail"); err != nil {
@@ -259,7 +264,7 @@ func validateRequiredPlanJSON(encoded []byte) error {
 	}
 	for index, permission := range permissions {
 		if err := requireNestedJSONFields(permission["resource"], fmt.Sprintf("permissions[%d].resource", index),
-			"kind", "name", "fingerprint",
+			"kind", "scope", "name", "fingerprint",
 		); err != nil {
 			return err
 		}
@@ -336,8 +341,14 @@ func validatePlanStructure(plan domain.Plan) error {
 	if !workflowIDPattern.MatchString(plan.WorkflowID) {
 		return invalid("workflowId", "must match WF-<GROUP>-<NN>")
 	}
+	if !projectIDPattern.MatchString(plan.ProjectID) {
+		return invalid("projectId", "must be a canonical project identifier")
+	}
 	if !environmentPattern.MatchString(plan.Environment) {
 		return invalid("environment", "must be a canonical environment name")
+	}
+	if !plan.EnvironmentClass.Valid() {
+		return invalid("environmentClass", "unknown value")
 	}
 	if err := validatePrincipal(plan.Principal); err != nil {
 		return err
@@ -366,15 +377,17 @@ func validatePlanStructure(plan domain.Plan) error {
 	if err := validatePolicyHash(plan.PolicyHash); err != nil {
 		return err
 	}
-	if plan.StepUpRequired && plan.ApprovalClass < domain.ApprovalDestructive {
-		return invalid("stepUpRequired", "requires a destructive approval class")
+	wantStepUp := plan.EnvironmentClass == domain.EnvironmentProduction &&
+		plan.ApprovalClass == domain.ApprovalDataDestructive
+	if plan.StepUpRequired != wantStepUp {
+		return invalid("stepUpRequired", "must match the environment and data-destructive approval class")
 	}
 	if plan.Intent != nil {
 		if err := validateIntent(*plan.Intent); err != nil {
 			return err
 		}
 	}
-	if err := validateResources(plan.Resources); err != nil {
+	if err := validateResources(plan.Resources, plan.ProjectID); err != nil {
 		return err
 	}
 	if plan.ApprovalClass != domain.ApprovalRead && len(plan.Resources) == 0 {
@@ -471,15 +484,20 @@ func validateIntent(intent domain.PlanIntent) error {
 	return nil
 }
 
-func validateResources(resources []domain.PlanResource) error {
+func validateResources(resources []domain.PlanResource, projectID string) error {
 	seen := make(map[string]struct{}, len(resources))
 	for index, resource := range resources {
 		path := fmt.Sprintf("resources[%d]", index)
-		if resource.Kind == "" || resource.Name == "" || resource.Fingerprint == "" {
-			return invalid(path, "kind, name, and fingerprint must not be empty")
+		if !identifierPattern.MatchString(resource.Kind) || !identifierPattern.MatchString(resource.Name) ||
+			resource.Fingerprint == "" {
+			return invalid(path, "kind and name must be canonical identifiers and fingerprint must not be empty")
+		}
+		scopeParts := resourceScopePattern.FindStringSubmatch(resource.Scope)
+		if len(scopeParts) != 2 || scopeParts[1] != projectID {
+			return invalid(path+".scope", "must be a canonical scope in the plan project")
 		}
 
-		key := resource.Kind + "\x00" + resource.Name
+		key := resource.Scope + "\x00" + resource.Kind + "\x00" + resource.Name
 		if _, exists := seen[key]; exists {
 			return invalid(path, "duplicate kind and name")
 		}
@@ -493,8 +511,8 @@ func validatePreconditions(preconditions []domain.PlanPrecondition) error {
 	seen := make(map[string]struct{}, len(preconditions))
 	for index, precondition := range preconditions {
 		path := fmt.Sprintf("preconditions[%d]", index)
-		if precondition.ID == "" {
-			return invalid(path+".id", "must not be empty")
+		if !identifierPattern.MatchString(precondition.ID) {
+			return invalid(path+".id", "must be a canonical identifier")
 		}
 		if _, exists := seen[precondition.ID]; exists {
 			return invalid(path+".id", "duplicate value")
@@ -513,16 +531,16 @@ func validateSteps(steps []domain.PlanStep, pointOfNoReturn string) error {
 	seen := make(map[string]struct{}, len(steps))
 	for index, step := range steps {
 		path := fmt.Sprintf("steps[%d]", index)
-		if step.ID == "" {
-			return invalid(path+".id", "must not be empty")
+		if !identifierPattern.MatchString(step.ID) {
+			return invalid(path+".id", "must be a canonical identifier")
 		}
 		if _, exists := seen[step.ID]; exists {
 			return invalid(path+".id", "duplicate value")
 		}
 		seen[step.ID] = struct{}{}
 
-		if step.Executor == "" {
-			return invalid(path+".executor", "must not be empty")
+		if !identifierPattern.MatchString(step.Executor) {
+			return invalid(path+".executor", "must be a canonical identifier")
 		}
 		if !step.ExecutingIdentity.Valid() {
 			return invalid(path+".executingIdentity", "unknown value")
@@ -625,7 +643,7 @@ func validatePermissions(
 }
 
 func planResourceKey(resource domain.PlanResource) string {
-	return resource.Kind + "\x00" + resource.Name + "\x00" + resource.Fingerprint
+	return resource.Scope + "\x00" + resource.Kind + "\x00" + resource.Name + "\x00" + resource.Fingerprint
 }
 
 func validateCost(cost domain.PlanCost) error {

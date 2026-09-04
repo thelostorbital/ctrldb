@@ -115,6 +115,10 @@ func CanTransition(from, to domain.OperationState) bool {
 
 // Transition advances the machine if the transition is allowed.
 func (machine *Machine) Transition(next domain.OperationState) error {
+	return machine.transition(next, false)
+}
+
+func (machine *Machine) transition(next domain.OperationState, cancellationAuthorized bool) error {
 	if machine == nil {
 		return fmt.Errorf("%w: nil machine", ErrInvalidTransition)
 	}
@@ -124,8 +128,15 @@ func (machine *Machine) Transition(next domain.OperationState) error {
 	if !CanTransition(machine.state, next) {
 		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, machine.state, next)
 	}
+	if next == domain.OperationCancelled && cancellationAuthorizationRequired(machine.state) && !cancellationAuthorized {
+		return fmt.Errorf("%w: cancellation decision required", ErrInvalidTransition)
+	}
 
 	machine.state = next
 
 	return nil
+}
+
+func cancellationAuthorizationRequired(state domain.OperationState) bool {
+	return state == domain.OperationProtect || state == domain.OperationExecute || state == domain.OperationPaused
 }

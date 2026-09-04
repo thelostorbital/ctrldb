@@ -247,8 +247,8 @@ func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence, cont
 		evidence.Principal != plan.Principal {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanBinding, ID: "execution-evidence"})
 	}
-	var contractRequiresApproval bool
-	blockers, contractRequiresApproval = validateExecutionContract(plan, contract, blockers)
+	var contractRequiresApproval, contractRequiresStepUp bool
+	blockers, contractRequiresApproval, contractRequiresStepUp = validateExecutionContract(plan, contract, blockers)
 
 	requireApproval := contractRequiresApproval || plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil
 	if requireApproval {
@@ -264,6 +264,11 @@ func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence, cont
 	blockers = validatePreconditionEvidence(plan, evidence, blockers)
 	blockers = validateResourceEvidence(plan, evidence, blockers)
 	blockers = validatePermissionEvidence(plan, evidence, blockers)
+	wantStepUp := plan.EnvironmentClass == domain.EnvironmentProduction &&
+		(plan.ApprovalClass == domain.ApprovalDataDestructive || contractRequiresStepUp)
+	if plan.StepUpRequired != wantStepUp {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "workflow-requirement"})
+	}
 	blockers = validateStepUpEvidence(plan, evidence, blockers)
 
 	if len(blockers) != 0 {
@@ -277,19 +282,21 @@ func validateExecutionContract(
 	plan domain.Plan,
 	contract domain.ExecutionContract,
 	blockers []PlanBlocker,
-) ([]PlanBlocker, bool) {
+) ([]PlanBlocker, bool, bool) {
 	contractSteps := contract.Steps()
 	if contract.WorkflowID() != plan.WorkflowID || len(contractSteps) != len(plan.Steps) {
-		return append(blockers, PlanBlocker{Kind: BlockerContract, ID: "workflow-or-step-set"}), true
+		return append(blockers, PlanBlocker{Kind: BlockerContract, ID: "workflow-or-step-set"}), true, true
 	}
 
 	minimumApproval := domain.ApprovalRead
 	mutationCapable := false
+	requiresStepUp := false
 	for _, step := range contractSteps {
 		if step.MinimumApproval > minimumApproval {
 			minimumApproval = step.MinimumApproval
 		}
 		mutationCapable = mutationCapable || step.Effect == domain.StepEffectMutation
+		requiresStepUp = requiresStepUp || step.RequiresStepUp
 	}
 
 	expectedPermissions := make(map[string]struct{})
@@ -332,7 +339,7 @@ func validateExecutionContract(
 		}
 	}
 
-	return blockers, minimumApproval != domain.ApprovalRead || mutationCapable
+	return blockers, minimumApproval != domain.ApprovalRead || mutationCapable, requiresStepUp
 }
 
 func planStepMatchesContract(step domain.PlanStep, expected domain.ExecutionStepContract) bool {

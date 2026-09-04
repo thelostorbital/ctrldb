@@ -566,6 +566,15 @@ func TestPlanAllowsScheduledDestructiveStepUp(t *testing.T) {
 	if _, err := policy.SealPlan(nonProduction); err != nil {
 		t.Fatalf("SealPlan() rejected non-production plan without step-up: %v", err)
 	}
+
+	for _, required := range []bool{false, true} {
+		productionAP4 := validPlan()
+		productionAP4.ApprovalClass = domain.ApprovalDestructive
+		productionAP4.StepUpRequired = required
+		if _, err := policy.SealPlan(productionAP4); err != nil {
+			t.Fatalf("SealPlan() rejected production AP-4 stepUpRequired=%t before contract validation: %v", required, err)
+		}
+	}
 }
 
 func validPlan() domain.Plan {

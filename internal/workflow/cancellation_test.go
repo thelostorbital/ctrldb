@@ -57,6 +57,50 @@ func TestCancellationRoutesPreMutationDirectlyToCancelled(t *testing.T) {
 	}
 }
 
+func TestMachineAppliesOnlyStateBoundCancellationDecisions(t *testing.T) {
+	t.Parallel()
+
+	var controller workflow.CancellationController
+	machine := machineAt(t, domain.OperationExecute)
+	_, cancelDecision, err := controller.Request(
+		validCancellationRequest(domain.OperationExecute, domain.MutationNotOccurred), true,
+	)
+	if err != nil {
+		t.Fatalf("Request() returned an error: %v", err)
+	}
+	if err := machine.ApplyCancellation(cancelDecision); err != nil {
+		t.Fatalf("ApplyCancellation() returned an error: %v", err)
+	}
+	if machine.State() != domain.OperationCancelled {
+		t.Fatalf("machine state = %s, want CANCELLED", machine.State())
+	}
+
+	machine = machineAt(t, domain.OperationExecute)
+	_, rollbackDecision, err := controller.Request(
+		validCancellationRequest(domain.OperationExecute, domain.MutationUnknown), true,
+	)
+	if err != nil {
+		t.Fatalf("Request(rollback) returned an error: %v", err)
+	}
+	if err := machine.ApplyCancellation(rollbackDecision); err != nil {
+		t.Fatalf("ApplyCancellation(rollback) returned an error: %v", err)
+	}
+	if machine.State() != domain.OperationRollback {
+		t.Fatalf("machine state = %s, want ROLLBACK", machine.State())
+	}
+
+	forged := workflow.CancellationDecision{
+		Action: workflow.CancellationCancel,
+		Target: domain.OperationCancelled,
+	}
+	if err := machineAt(t, domain.OperationExecute).ApplyCancellation(forged); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("forged decision error = %v, want ErrInvalidCancellation", err)
+	}
+	if err := machineAt(t, domain.OperationProtect).ApplyCancellation(cancelDecision); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("replayed decision error = %v, want ErrInvalidCancellation", err)
+	}
+}
+
 func TestCancellationFailsClosedOnUnsafeRoutes(t *testing.T) {
 	t.Parallel()
 
@@ -178,6 +222,36 @@ func TestCancellationJournalBindsInFlightStepAndEscalatesNewMutation(t *testing.
 	wrongStep = append(wrongStep, wrong)
 	if err := workflow.ValidateJournal(wrongStep); !errors.Is(err, workflow.ErrInvalidJournalStream) {
 		t.Fatalf("mismatched in-flight step error = %v, want ErrInvalidJournalStream", err)
+	}
+}
+
+func TestCancellationJournalRequiresInFlightStepStartAtOrBeforeRequest(t *testing.T) {
+	t.Parallel()
+
+	request := validCancellationRequest(domain.OperationExecute, domain.MutationNotOccurred)
+	request.CurrentStepID = "check-health"
+	var controller workflow.CancellationController
+	_, decision, err := controller.Request(request, false)
+	if err != nil {
+		t.Fatalf("Request() returned an error: %v", err)
+	}
+	makeEntries := func(startedAt time.Time) []domain.JournalEntry {
+		entries := append(validJournal()[:5], *decision.JournalEntry)
+		step := validStepEntry()
+		step.Sequence = 7
+		step.Step.StartedAt = startedAt
+		endedAt := request.RequestedAt.Add(time.Second)
+		step.Step.EndedAt = &endedAt
+		step.RecordedAt = endedAt
+
+		return append(entries, step)
+	}
+
+	if err := workflow.ValidateJournal(makeEntries(request.RequestedAt)); err != nil {
+		t.Fatalf("exact request-time step start returned an error: %v", err)
+	}
+	if err := workflow.ValidateJournal(makeEntries(request.RequestedAt.Add(time.Nanosecond))); !errors.Is(err, workflow.ErrInvalidJournalStream) {
+		t.Fatalf("post-request step start error = %v, want ErrInvalidJournalStream", err)
 	}
 }
 

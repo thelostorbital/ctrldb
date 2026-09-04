@@ -135,6 +135,7 @@ type ExecutionStepContract struct {
 	MinimumApproval     ApprovalClass
 	TargetKinds         []string
 	RequiredPermissions []string
+	RequiresStepUp      bool
 	Idempotent          bool
 	Retry               RetryPolicy
 	CancelSafe          bool
@@ -166,6 +167,9 @@ func NewExecutionContract(workflowID string, steps []ExecutionStepContract) (Exe
 		}
 		if step.Effect == StepEffectMutation && step.MinimumApproval == ApprovalRead {
 			return ExecutionContract{}, fmt.Errorf("%w: mutation step has read approval", ErrInvalidExecutionContract)
+		}
+		if step.RequiresStepUp && (step.Effect != StepEffectMutation || step.MinimumApproval < ApprovalDestructive) {
+			return ExecutionContract{}, fmt.Errorf("%w: step-up requires an AP-4 or stronger mutation step", ErrInvalidExecutionContract)
 		}
 		if _, duplicate := seen[step.ID]; duplicate {
 			return ExecutionContract{}, fmt.Errorf("%w: duplicate step", ErrInvalidExecutionContract)

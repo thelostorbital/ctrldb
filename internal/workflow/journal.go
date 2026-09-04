@@ -290,6 +290,7 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 	var pendingCancellation domain.OperationState
 	var pendingCurrentStepID string
 	var pendingStepStartBoundary time.Time
+	var pendingRequestedAt time.Time
 
 	for index, entry := range entries {
 		if err := ValidateJournalEntry(entry); err != nil {
@@ -329,6 +330,7 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 			pendingCancellation = entry.Cancellation.RequiredRoute
 			pendingCurrentStepID = entry.Cancellation.CurrentStepID
 			pendingStepStartBoundary = priorTime
+			pendingRequestedAt = entry.Cancellation.RequestedAt
 			if !cancellationRouteReachable(machine.State(), pendingCancellation) {
 				return journalStreamError(index+1, "cancellation request has no reachable route")
 			}
@@ -361,18 +363,26 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 			if entry.OperationState == domain.OperationCancelled && mutationMayHaveOccurred {
 				return journalStreamError(index+1, "CANCELLED after possible mutation must route through ROLLBACK")
 			}
-			if err := machine.Transition(entry.OperationState); err != nil {
-				return fmt.Errorf("%w: entry %d: %v", ErrInvalidJournalStream, index+1, err)
+			var transitionErr error
+			if entry.OperationState == domain.OperationCancelled {
+				transitionErr = machine.transition(entry.OperationState, true)
+			} else {
+				transitionErr = machine.Transition(entry.OperationState)
+			}
+			if transitionErr != nil {
+				return fmt.Errorf("%w: entry %d: %v", ErrInvalidJournalStream, index+1, transitionErr)
 			}
 			if entry.OperationState == pendingCancellation {
 				pendingCancellation = ""
 				pendingCurrentStepID = ""
 				pendingStepStartBoundary = time.Time{}
+				pendingRequestedAt = time.Time{}
 			} else if pendingCancellation != "" && !cancellationRouteReachable(machine.State(), pendingCancellation) {
 				return journalStreamError(index+1, "transition made the pending cancellation unreachable")
 			} else if pendingCancellation != "" {
 				pendingCurrentStepID = ""
 				pendingStepStartBoundary = time.Time{}
+				pendingRequestedAt = time.Time{}
 			}
 			if entry.Pause != nil {
 				if mutationMayHaveOccurred && !entry.Pause.MutationOccurred {
@@ -406,6 +416,9 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 			if pendingCurrentStepID != "" && entry.Step.ID != pendingCurrentStepID {
 				return journalStreamError(index+1, "cancellation request does not match the in-flight step")
 			}
+			if pendingCurrentStepID != "" && entry.Step.StartedAt.After(pendingRequestedAt) {
+				return journalStreamError(index+1, "matched step started after the cancellation request")
+			}
 		}
 		stepStartBoundary := priorTime
 		if pendingCurrentStepID != "" {
@@ -413,6 +426,7 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 		}
 		pendingCurrentStepID = ""
 		pendingStepStartBoundary = time.Time{}
+		pendingRequestedAt = time.Time{}
 		if entry.Step.StartedAt.Before(stepStartBoundary) {
 			return journalStreamError(index+1, "step started before the current journal boundary")
 		}
@@ -446,9 +460,10 @@ func JournalObjectName(entry domain.JournalEntry) (string, error) {
 	}
 
 	entryID := "state-" + strings.ToLower(strings.ReplaceAll(string(entry.OperationState), "_", "-"))
-	if entry.Kind == domain.JournalEntryStep {
+	switch entry.Kind {
+	case domain.JournalEntryStep:
 		entryID = entry.Step.ID
-	} else if entry.Kind == domain.JournalEntryCancellationRequest {
+	case domain.JournalEntryCancellationRequest:
 		entryID = "cancellation-request"
 	}
 

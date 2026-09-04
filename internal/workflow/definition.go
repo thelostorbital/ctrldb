@@ -28,6 +28,7 @@ type StepDefinition struct {
 	MinimumApproval     domain.ApprovalClass
 	TargetKinds         []string
 	RequiredPermissions []string
+	RequiresStepUp      bool
 	Idempotent          bool
 	Retry               domain.RetryPolicy
 	CancelSafe          bool
@@ -94,6 +95,7 @@ func NewDefinition(workflowID string, steps []StepDefinition) (Definition, error
 			MinimumApproval:     step.MinimumApproval,
 			TargetKinds:         step.TargetKinds,
 			RequiredPermissions: step.RequiredPermissions,
+			RequiresStepUp:      step.RequiresStepUp,
 			Idempotent:          step.Idempotent,
 			Retry:               step.Retry,
 			CancelSafe:          step.CancelSafe,

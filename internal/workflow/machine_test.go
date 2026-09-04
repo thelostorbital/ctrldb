@@ -85,7 +85,7 @@ func TestMachineFailureBranches(t *testing.T) {
 		},
 		{
 			name:  "cancel before mutation",
-			start: domain.OperationExecute,
+			start: domain.OperationLock,
 			path:  []domain.OperationState{domain.OperationCancelled},
 		},
 		{
@@ -107,6 +107,24 @@ func TestMachineFailureBranches(t *testing.T) {
 			machine := machineAt(t, test.start)
 			transitionThrough(t, machine, test.path...)
 		})
+	}
+}
+
+func TestMachineRequiresCancellationDecisionForMutationCapableStates(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []domain.OperationState{
+		domain.OperationProtect,
+		domain.OperationExecute,
+		domain.OperationPaused,
+	} {
+		machine := machineAt(t, state)
+		if err := machine.Transition(domain.OperationCancelled); !errors.Is(err, workflow.ErrInvalidTransition) {
+			t.Fatalf("Transition(%s -> CANCELLED) error = %v, want ErrInvalidTransition", state, err)
+		}
+		if machine.State() != state {
+			t.Fatalf("state changed after cancellation bypass from %s: %s", state, machine.State())
+		}
 	}
 }
 

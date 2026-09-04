@@ -123,6 +123,60 @@ func TestExecutionGateRequiresTrustedRiskAndExactPermissions(t *testing.T) {
 	}
 }
 
+func TestExecutionGateDerivesProductionAP4StepUpFromTrustedContract(t *testing.T) {
+	t.Parallel()
+
+	requiredPlan, requiredContract := ap4ExecutionPlan(t, "delete-disk", "disk", "compute.disks.delete", true)
+	checkedAt := requiredPlan.CreatedAt.Add(10 * time.Minute)
+	if err := policy.ValidatePlanForExecution(
+		requiredPlan, validExecutionEvidence(requiredPlan, checkedAt), requiredContract,
+	); err != nil {
+		t.Fatalf("production AP-4 disk deletion with step-up returned an error: %v", err)
+	}
+
+	missingFlag := requiredPlan
+	missingFlag.StepUpRequired = false
+	missingFlag, err := policy.SealPlan(missingFlag)
+	if err != nil {
+		t.Fatalf("SealPlan() should defer the production AP-4 decision to the trusted contract: %v", err)
+	}
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		missingFlag, validExecutionEvidence(missingFlag, checkedAt), requiredContract,
+	), policy.BlockerStepUp)
+
+	ordinaryPlan, ordinaryContract := ap4ExecutionPlan(
+		t, "restart-instance", "instance", "compute.instances.reset", false,
+	)
+	if err := policy.ValidatePlanForExecution(
+		ordinaryPlan, validExecutionEvidence(ordinaryPlan, checkedAt), ordinaryContract,
+	); err != nil {
+		t.Fatalf("ordinary production AP-4 plan without step-up returned an error: %v", err)
+	}
+	unexpectedFlag := ordinaryPlan
+	unexpectedFlag.StepUpRequired = true
+	unexpectedFlag, err = policy.SealPlan(unexpectedFlag)
+	if err != nil {
+		t.Fatalf("SealPlan() should defer the ordinary production AP-4 decision to the trusted contract: %v", err)
+	}
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		unexpectedFlag, validExecutionEvidence(unexpectedFlag, checkedAt), ordinaryContract,
+	), policy.BlockerStepUp)
+
+	nonProduction := requiredPlan
+	nonProduction.Environment = "staging"
+	nonProduction.EnvironmentClass = domain.EnvironmentStaging
+	nonProduction.StepUpRequired = false
+	nonProduction, err = policy.SealPlan(nonProduction)
+	if err != nil {
+		t.Fatalf("SealPlan(non-production) returned an error: %v", err)
+	}
+	if err := policy.ValidatePlanForExecution(
+		nonProduction, validExecutionEvidence(nonProduction, checkedAt), requiredContract,
+	); err != nil {
+		t.Fatalf("non-production trusted step-up plan returned an error: %v", err)
+	}
+}
+
 func TestExecutionGateRejectsMissingStaleOrMismatchedEvidence(t *testing.T) {
 	t.Parallel()
 
@@ -504,6 +558,54 @@ func validExecutionContract(t *testing.T) domain.ExecutionContract {
 	}
 
 	return definition.ExecutionContract()
+}
+
+func ap4ExecutionPlan(
+	t *testing.T,
+	stepID, kind, permission string,
+	requiresStepUp bool,
+) (domain.Plan, domain.ExecutionContract) {
+	t.Helper()
+	plan := validPlan()
+	plan.ApprovalClass = domain.ApprovalDestructive
+	plan.StepUpRequired = requiresStepUp
+	plan.Resources[0].Kind = kind
+	plan.Resources[0].Name = "target-resource"
+	plan.Steps[0].ID = stepID
+	plan.Steps[0].Executor = "compute-api"
+	plan.Steps[0].CommandRedacted = redact.Sanitize("execute reviewed resource operation")
+	plan.Steps[0].Targets[0] = plan.Resources[0]
+	plan.Permissions[0].StepID = stepID
+	plan.Permissions[0].Permission = permission
+	plan.Permissions[0].Resource = plan.Resources[0]
+	plan.PointOfNoReturn = stepID
+	sealed, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+	definition, err := workflow.NewDefinition(plan.WorkflowID, []workflow.StepDefinition{
+		{
+			ID:                  stepID,
+			Executor:            plan.Steps[0].Executor,
+			ExecutingIdentity:   plan.Steps[0].ExecutingIdentity,
+			Effect:              domain.StepEffectMutation,
+			MinimumApproval:     domain.ApprovalDestructive,
+			TargetKinds:         []string{kind},
+			RequiredPermissions: []string{permission},
+			RequiresStepUp:      requiresStepUp,
+			Idempotent:          plan.Steps[0].Idempotent,
+			Retry:               plan.Steps[0].Retry,
+			CancelSafe:          plan.Steps[0].CancelSafe,
+			TimeoutSeconds:      plan.Steps[0].TimeoutSeconds,
+			SuccessCondition:    plan.Steps[0].SuccessCondition,
+			FailureBehavior:     plan.Steps[0].FailureBehavior,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDefinition() returned an error: %v", err)
+	}
+
+	return sealed, definition.ExecutionContract()
 }
 
 func expectBlockedKind(t *testing.T, err error, kind policy.PlanBlockerKind) {

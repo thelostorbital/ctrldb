@@ -406,10 +406,16 @@ func validatePlanStructure(plan domain.Plan) error {
 	if err := validatePolicyHash(plan.PolicyHash); err != nil {
 		return err
 	}
-	wantStepUp := plan.EnvironmentClass == domain.EnvironmentProduction &&
-		plan.ApprovalClass == domain.ApprovalDataDestructive
-	if plan.StepUpRequired != wantStepUp {
-		return invalid("stepUpRequired", "must match the environment and data-destructive approval class")
+	if plan.EnvironmentClass != domain.EnvironmentProduction && plan.StepUpRequired {
+		return invalid("stepUpRequired", "must be false outside production")
+	}
+	if plan.EnvironmentClass == domain.EnvironmentProduction {
+		if plan.ApprovalClass == domain.ApprovalDataDestructive && !plan.StepUpRequired {
+			return invalid("stepUpRequired", "must be true for production data-destructive plans")
+		}
+		if plan.ApprovalClass < domain.ApprovalDestructive && plan.StepUpRequired {
+			return invalid("stepUpRequired", "requires a production AP-4 or stronger plan")
+		}
 	}
 	if plan.Intent != nil {
 		if err := validateIntent(*plan.Intent); err != nil {

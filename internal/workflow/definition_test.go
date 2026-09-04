@@ -26,6 +26,15 @@ func TestWorkflowDefinitionsRequireBoundedExecutionContracts_TEST_U_PLAN_04(t *t
 		{name: "mutation with read approval", mutate: func(step *workflow.StepDefinition) { step.MinimumApproval = domain.ApprovalRead }},
 		{name: "missing target kinds", mutate: func(step *workflow.StepDefinition) { step.TargetKinds = nil }},
 		{name: "missing permissions", mutate: func(step *workflow.StepDefinition) { step.RequiredPermissions = nil }},
+		{name: "step-up below AP-4", mutate: func(step *workflow.StepDefinition) {
+			step.MinimumApproval = domain.ApprovalProtected
+			step.RequiresStepUp = true
+		}},
+		{name: "read step-up", mutate: func(step *workflow.StepDefinition) {
+			step.Effect = domain.StepEffectRead
+			step.MinimumApproval = domain.ApprovalDestructive
+			step.RequiresStepUp = true
+		}},
 		{name: "zero attempts", mutate: func(step *workflow.StepDefinition) { step.Retry.MaxAttempts = 0 }},
 		{name: "unbounded attempts", mutate: func(step *workflow.StepDefinition) { step.Retry.MaxAttempts = domain.MaxStepAttempts + 1 }},
 		{name: "zero retry backoff", mutate: func(step *workflow.StepDefinition) { step.Retry.InitialBackoffSeconds = 0 }},

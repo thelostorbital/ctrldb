@@ -55,10 +55,16 @@ type CancellationRequest struct {
 
 // CancellationDecision tells the engine whether to queue or transition.
 type CancellationDecision struct {
-	Action       CancellationAction
-	Target       domain.OperationState
-	JournalEntry *domain.JournalEntry
-	UIState      string
+	Action        CancellationAction
+	Target        domain.OperationState
+	JournalEntry  *domain.JournalEntry
+	UIState       string
+	authorization *cancellationAuthorization
+}
+
+type cancellationAuthorization struct {
+	from   domain.OperationState
+	target domain.OperationState
 }
 
 // Pending reports whether a cancellation waits for a safe boundary.
@@ -87,7 +93,6 @@ func (controller CancellationController) UIState(current domain.OperationState, 
 
 // Request returns a durable record to persist during unsafe in-flight work or
 // immediately routes a safe boundary according to observed mutation state.
-
 func (controller CancellationController) Request(request CancellationRequest, cancelSafe bool) (CancellationController, CancellationDecision, error) {
 	current := request.OperationState
 	if controller.queued {
@@ -154,6 +159,18 @@ func (controller CancellationController) AtBoundary(current domain.OperationStat
 	return routeCancellationTo(controller, current, target)
 }
 
+// ApplyCancellation advances machine only for a decision produced for its
+// exact current state by CancellationController.
+func (machine *Machine) ApplyCancellation(decision CancellationDecision) error {
+	if machine == nil || decision.authorization == nil || decision.authorization.from != machine.State() ||
+		decision.authorization.target != decision.Target ||
+		(decision.Action != CancellationCancel && decision.Action != CancellationRollback) {
+		return fmt.Errorf("%w: missing or mismatched authorization", ErrInvalidCancellation)
+	}
+
+	return machine.transition(decision.Target, true)
+}
+
 func routeCancellation(controller CancellationController, current domain.OperationState, mutationMayHaveOccurred bool) (CancellationController, CancellationDecision, error) {
 	return routeCancellationTo(controller, current, cancellationTarget(mutationMayHaveOccurred))
 }
@@ -169,7 +186,12 @@ func routeCancellationTo(controller CancellationController, current, target doma
 		return controller, CancellationDecision{}, fmt.Errorf("%w: %s cannot route to %s", ErrInvalidCancellation, current, target)
 	}
 
-	return CancellationController{}, CancellationDecision{Action: action, Target: target, UIState: uiState}, nil
+	return CancellationController{}, CancellationDecision{
+		Action:        action,
+		Target:        target,
+		UIState:       uiState,
+		authorization: &cancellationAuthorization{from: current, target: target},
+	}, nil
 }
 
 // RestoreCancellationController validates a complete journal and reconstructs

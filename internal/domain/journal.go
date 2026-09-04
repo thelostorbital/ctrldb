@@ -25,13 +25,14 @@ var (
 type JournalEntryKind string
 
 const (
-	JournalEntryTransition JournalEntryKind = "transition"
-	JournalEntryStep       JournalEntryKind = "step"
+	JournalEntryTransition          JournalEntryKind = "transition"
+	JournalEntryStep                JournalEntryKind = "step"
+	JournalEntryCancellationRequest JournalEntryKind = "cancellation-request"
 )
 
 // Valid reports whether kind is part of the closed journal schema.
 func (kind JournalEntryKind) Valid() bool {
-	return kind == JournalEntryTransition || kind == JournalEntryStep
+	return kind == JournalEntryTransition || kind == JournalEntryStep || kind == JournalEntryCancellationRequest
 }
 
 // MarshalText implements encoding.TextMarshaler.
@@ -98,14 +99,27 @@ func (outcome *StepOutcome) UnmarshalText(text []byte) error {
 
 // JournalEntry is one immutable boundary record in an operation stream.
 type JournalEntry struct {
-	Schema         string           `json:"schema"`
-	OperationID    string           `json:"operationId"`
-	PlanID         string           `json:"planId"`
-	Sequence       uint64           `json:"sequence"`
-	Kind           JournalEntryKind `json:"kind"`
-	RecordedAt     time.Time        `json:"recordedAt"`
-	OperationState OperationState   `json:"operationState"`
-	Step           *JournalStep     `json:"step,omitempty"`
+	Schema         string                      `json:"schema"`
+	OperationID    string                      `json:"operationId"`
+	PlanID         string                      `json:"planId"`
+	ContractHash   string                      `json:"contractHash"`
+	Sequence       uint64                      `json:"sequence"`
+	Kind           JournalEntryKind            `json:"kind"`
+	RecordedAt     time.Time                   `json:"recordedAt"`
+	OperationState OperationState              `json:"operationState"`
+	Step           *JournalStep                `json:"step,omitempty"`
+	Pause          *JournalPause               `json:"pause,omitempty"`
+	Cancellation   *JournalCancellationRequest `json:"cancellation,omitempty"`
+}
+
+// JournalCancellationRequest is the durable proof that an unsafe-boundary
+// cancellation was requested and which fail-closed route must be honored.
+type JournalCancellationRequest struct {
+	RequestedAt           time.Time           `json:"requestedAt"`
+	CurrentStepID         string              `json:"currentStepId"`
+	ExecutionContractHash string              `json:"executionContractHash"`
+	MutationObservation   MutationObservation `json:"mutationObservation"`
+	RequiredRoute         OperationState      `json:"requiredRoute"`
 }
 
 // JournalStep records one observed attempt without persisting raw output.
@@ -118,4 +132,15 @@ type JournalStep struct {
 	EndedAt           *time.Time        `json:"endedAt,omitempty"`
 	MutationOccurred  bool              `json:"mutationOccurred"`
 	ResultSummary     redact.Text       `json:"resultSummary"`
+}
+
+// JournalPause records all state needed to review and safely resume a pause.
+// MutationOccurred is deliberately not optional: false is meaningful durable
+// evidence that cancellation may terminate without rollback.
+type JournalPause struct {
+	PausedAt           time.Time   `json:"pausedAt"`
+	PauseReason        redact.Text `json:"pauseReason"`
+	MutationOccurred   bool        `json:"mutationOccurred"`
+	ResumeBy           time.Time   `json:"resumeBy"`
+	ReapprovalRequired bool        `json:"reapprovalRequired"`
 }

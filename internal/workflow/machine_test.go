@@ -11,10 +11,18 @@ import (
 	"github.com/thelostorbital/ctrldb/internal/workflow"
 )
 
+const (
+	testOperationID = "op-0123456789abcdef"
+	testPlanID      = "plan-0123456789abcdef"
+)
+
 func TestMachineHappyPath(t *testing.T) {
 	t.Parallel()
 
-	machine := workflow.NewMachine()
+	machine, err := workflow.NewMachine(testOperationID, testPlanID)
+	if err != nil {
+		t.Fatalf("NewMachine() returned an error: %v", err)
+	}
 	transitionThrough(t, machine,
 		domain.OperationValidate,
 		domain.OperationPlan,
@@ -31,7 +39,10 @@ func TestMachineHappyPath(t *testing.T) {
 func TestMachinePermitsSafeWriteToSkipProtection(t *testing.T) {
 	t.Parallel()
 
-	machine := workflow.NewMachine()
+	machine, err := workflow.NewMachine(testOperationID, testPlanID)
+	if err != nil {
+		t.Fatalf("NewMachine() returned an error: %v", err)
+	}
 	transitionThrough(t, machine,
 		domain.OperationValidate,
 		domain.OperationPlan,
@@ -84,11 +95,6 @@ func TestMachineFailureBranches(t *testing.T) {
 			path:  []domain.OperationState{domain.OperationFailedCleanup},
 		},
 		{
-			name:  "cancel after verified unwind",
-			start: domain.OperationRollback,
-			path:  []domain.OperationState{domain.OperationCancelled},
-		},
-		{
 			name:  "cancel before mutation",
 			start: domain.OperationLock,
 			path:  []domain.OperationState{domain.OperationCancelled},
@@ -112,6 +118,24 @@ func TestMachineFailureBranches(t *testing.T) {
 			machine := machineAt(t, test.start)
 			transitionThrough(t, machine, test.path...)
 		})
+	}
+}
+
+func TestMachineRequiresCancellationDecisionForMutationCapableStates(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []domain.OperationState{
+		domain.OperationProtect,
+		domain.OperationExecute,
+		domain.OperationPaused,
+	} {
+		machine := machineAt(t, state)
+		if err := machine.Transition(domain.OperationCancelled); !errors.Is(err, workflow.ErrInvalidTransition) {
+			t.Fatalf("Transition(%s -> CANCELLED) error = %v, want ErrInvalidTransition", state, err)
+		}
+		if machine.State() != state {
+			t.Fatalf("state changed after cancellation bypass from %s: %s", state, machine.State())
+		}
 	}
 }
 
@@ -144,11 +168,14 @@ func TestMachineRejectsUnknownState(t *testing.T) {
 	t.Parallel()
 
 	unknown := domain.OperationState("UNKNOWN")
-	if _, err := workflow.RestoreMachine(unknown); !errors.Is(err, domain.ErrInvalidOperationState) {
+	if _, err := workflow.RestoreMachine(testOperationID, testPlanID, unknown); !errors.Is(err, domain.ErrInvalidOperationState) {
 		t.Fatalf("RestoreMachine() error = %v, want ErrInvalidOperationState", err)
 	}
 
-	machine := workflow.NewMachine()
+	machine, err := workflow.NewMachine(testOperationID, testPlanID)
+	if err != nil {
+		t.Fatalf("NewMachine() returned an error: %v", err)
+	}
 	if err := machine.Transition(unknown); !errors.Is(err, domain.ErrInvalidOperationState) {
 		t.Fatalf("Transition() error = %v, want ErrInvalidOperationState", err)
 	}
@@ -157,10 +184,33 @@ func TestMachineRejectsUnknownState(t *testing.T) {
 	}
 }
 
+func TestMachineRequiresCanonicalOperationAndPlanBinding(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		operationID string
+		planID      string
+	}{
+		{name: "missing operation", planID: testPlanID},
+		{name: "noncanonical operation", operationID: "operation-unsafe", planID: testPlanID},
+		{name: "missing plan", operationID: testOperationID},
+		{name: "noncanonical plan", operationID: testOperationID, planID: "plan-unsafe"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := workflow.NewMachine(test.operationID, test.planID); !errors.Is(err, workflow.ErrInvalidMachineBinding) {
+				t.Fatalf("NewMachine() error = %v, want ErrInvalidMachineBinding", err)
+			}
+		})
+	}
+}
+
 func machineAt(t *testing.T, state domain.OperationState) *workflow.Machine {
 	t.Helper()
 
-	machine, err := workflow.RestoreMachine(state)
+	machine, err := workflow.RestoreMachine(testOperationID, testPlanID, state)
 	if err != nil {
 		t.Fatalf("RestoreMachine(%q) returned an error: %v", state, err)
 	}

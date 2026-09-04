@@ -291,16 +291,18 @@ func RestoreCancellationController(
 	if entries[0].ContractHash != contract.Digest() {
 		return CancellationController{}, fmt.Errorf("%w: journal does not match the execution contract", ErrInvalidCancellation)
 	}
-	if pointOfNoReturnReached(contract, entries) {
-		return CancellationController{}, fmt.Errorf("%w: point of no return has been reached", ErrInvalidCancellation)
-	}
-
 	var target domain.OperationState
 	var binding cancellationBinding
+	contractSteps := contract.Steps()
+	nextStep := 0
 	for _, entry := range entries {
 		if entry.Kind == domain.JournalEntryStep {
-			if _, ok := executionContractStep(contract, entry.Step.ID); !ok {
-				return CancellationController{}, fmt.Errorf("%w: journal step is outside the execution contract", ErrInvalidCancellation)
+			if nextStep >= len(contractSteps) || entry.Step.ID != contractSteps[nextStep].ID ||
+				entry.Step.ExecutingIdentity != contractSteps[nextStep].ExecutingIdentity {
+				return CancellationController{}, fmt.Errorf("%w: journal step contradicts the execution contract", ErrInvalidCancellation)
+			}
+			if entry.Step.Outcome == domain.StepDone {
+				nextStep++
 			}
 		}
 		if entry.Kind == domain.JournalEntryCancellationRequest {
@@ -309,10 +311,10 @@ func RestoreCancellationController(
 					"%w: cancellation request does not match the execution contract", ErrInvalidCancellation,
 				)
 			}
-			step, ok := executionContractStep(contract, entry.Cancellation.CurrentStepID)
-			if !ok {
+			if nextStep >= len(contractSteps) || entry.Cancellation.CurrentStepID != contractSteps[nextStep].ID {
 				return CancellationController{}, fmt.Errorf("%w: cancellation step is outside the execution contract", ErrInvalidCancellation)
 			}
+			step := contractSteps[nextStep]
 			target = entry.Cancellation.RequiredRoute
 			binding = cancellationBinding{
 				operationID:  entry.OperationID,
@@ -333,6 +335,9 @@ func RestoreCancellationController(
 			target = ""
 			binding = cancellationBinding{}
 		}
+	}
+	if target != "" && pointOfNoReturnReached(contract, entries) {
+		return CancellationController{}, fmt.Errorf("%w: point of no return has been reached", ErrInvalidCancellation)
 	}
 	if target == domain.OperationRollback && contract.RollbackBoundary() == "none" {
 		return CancellationController{}, fmt.Errorf("%w: execution contract has no rollback boundary", ErrInvalidCancellation)
@@ -401,7 +406,8 @@ func cancellationContext(
 		if entry.Kind != domain.JournalEntryStep {
 			continue
 		}
-		if nextStep >= len(steps) || entry.Step.ID != steps[nextStep].ID {
+		if nextStep >= len(steps) || entry.Step.ID != steps[nextStep].ID ||
+			entry.Step.ExecutingIdentity != steps[nextStep].ExecutingIdentity {
 			return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: journal steps do not match the execution contract", ErrInvalidCancellation)
 		}
 		if entry.Step.Outcome == domain.StepUnknown {
@@ -469,23 +475,6 @@ func pointOfNoReturnReached(contract domain.ExecutionContract, entries []domain.
 	}
 
 	return false
-}
-
-func executionContractStep(contract domain.ExecutionContract, stepID string) (domain.ExecutionStepContract, bool) {
-	var matched domain.ExecutionStepContract
-	found := false
-	for _, step := range contract.Steps() {
-		if step.ID != stepID {
-			continue
-		}
-		if found {
-			return domain.ExecutionStepContract{}, false
-		}
-		matched = step
-		found = true
-	}
-
-	return matched, found
 }
 
 func cancellationBoundaryRecorded(entries []domain.JournalEntry, binding cancellationBinding) bool {

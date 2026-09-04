@@ -284,6 +284,10 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 			plan.Exposure = domain.ExposurePrivate
 			plan.ApprovalClass = domain.ApprovalSecuritySensitive
 			plan.ExposureControls = validExposureControls(*plan)
+			plan.ExposureControls.Profile = domain.ExposureProfileACC04
+			plan.ExposureControls.Sources = []domain.PlanExposureSource{{
+				Kind: domain.ExposureSourcePrivateRange, Value: "10.20.0.0/16",
+			}}
 		}},
 		{name: "protection", mutate: func(plan *domain.Plan) { plan.Protection[0] = redact.Sanitize("verified snapshot") }},
 		{name: "rollback", mutate: func(plan *domain.Plan) { plan.Rollback.Assets[0].EvidenceRef = "evidence/replacement.json" }},
@@ -969,6 +973,20 @@ func TestPlanRecoveryAssetsAreTypedFreshAndRiskBound(t *testing.T) {
 				plan.Rollback.Assets[0].Protects, plan.Rollback.Assets[0].Protects[0],
 			)
 		},
+		"recovery asset targets itself": func(plan *domain.Plan) {
+			asset := plan.Rollback.Assets[0].Resource
+			plan.Resources = append(plan.Resources, asset)
+			plan.Steps[0].Targets = append(plan.Steps[0].Targets, asset)
+			permission := plan.Permissions[0]
+			permission.Resource = asset
+			permission.Permission = "compute.snapshots.delete"
+			plan.Permissions = append(plan.Permissions, permission)
+		},
+		"recovery asset claims self-protection": func(plan *domain.Plan) {
+			asset := plan.Rollback.Assets[0].Resource
+			plan.Resources = append(plan.Resources, asset)
+			plan.Rollback.Assets[0].Protects = []domain.PlanResource{asset}
+		},
 		"PBM missing restoreTo": func(plan *domain.Plan) {
 			validPBM(plan)
 			plan.Rollback.Assets[0].RestoreTo = nil
@@ -1030,6 +1048,79 @@ func TestPlanPrivateRangeRequiresWholePrefixContainment(t *testing.T) {
 		if _, err := policy.SealPlan(build(prefix)); !errors.Is(err, policy.ErrInvalidPlan) {
 			t.Fatalf("SealPlan(%s) error = %v, want ErrInvalidPlan", prefix, err)
 		}
+	}
+}
+
+func TestPlanExposureSourcesMatchTheDeclaredReachabilityClass(t *testing.T) {
+	t.Parallel()
+
+	build := func(exposure domain.ExposureDelta, profile domain.ExposureProfile) domain.Plan {
+		plan := validPlan()
+		plan.ApprovalClass = domain.ApprovalSecuritySensitive
+		plan.Exposure = exposure
+		plan.ExposureControls = validExposureControls(plan)
+		plan.ExposureControls.Profile = profile
+
+		return plan
+	}
+	valid := []struct {
+		name     string
+		exposure domain.ExposureDelta
+		profile  domain.ExposureProfile
+		source   domain.PlanExposureSource
+	}{
+		{name: "private range", exposure: domain.ExposurePrivate, profile: domain.ExposureProfileACC04,
+			source: domain.PlanExposureSource{Kind: domain.ExposureSourcePrivateRange, Value: "10.20.0.0/16"}},
+		{name: "private tag", exposure: domain.ExposurePrivate, profile: domain.ExposureProfileACC01,
+			source: domain.PlanExposureSource{Kind: domain.ExposureSourceTag, Value: "application-server"}},
+		{name: "private service account", exposure: domain.ExposurePrivate, profile: domain.ExposureProfileACC01,
+			source: domain.PlanExposureSource{Kind: domain.ExposureSourceServiceAccount,
+				Value: "application@ctrldb-prod-123.iam.gserviceaccount.com"}},
+		{name: "IAP tunnel", exposure: domain.ExposureTunnel, profile: domain.ExposureProfileACC03,
+			source: domain.PlanExposureSource{Kind: domain.ExposureSourceIAP, Value: "35.235.240.0/20"}},
+		{name: "external CIDR", exposure: domain.ExposureExternal, profile: domain.ExposureProfileACC06,
+			source: domain.PlanExposureSource{Kind: domain.ExposureSourceCIDR, Value: "203.0.113.4/32"}},
+	}
+	for _, test := range valid {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			plan := build(test.exposure, test.profile)
+			plan.ExposureControls.Sources = []domain.PlanExposureSource{test.source}
+			if test.exposure == domain.ExposureTunnel {
+				plan.ExposureControls.Authentication = domain.ExposureAuthIAP
+			}
+			if _, err := policy.SealPlan(plan); err != nil {
+				t.Fatalf("SealPlan() returned an error: %v", err)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name     string
+		exposure domain.ExposureDelta
+		profile  domain.ExposureProfile
+		source   domain.PlanExposureSource
+	}{
+		{name: "public CIDR classified private", exposure: domain.ExposurePrivate, profile: domain.ExposureProfileACC04,
+			source: domain.PlanExposureSource{Kind: domain.ExposureSourceCIDR, Value: "8.8.8.0/24"}},
+		{name: "private range classified external", exposure: domain.ExposureExternal, profile: domain.ExposureProfileACC06,
+			source: domain.PlanExposureSource{Kind: domain.ExposureSourcePrivateRange, Value: "10.20.0.0/16"}},
+		{name: "CIDR classified tunnel", exposure: domain.ExposureTunnel, profile: domain.ExposureProfileACC03,
+			source: domain.PlanExposureSource{Kind: domain.ExposureSourceCIDR, Value: "203.0.113.4/32"}},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			plan := build(test.exposure, test.profile)
+			plan.ExposureControls.Sources = []domain.PlanExposureSource{test.source}
+			if test.exposure == domain.ExposureTunnel {
+				plan.ExposureControls.Authentication = domain.ExposureAuthIAP
+			}
+			if _, err := policy.SealPlan(plan); !errors.Is(err, policy.ErrInvalidPlan) {
+				t.Fatalf("SealPlan() error = %v, want ErrInvalidPlan", err)
+			}
+		})
 	}
 }
 

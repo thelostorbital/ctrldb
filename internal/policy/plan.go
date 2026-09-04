@@ -806,6 +806,12 @@ func validateRecoveryAssets(plan domain.Plan) error {
 		planResources[planResourceKey(resource)] = resource
 	}
 	seen := make(map[string]struct{}, len(assets))
+	targetedResources := make(map[string]struct{})
+	for _, step := range plan.Steps {
+		for _, target := range step.Targets {
+			targetedResources[planResourceKey(target)] = struct{}{}
+		}
+	}
 	for index, asset := range assets {
 		path := fmt.Sprintf("rollback.assets[%d]", index)
 		if !asset.Kind.Valid() {
@@ -817,11 +823,17 @@ func validateRecoveryAssets(plan domain.Plan) error {
 			return invalid(path, "duplicates a recovery asset")
 		}
 		seen[key] = struct{}{}
+		if _, targeted := targetedResources[planResourceKey(asset.Resource)]; targeted {
+			return invalid(path+".resource", "must not be a target of the same plan")
+		}
 		if len(asset.Protects) == 0 || len(asset.Protects) > maxExposureTargets {
 			return invalid(path+".protects", "must contain bounded protected plan resources")
 		}
 		seenProtected := make(map[string]struct{}, len(asset.Protects))
 		for _, protected := range asset.Protects {
+			if protected == asset.Resource {
+				return invalid(path+".protects", "must not claim that a recovery asset protects itself")
+			}
 			protectedKey := planResourceKey(protected)
 			if planned, exists := planResources[protectedKey]; !exists || protected != planned {
 				return invalid(path+".protects", "must exactly match fingerprinted plan resources")
@@ -918,7 +930,7 @@ func validateExposureControls(plan domain.Plan) error {
 	wantsInternetWide := false
 	seenSources := make(map[string]struct{}, len(controls.Sources))
 	for _, source := range controls.Sources {
-		if !source.Kind.Valid() || !validExposureSource(source) {
+		if !source.Kind.Valid() || !validExposureSource(source) || !sourceAllowedForExposure(plan.Exposure, source.Kind) {
 			return invalid("exposureControls.sources", "contains a noncanonical source")
 		}
 		key := string(source.Kind) + "\x00" + source.Value
@@ -962,6 +974,20 @@ func validateExposureControls(plan domain.Plan) error {
 	}
 
 	return nil
+}
+
+func sourceAllowedForExposure(exposure domain.ExposureDelta, kind domain.ExposureSourceKind) bool {
+	switch exposure {
+	case domain.ExposurePrivate:
+		return kind == domain.ExposureSourcePrivateRange || kind == domain.ExposureSourceTag ||
+			kind == domain.ExposureSourceServiceAccount
+	case domain.ExposureTunnel:
+		return kind == domain.ExposureSourceIAP || kind == domain.ExposureSourceTunnel
+	case domain.ExposureExternal:
+		return kind == domain.ExposureSourceCIDR
+	default:
+		return false
+	}
 }
 
 func validExposureSource(source domain.PlanExposureSource) bool {

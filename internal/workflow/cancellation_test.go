@@ -327,6 +327,15 @@ func TestCancellationRestoreRejectsAmbiguousOrMismatchedEvidence(t *testing.T) {
 	); !errors.Is(err, workflow.ErrInvalidCancellation) {
 		t.Fatalf("machine/journal state mismatch error = %v, want ErrInvalidCancellation", err)
 	}
+	wrongIdentity := append([]domain.JournalEntry(nil), entriesWithBoundary...)
+	wrongIdentity[len(wrongIdentity)-1].Step = new(domain.JournalStep)
+	*wrongIdentity[len(wrongIdentity)-1].Step = *entriesWithBoundary[len(entriesWithBoundary)-1].Step
+	wrongIdentity[len(wrongIdentity)-1].Step.ExecutingIdentity = domain.IdentityProvisioner
+	if _, err := workflow.RestoreCancellationController(
+		wrongIdentity, request.OperationID, request.PlanID, contract,
+	); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("journal identity mismatch error = %v, want ErrInvalidCancellation", err)
+	}
 
 	duplicate := *decision.JournalEntry
 	cancellationCopy := *duplicate.Cancellation
@@ -339,6 +348,33 @@ func TestCancellationRestoreRejectsAmbiguousOrMismatchedEvidence(t *testing.T) {
 		entries, request.OperationID, request.PlanID, contract,
 	); !errors.Is(err, workflow.ErrInvalidCancellation) {
 		t.Fatalf("ambiguous restore error = %v, want ErrInvalidCancellation", err)
+	}
+}
+
+func TestCancellationRestoreReturnsEmptyAfterNormalIrreversibleProgress(t *testing.T) {
+	t.Parallel()
+
+	step := validDefinitionStep()
+	definition, err := workflow.NewDefinition(
+		"WF-VM-02", "before-old-instance-delete", step.ID,
+		domain.PointOfNoReturnStepComplete, []workflow.StepDefinition{step},
+	)
+	if err != nil {
+		t.Fatalf("NewDefinition() returned an error: %v", err)
+	}
+	contract := definition.ExecutionContract()
+	request := validCancellationRequest()
+	entries := journalBoundToContract(validJournal()[:5], contract)
+	completed := cancellationStepEntry(contract, step.ID, 6, request.RequestedAt, true)
+	entries = append(entries, completed)
+	restored, err := workflow.RestoreCancellationController(
+		entries, request.OperationID, request.PlanID, contract,
+	)
+	if err != nil {
+		t.Fatalf("RestoreCancellationController() returned an error: %v", err)
+	}
+	if restored.Pending() {
+		t.Fatal("normal irreversible progress restored a pending cancellation")
 	}
 }
 

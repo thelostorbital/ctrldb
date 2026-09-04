@@ -49,18 +49,17 @@ type cancellationBinding struct {
 	planID      string
 	sequence    uint64
 	requestedAt time.Time
+	stepID      string
+	cancelSafe  bool
 }
 
 // CancellationRequest contains the complete data needed to construct the
 // durable journal record for a request made during an unsafe in-flight step.
 type CancellationRequest struct {
-	OperationID         string
-	PlanID              string
-	Sequence            uint64
-	RequestedAt         time.Time
-	OperationState      domain.OperationState
-	CurrentStepID       string
-	MutationObservation domain.MutationObservation
+	OperationID string
+	PlanID      string
+	Sequence    uint64
+	RequestedAt time.Time
 }
 
 // CancellationDecision tells the engine whether to queue or transition.
@@ -110,7 +109,8 @@ func (controller CancellationController) UIState(current domain.OperationState, 
 func (controller CancellationController) Request(
 	machine *Machine,
 	request CancellationRequest,
-	cancelSafe bool,
+	contract domain.ExecutionContract,
+	entries []domain.JournalEntry,
 ) (CancellationController, CancellationDecision, error) {
 	if machine == nil {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: nil machine", ErrInvalidCancellation)
@@ -119,48 +119,55 @@ func (controller CancellationController) Request(
 	if machine.operationID != request.OperationID || machine.planID != request.PlanID {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: request does not match machine binding", ErrInvalidCancellation)
 	}
+	if err := validateCancellationRequest(request); err != nil {
+		return controller, CancellationDecision{}, err
+	}
 	if controller.queued {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: cancellation request already recorded", ErrInvalidCancellation)
 	}
 	if !current.Valid() || current.Terminal() {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q cannot accept cancellation", ErrInvalidCancellation, current)
 	}
-	if !request.MutationObservation.Valid() {
-		return controller, CancellationDecision{}, fmt.Errorf("%w: invalid mutation observation", ErrInvalidCancellation)
+	binding := cancellationBinding{
+		operationID: request.OperationID, planID: request.PlanID,
+		sequence: request.Sequence, requestedAt: request.RequestedAt,
 	}
-	mutationMayHaveOccurred := request.MutationObservation != domain.MutationNotOccurred
-	target := cancellationTarget(mutationMayHaveOccurred)
-	if request.OperationState != current {
-		return controller, CancellationDecision{}, fmt.Errorf("%w: request state does not match machine", ErrInvalidCancellation)
-	}
-	entry := cancellationJournalEntry(request, target)
-	if err := ValidateJournalEntry(entry); err != nil {
-		return controller, CancellationDecision{}, fmt.Errorf("%w: invalid request identity or boundary", ErrInvalidCancellation)
-	}
-	if !cancellationRouteReachable(current, target) {
-		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q has no safe cancellation route", ErrInvalidCancellation, current)
-	}
-	if !cancelSafe {
-		return controller, CancellationDecision{
-			Action:       CancellationPersist,
-			JournalEntry: &entry,
-			UIState:      cancellationUnavailableUI,
-		}, nil
+	if cancellationStateIsStructurallyPreMutation(current) {
+		return routeCancellationTo(controller, machine, domain.OperationCancelled, binding)
 	}
 
-	return routeCancellation(controller, machine, mutationMayHaveOccurred, cancellationBinding{
-		operationID: request.OperationID,
-		planID:      request.PlanID,
-		sequence:    request.Sequence,
-		requestedAt: request.RequestedAt,
-	})
+	step, observation, err := cancellationContext(machine, contract, entries, request)
+	if err != nil {
+		return controller, CancellationDecision{}, err
+	}
+	binding.stepID = step.ID
+	binding.cancelSafe = step.CancelSafe
+	if current == domain.OperationPaused {
+		return routeCancellation(controller, machine, observation != domain.MutationNotOccurred, binding)
+	}
+	if current != domain.OperationProtect && current != domain.OperationExecute {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q has no safe cancellation route", ErrInvalidCancellation, current)
+	}
+
+	entry := cancellationJournalEntry(request, current, step.ID, observation)
+	stream := append(append([]domain.JournalEntry(nil), entries...), entry)
+	if err := ValidateJournal(stream); err != nil {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: request does not extend the durable journal", ErrInvalidCancellation)
+	}
+
+	return controller, CancellationDecision{
+		Action:       CancellationPersist,
+		JournalEntry: &entry,
+		UIState:      cancellationUnavailableUI,
+	}, nil
 }
 
 // AtBoundary honours a queued request. With no queued request it produces no
 // transition and leaves the controller unchanged.
 func (controller CancellationController) AtBoundary(
 	machine *Machine,
-	mutationMayHaveOccurred bool,
+	contract domain.ExecutionContract,
+	entries []domain.JournalEntry,
 ) (CancellationController, CancellationDecision, error) {
 	if machine == nil {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: nil machine", ErrInvalidCancellation)
@@ -172,18 +179,21 @@ func (controller CancellationController) AtBoundary(
 	if !current.Valid() || current.Terminal() {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q cannot reach a cancellation boundary", ErrInvalidCancellation, current)
 	}
-	target := cancellationTarget(mutationMayHaveOccurred)
-	if controller.queued && controller.target == domain.OperationRollback {
-		target = domain.OperationRollback
+	if !controller.queued {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: no durable cancellation request", ErrInvalidCancellation)
 	}
-	if !CanTransition(current, target) {
+	fresh, err := RestoreCancellationController(entries, machine.operationID, machine.planID, contract)
+	if err != nil || !fresh.queued || fresh.binding != controller.binding {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: durable cancellation request changed", ErrInvalidCancellation)
+	}
+	if !cancellationBoundaryRecorded(entries, controller.binding) {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: no durable safe boundary after request", ErrInvalidCancellation)
+	}
+	if !CanTransition(current, fresh.target) {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q has no safe cancellation route", ErrInvalidCancellation, current)
 	}
-	if !controller.queued {
-		return controller, CancellationDecision{Action: CancellationNone, UIState: cancellationAvailableUI}, nil
-	}
 
-	return routeCancellationTo(controller, machine, target, controller.binding)
+	return routeCancellationTo(controller, machine, fresh.target, fresh.binding)
 }
 
 // ApplyCancellation advances machine only for a decision produced for its
@@ -253,7 +263,11 @@ func routeCancellationTo(
 
 // RestoreCancellationController validates a complete journal and reconstructs
 // only a cancellation request that was durably recorded but not yet routed.
-func RestoreCancellationController(entries []domain.JournalEntry, operationID, planID string) (CancellationController, error) {
+func RestoreCancellationController(
+	entries []domain.JournalEntry,
+	operationID, planID string,
+	contract domain.ExecutionContract,
+) (CancellationController, error) {
 	if err := ValidateJournal(entries); err != nil {
 		return CancellationController{}, fmt.Errorf("%w: invalid journal", ErrInvalidCancellation)
 	}
@@ -264,13 +278,24 @@ func RestoreCancellationController(entries []domain.JournalEntry, operationID, p
 	var target domain.OperationState
 	var binding cancellationBinding
 	for _, entry := range entries {
+		if entry.Kind == domain.JournalEntryStep {
+			if _, ok := executionContractStep(contract, entry.Step.ID); !ok {
+				return CancellationController{}, fmt.Errorf("%w: journal step is outside the execution contract", ErrInvalidCancellation)
+			}
+		}
 		if entry.Kind == domain.JournalEntryCancellationRequest {
+			step, ok := executionContractStep(contract, entry.Cancellation.CurrentStepID)
+			if !ok {
+				return CancellationController{}, fmt.Errorf("%w: cancellation step is outside the execution contract", ErrInvalidCancellation)
+			}
 			target = entry.Cancellation.RequiredRoute
 			binding = cancellationBinding{
 				operationID: entry.OperationID,
 				planID:      entry.PlanID,
 				sequence:    entry.Sequence,
 				requestedAt: entry.Cancellation.RequestedAt,
+				stepID:      step.ID,
+				cancelSafe:  step.CancelSafe,
 			}
 			continue
 		}
@@ -287,7 +312,111 @@ func RestoreCancellationController(entries []domain.JournalEntry, operationID, p
 	return CancellationController{queued: target != "", target: target, binding: binding}, nil
 }
 
-func cancellationJournalEntry(request CancellationRequest, target domain.OperationState) domain.JournalEntry {
+func validateCancellationRequest(request CancellationRequest) error {
+	if !operationIDPattern.MatchString(request.OperationID) || !journalPlanIDPattern.MatchString(request.PlanID) ||
+		request.Sequence == 0 || request.RequestedAt.IsZero() {
+		return fmt.Errorf("%w: invalid request identity", ErrInvalidCancellation)
+	}
+	_, offset := request.RequestedAt.Zone()
+	if offset != 0 {
+		return fmt.Errorf("%w: invalid request time", ErrInvalidCancellation)
+	}
+
+	return nil
+}
+
+func cancellationContext(
+	machine *Machine,
+	contract domain.ExecutionContract,
+	entries []domain.JournalEntry,
+	request CancellationRequest,
+) (domain.ExecutionStepContract, domain.MutationObservation, error) {
+	if err := ValidateJournal(entries); err != nil || len(entries) == 0 {
+		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: invalid durable journal", ErrInvalidCancellation)
+	}
+	last := entries[len(entries)-1]
+	if entries[0].OperationID != machine.operationID || entries[0].PlanID != machine.planID ||
+		last.OperationState != machine.State() || request.Sequence != last.Sequence+1 ||
+		request.RequestedAt.Before(last.RecordedAt) {
+		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: journal does not match the current machine boundary", ErrInvalidCancellation)
+	}
+
+	steps := contract.Steps()
+	if contract.WorkflowID() == "" || len(steps) == 0 {
+		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: missing execution contract", ErrInvalidCancellation)
+	}
+	nextStep := 0
+	observation := domain.MutationNotOccurred
+	for _, entry := range entries {
+		if entry.Pause != nil && entry.Pause.MutationOccurred {
+			observation = domain.MutationOccurred
+		}
+		if entry.Kind != domain.JournalEntryStep {
+			continue
+		}
+		if nextStep >= len(steps) || entry.Step.ID != steps[nextStep].ID {
+			return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: journal steps do not match the execution contract", ErrInvalidCancellation)
+		}
+		if entry.Step.Outcome == domain.StepUnknown {
+			observation = domain.MutationUnknown
+		} else if entry.Step.MutationOccurred && observation != domain.MutationUnknown {
+			observation = domain.MutationOccurred
+		}
+		if entry.Step.Outcome == domain.StepDone {
+			nextStep++
+		}
+	}
+	if nextStep >= len(steps) {
+		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: execution contract has no current step", ErrInvalidCancellation)
+	}
+
+	return steps[nextStep], observation, nil
+}
+
+func executionContractStep(contract domain.ExecutionContract, stepID string) (domain.ExecutionStepContract, bool) {
+	var matched domain.ExecutionStepContract
+	found := false
+	for _, step := range contract.Steps() {
+		if step.ID != stepID {
+			continue
+		}
+		if found {
+			return domain.ExecutionStepContract{}, false
+		}
+		matched = step
+		found = true
+	}
+
+	return matched, found
+}
+
+func cancellationBoundaryRecorded(entries []domain.JournalEntry, binding cancellationBinding) bool {
+	for _, entry := range entries {
+		if entry.Sequence > binding.sequence && entry.Kind == domain.JournalEntryStep &&
+			entry.Step.ID == binding.stepID && entry.Step.EndedAt != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+func cancellationStateIsStructurallyPreMutation(state domain.OperationState) bool {
+	switch state {
+	case domain.OperationDiscover, domain.OperationValidate, domain.OperationPlan,
+		domain.OperationApprovedWaiting, domain.OperationLock:
+		return true
+	default:
+		return false
+	}
+}
+
+func cancellationJournalEntry(
+	request CancellationRequest,
+	state domain.OperationState,
+	stepID string,
+	observation domain.MutationObservation,
+) domain.JournalEntry {
 	return domain.JournalEntry{
 		Schema:         domain.JournalSchemaV1,
 		OperationID:    request.OperationID,
@@ -295,12 +424,12 @@ func cancellationJournalEntry(request CancellationRequest, target domain.Operati
 		Sequence:       request.Sequence,
 		Kind:           domain.JournalEntryCancellationRequest,
 		RecordedAt:     request.RequestedAt,
-		OperationState: request.OperationState,
+		OperationState: state,
 		Cancellation: &domain.JournalCancellationRequest{
 			RequestedAt:         request.RequestedAt,
-			CurrentStepID:       request.CurrentStepID,
-			MutationObservation: request.MutationObservation,
-			RequiredRoute:       target,
+			CurrentStepID:       stepID,
+			MutationObservation: observation,
+			RequiredRoute:       cancellationTarget(observation != domain.MutationNotOccurred),
 		},
 	}
 }

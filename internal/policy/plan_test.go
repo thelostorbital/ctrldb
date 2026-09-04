@@ -5,6 +5,7 @@ package policy_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"math"
 	"reflect"
@@ -348,6 +349,101 @@ func TestPlanDecodeRejectsMissingExecutionContractFields(t *testing.T) {
 				t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
 			}
 		})
+	}
+}
+
+func TestPlanDecodeRequiresCompleteNestedCostJSON(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := policy.EncodePlan(validPlan())
+	if err != nil {
+		t.Fatalf("EncodePlan() returned an error: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "runRate", mutate: func(cost map[string]any) { delete(cost, "runRate") }},
+		{name: "items", mutate: func(cost map[string]any) { delete(cost, "items") }},
+		{name: "source", mutate: func(cost map[string]any) { delete(cost, "source") }},
+		{name: "priceTableDate", mutate: func(cost map[string]any) { delete(cost, "priceTableDate") }},
+		{name: "stale false", mutate: func(cost map[string]any) { delete(cost, "stale") }},
+		{name: "assumptions", mutate: func(cost map[string]any) { delete(cost, "assumptions") }},
+		{name: "unpriced", mutate: func(cost map[string]any) { delete(cost, "unpriced") }},
+		{name: "budget", mutate: func(cost map[string]any) { delete(cost, "budget") }},
+		{name: "runRate amount", mutate: func(cost map[string]any) {
+			delete(cost["runRate"].(map[string]any), "amountUSD")
+		}},
+		{name: "runRate period", mutate: func(cost map[string]any) {
+			delete(cost["runRate"].(map[string]any), "period")
+		}},
+		{name: "item resource", mutate: func(cost map[string]any) {
+			delete(cost["items"].([]any)[0].(map[string]any), "resource")
+		}},
+		{name: "item kind", mutate: func(cost map[string]any) {
+			delete(cost["items"].([]any)[0].(map[string]any), "kind")
+		}},
+		{name: "item amount", mutate: func(cost map[string]any) {
+			delete(cost["items"].([]any)[0].(map[string]any), "amountUSD")
+		}},
+		{name: "incremental amount", mutate: func(cost map[string]any) {
+			delete(cost["incremental"].(map[string]any), "amountUSD")
+		}},
+		{name: "incremental period", mutate: func(cost map[string]any) {
+			delete(cost["incremental"].(map[string]any), "period")
+		}},
+		{name: "incremental plan", mutate: func(cost map[string]any) {
+			delete(cost["incremental"].(map[string]any), "plan")
+		}},
+		{name: "budget state", mutate: func(cost map[string]any) {
+			delete(cost["budget"].(map[string]any), "state")
+		}},
+		{name: "ok budget ceiling", mutate: func(cost map[string]any) {
+			delete(cost["budget"].(map[string]any), "ceilingUSD")
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var document map[string]any
+			if err := json.Unmarshal(encoded, &document); err != nil {
+				t.Fatalf("json.Unmarshal() returned an error: %v", err)
+			}
+			test.mutate(document["cost"].(map[string]any))
+			without, err := json.Marshal(document)
+			if err != nil {
+				t.Fatalf("json.Marshal() returned an error: %v", err)
+			}
+			if _, err := policy.DecodePlan(without); !errors.Is(err, policy.ErrInvalidPlan) {
+				t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
+			}
+		})
+	}
+
+	unavailable := validPlan()
+	unavailable.Cost.Budget.State = domain.BudgetUnavailable
+	unavailable.Cost.Budget.Reason = redact.Sanitize("budget API unavailable")
+	unavailable.Cost.Budget.CeilingUSD = nil
+	unavailable, err = policy.SealPlan(unavailable)
+	if err != nil {
+		t.Fatalf("SealPlan(unavailable budget) returned an error: %v", err)
+	}
+	unavailableJSON, err := policy.EncodePlan(unavailable)
+	if err != nil {
+		t.Fatalf("EncodePlan(unavailable budget) returned an error: %v", err)
+	}
+	var unavailableDocument map[string]any
+	if err := json.Unmarshal(unavailableJSON, &unavailableDocument); err != nil {
+		t.Fatalf("json.Unmarshal(unavailable budget) returned an error: %v", err)
+	}
+	delete(unavailableDocument["cost"].(map[string]any)["budget"].(map[string]any), "reason")
+	withoutReason, err := json.Marshal(unavailableDocument)
+	if err != nil {
+		t.Fatalf("json.Marshal(unavailable budget) returned an error: %v", err)
+	}
+	if _, err := policy.DecodePlan(withoutReason); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan(unavailable budget without reason) error = %v, want ErrInvalidPlan", err)
 	}
 }
 

@@ -376,8 +376,36 @@ func validateRequiredPlanJSON(encoded []byte) error {
 			return err
 		}
 	}
+	if err := validateRequiredCostJSON(plan["cost"]); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func validateRequiredCostJSON(encoded json.RawMessage) error {
+	var cost map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &cost); err != nil {
+		return invalid("cost", "must be an object")
+	}
+	if err := requireJSONFields(cost, "cost",
+		"runRate", "items", "source", "priceTableDate", "stale", "assumptions", "unpriced", "budget",
+	); err != nil {
+		return err
+	}
+	if err := requireNestedJSONFields(cost["runRate"], "cost.runRate", "amountUSD", "period"); err != nil {
+		return err
+	}
+	if err := requireJSONArrayFields(cost["items"], "cost.items", "resource", "kind", "amountUSD"); err != nil {
+		return err
+	}
+	if incremental, exists := cost["incremental"]; exists {
+		if err := requireNestedJSONFields(incremental, "cost.incremental", "amountUSD", "period", "plan"); err != nil {
+			return err
+		}
+	}
+
+	return requireNestedJSONFields(cost["budget"], "cost.budget", "state")
 }
 
 func requireJSONArrayFields(encoded json.RawMessage, path string, fields ...string) error {
@@ -799,6 +827,15 @@ func validateCost(cost domain.PlanCost) error {
 	}
 	if !cost.Budget.State.Valid() {
 		return invalid("cost.budget.state", "unknown value")
+	}
+	if cost.Budget.State == domain.BudgetOK && cost.Budget.CeilingUSD == nil {
+		return invalid("cost.budget.ceilingUSD", "is required when budget state is ok")
+	}
+	if cost.Budget.State == domain.BudgetUnavailable && cost.Budget.Reason.String() == "" {
+		return invalid("cost.budget.reason", "is required when budget state is unavailable")
+	}
+	if cost.Budget.State != domain.BudgetOK && cost.Budget.CeilingUSD != nil {
+		return invalid("cost.budget.ceilingUSD", "is allowed only when budget state is ok")
 	}
 	if cost.Budget.CeilingUSD != nil {
 		if err := validateAmount("cost.budget.ceilingUSD", *cost.Budget.CeilingUSD); err != nil {

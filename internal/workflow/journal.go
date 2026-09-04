@@ -193,8 +193,12 @@ func validateRequiredJournalJSON(encoded []byte, entry domain.JournalEntry) erro
 		if err := json.Unmarshal(document["step"], &step); err != nil {
 			return journalEntryError("step", "must be an object")
 		}
-		if _, exists := step["mutationOccurred"]; !exists {
-			return journalEntryError("step.mutationOccurred", "is required")
+		for _, field := range []string{
+			"id", "outcome", "executingIdentity", "attempt", "startedAt", "mutationOccurred", "resultSummary",
+		} {
+			if _, exists := step[field]; !exists {
+				return journalEntryError("step."+field, "is required")
+			}
 		}
 	}
 	if entry.Kind == domain.JournalEntryCancellationRequest && entry.Cancellation != nil {

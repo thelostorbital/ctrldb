@@ -365,13 +365,17 @@ func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
 	evidence := validExecutionEvidence(plan, checkedAt)
 	evidence.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
 	evidence.ObservedAt = checkedAt.Add(-10 * time.Minute)
-	evidence.StepUp.ServerTimeCreated = checkedAt.Add(-10 * time.Minute)
+	evidence.StepUp.ServerTimeCreated = checkedAt.Add(-10*time.Minute + time.Nanosecond)
 	if err := policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)); err != nil {
 		t.Fatalf("fresh step-up returned an error: %v", err)
 	}
 
 	for _, mutate := range []func(*policy.ExecutionEvidence){
 		func(evidence *policy.ExecutionEvidence) { evidence.StepUp = nil },
+		func(evidence *policy.ExecutionEvidence) {
+			evidence.ObservedAt = checkedAt.Add(-10 * time.Minute)
+			evidence.StepUp.ServerTimeCreated = checkedAt.Add(-10 * time.Minute)
+		},
 		func(evidence *policy.ExecutionEvidence) { evidence.StepUp.PlanID = "plan-fedcba9876543210" },
 		func(evidence *policy.ExecutionEvidence) { evidence.StepUp.ProjectID = "ctrldb-other-123" },
 		func(evidence *policy.ExecutionEvidence) { evidence.StepUp.Principal = "other@example.com" },

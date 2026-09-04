@@ -494,7 +494,7 @@ func validateStepUpEvidence(plan domain.Plan, evidence ExecutionEvidence, blocke
 		!validStepUpObject(stepUp.RecordObject, plan) || !validEvidenceTime(stepUp.ServerTimeCreated) ||
 		stepUp.ServerTimeCreated.Before(evidence.ObservedAt) ||
 		stepUp.ServerTimeCreated.After(evidence.CheckedAt) ||
-		evidence.CheckedAt.Sub(stepUp.ServerTimeCreated) > stepUpFreshness {
+		evidence.CheckedAt.Sub(stepUp.ServerTimeCreated) >= stepUpFreshness {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "invalid-or-stale"})
 	}
 	if evidence.Approval == nil || stepUp.ServerTimeCreated.Before(

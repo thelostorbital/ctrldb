@@ -5,6 +5,7 @@ package workflow_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -212,6 +213,42 @@ func TestCancellationJournalEntryRequiresCompleteDurableRecord(t *testing.T) {
 		if err := workflow.ValidateJournalEntry(changed); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
 			t.Fatalf("ValidateJournalEntry() error = %v, want ErrInvalidJournalEntry", err)
 		}
+	}
+}
+
+func TestJournalStepDecodeRequiresEveryNonOptionalField(t *testing.T) {
+	t.Parallel()
+
+	encoded := mustEncodeJournalEntry(t, validStepEntry())
+	for _, field := range []string{
+		"id", "outcome", "executingIdentity", "attempt", "startedAt", "mutationOccurred", "resultSummary", "endedAt",
+	} {
+		field := field
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+			var document map[string]any
+			if err := json.Unmarshal(encoded, &document); err != nil {
+				t.Fatalf("json.Unmarshal() returned an error: %v", err)
+			}
+			delete(document["step"].(map[string]any), field)
+			without, err := json.Marshal(document)
+			if err != nil {
+				t.Fatalf("json.Marshal() returned an error: %v", err)
+			}
+			if _, err := workflow.DecodeJournalEntry(without); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+				t.Fatalf("DecodeJournalEntry() error = %v, want ErrInvalidJournalEntry", err)
+			}
+		})
+	}
+
+	emptySummary := validStepEntry()
+	emptySummary.Step.ResultSummary = redact.Sanitize("")
+	decoded, err := workflow.DecodeJournalEntry(mustEncodeJournalEntry(t, emptySummary))
+	if err != nil {
+		t.Fatalf("explicit empty resultSummary returned an error: %v", err)
+	}
+	if decoded.Step.ResultSummary.String() != "" {
+		t.Fatalf("resultSummary = %q, want explicit empty value", decoded.Step.ResultSummary.String())
 	}
 }
 

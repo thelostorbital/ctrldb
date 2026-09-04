@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
 )
@@ -30,11 +31,13 @@ var (
 )
 
 var (
-	planIDPattern     = regexp.MustCompile(`^plan-[0-9a-f]{16}$`)
-	planHashPattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	workflowIDPattern = regexp.MustCompile(`^WF-[A-Z0-9]+-[0-9]{2}$`)
-	datePattern       = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
-	zeroPlanHash      = strings.Repeat("0", sha256.Size*2)
+	planIDPattern      = regexp.MustCompile(`^plan-[0-9a-f]{16}$`)
+	planHashPattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	workflowIDPattern  = regexp.MustCompile(`^WF-[A-Z0-9]+-[0-9]{2}$`)
+	environmentPattern = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	permissionPattern  = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
+	datePattern        = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
+	zeroPlanHash       = strings.Repeat("0", sha256.Size*2)
 )
 
 // SealPlan structurally validates plan and returns a copy carrying the digest
@@ -52,6 +55,26 @@ func SealPlan(plan domain.Plan) (domain.Plan, error) {
 	plan.PlanHash = digest
 
 	return plan, nil
+}
+
+// SealPlanAt returns a sealed copy whose creation and expiry boundaries are
+// derived from one trusted clock reading and the configured plan validity.
+func SealPlanAt(plan domain.Plan, createdAt time.Time, planValidity time.Duration) (domain.Plan, error) {
+	if err := validateUTCTime("createdAt", createdAt); err != nil {
+		return domain.Plan{}, err
+	}
+	if planValidity <= 0 {
+		return domain.Plan{}, invalid("planValidity", "must be positive")
+	}
+
+	expiresAt := createdAt.Add(planValidity)
+	if !expiresAt.After(createdAt) {
+		return domain.Plan{}, invalid("planValidity", "overflows the expiry boundary")
+	}
+	plan.CreatedAt = createdAt
+	plan.ExpiresAt = expiresAt
+
+	return SealPlan(plan)
 }
 
 // ComputePlanHash returns the digest SealPlan would assign without modifying
@@ -123,12 +146,102 @@ func DecodePlan(encoded []byte) (domain.Plan, error) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return domain.Plan{}, fmt.Errorf("%w: trailing JSON value", ErrInvalidPlan)
 	}
+	if err := validateRequiredPlanJSON(encoded); err != nil {
+		return domain.Plan{}, err
+	}
 
 	if err := ValidatePlan(plan); err != nil {
 		return domain.Plan{}, err
 	}
 
 	return plan, nil
+}
+
+func validateRequiredPlanJSON(encoded []byte) error {
+	var plan map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &plan); err != nil {
+		return invalid("decode", err.Error())
+	}
+	if err := requireJSONFields(plan, "plan",
+		"planId", "planHash", "workflowId", "environment", "principal", "createdAt",
+		"approvalClass", "expiresAt", "coolingOffSeconds", "identity", "policyHash",
+		"stepUpRequired", "resources", "preconditions", "permissions", "steps", "cost",
+		"downtime", "exposure", "protection", "rollback", "verification",
+	); err != nil {
+		return err
+	}
+
+	if err := requireNestedJSONFields(plan["identity"], "identity",
+		"default", "hostControlSteps", "deleteSteps", "bootstrapSteps",
+	); err != nil {
+		return err
+	}
+	if err := requireNestedJSONFields(plan["policyHash"], "policyHash", "match"); err != nil {
+		return err
+	}
+	if err := requireJSONArrayFields(plan["resources"], "resources", "kind", "name", "fingerprint"); err != nil {
+		return err
+	}
+	if err := requireJSONArrayFields(plan["preconditions"], "preconditions", "id", "ok", "detail"); err != nil {
+		return err
+	}
+	if err := requireJSONArrayFields(plan["permissions"], "permissions", "identity", "permission", "granted"); err != nil {
+		return err
+	}
+
+	var steps []map[string]json.RawMessage
+	if err := json.Unmarshal(plan["steps"], &steps); err != nil {
+		return invalid("steps", "must be an array")
+	}
+	for index, step := range steps {
+		path := fmt.Sprintf("steps[%d]", index)
+		if err := requireJSONFields(step, path,
+			"id", "executor", "executingIdentity", "commandRedacted", "idempotent", "retry",
+			"cancelSafe", "timeoutSeconds", "successCondition", "failureBehavior",
+		); err != nil {
+			return err
+		}
+		if err := requireNestedJSONFields(step["retry"], path+".retry",
+			"maxAttempts", "initialBackoffSeconds", "maxBackoffSeconds",
+		); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func requireJSONArrayFields(encoded json.RawMessage, path string, fields ...string) error {
+	var values []map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &values); err != nil {
+		return invalid(path, "must be an array")
+	}
+	for index, value := range values {
+		if err := requireJSONFields(value, fmt.Sprintf("%s[%d]", path, index), fields...); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func requireNestedJSONFields(encoded json.RawMessage, path string, fields ...string) error {
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return invalid(path, "must be an object")
+	}
+
+	return requireJSONFields(value, path, fields...)
+}
+
+func requireJSONFields(value map[string]json.RawMessage, path string, fields ...string) error {
+	for _, field := range fields {
+		if _, exists := value[field]; !exists {
+			return invalid(path+"."+field, "is required")
+		}
+	}
+
+	return nil
 }
 
 // ValidatePlan checks the resource-independent PlanV1 invariants and content
@@ -147,11 +260,23 @@ func validatePlanStructure(plan domain.Plan) error {
 	if !workflowIDPattern.MatchString(plan.WorkflowID) {
 		return invalid("workflowId", "must match WF-<GROUP>-<NN>")
 	}
+	if !environmentPattern.MatchString(plan.Environment) {
+		return invalid("environment", "must be a canonical environment name")
+	}
+	if err := validatePrincipal(plan.Principal); err != nil {
+		return err
+	}
+	if err := validateUTCTime("createdAt", plan.CreatedAt); err != nil {
+		return err
+	}
 	if !plan.ApprovalClass.Valid() {
 		return invalid("approvalClass", "unknown value")
 	}
 	if err := validateUTCTime("expiresAt", plan.ExpiresAt); err != nil {
 		return err
+	}
+	if !plan.ExpiresAt.After(plan.CreatedAt) {
+		return invalid("expiresAt", "must be later than createdAt")
 	}
 	if plan.CoolingOffSeconds < 0 {
 		return invalid("coolingOffSeconds", "must not be negative")
@@ -174,6 +299,9 @@ func validatePlanStructure(plan domain.Plan) error {
 		return err
 	}
 	if err := validatePreconditions(plan.Preconditions); err != nil {
+		return err
+	}
+	if err := validatePermissions(plan.Permissions, plan.ApprovalClass); err != nil {
 		return err
 	}
 	if err := validateSteps(plan.Steps, plan.PointOfNoReturn); err != nil {
@@ -317,8 +445,20 @@ func validateSteps(steps []domain.PlanStep, pointOfNoReturn string) error {
 		if !step.ExecutingIdentity.Valid() {
 			return invalid(path+".executingIdentity", "unknown value")
 		}
-		if step.TimeoutSeconds < 0 {
-			return invalid(path+".timeoutSeconds", "must not be negative")
+		if step.CommandRedacted.String() == "" {
+			return invalid(path+".commandRedacted", "must not be empty")
+		}
+		if !step.Retry.Valid() {
+			return invalid(path+".retry", "must be an explicit bounded retry policy")
+		}
+		if step.TimeoutSeconds <= 0 || step.TimeoutSeconds > domain.MaxStepTimeoutSeconds {
+			return invalid(path+".timeoutSeconds", "must be positive and bounded")
+		}
+		if step.SuccessCondition.String() == "" {
+			return invalid(path+".successCondition", "must not be empty")
+		}
+		if !step.FailureBehavior.Valid() {
+			return invalid(path+".failureBehavior", "unknown value")
 		}
 	}
 
@@ -326,6 +466,30 @@ func validateSteps(steps []domain.PlanStep, pointOfNoReturn string) error {
 		if _, exists := seen[pointOfNoReturn]; !exists {
 			return invalid("pointOfNoReturn", "must name a step in this plan")
 		}
+	}
+
+	return nil
+}
+
+func validatePermissions(permissions []domain.PlanPermission, approvalClass domain.ApprovalClass) error {
+	if approvalClass != domain.ApprovalRead && len(permissions) == 0 {
+		return invalid("permissions", "must contain exact permission checks for a mutating plan")
+	}
+
+	seen := make(map[string]struct{}, len(permissions))
+	for index, permission := range permissions {
+		path := fmt.Sprintf("permissions[%d]", index)
+		if !permission.Identity.Valid() {
+			return invalid(path+".identity", "unknown value")
+		}
+		if !permissionPattern.MatchString(permission.Permission) {
+			return invalid(path+".permission", "must be an exact permission name")
+		}
+		key := string(permission.Identity) + "\x00" + permission.Permission
+		if _, exists := seen[key]; exists {
+			return invalid(path, "duplicates an identity and permission")
+		}
+		seen[key] = struct{}{}
 	}
 
 	return nil
@@ -391,6 +555,19 @@ func validateUTCTime(path string, value time.Time) error {
 	_, offset := value.Zone()
 	if offset != 0 {
 		return invalid(path, "must be UTC")
+	}
+
+	return nil
+}
+
+func validatePrincipal(value string) error {
+	if value == "" || len(value) > 254 || strings.TrimSpace(value) != value {
+		return invalid("principal", "must be a non-empty canonical identity")
+	}
+	for _, character := range value {
+		if unicode.IsSpace(character) || unicode.IsControl(character) {
+			return invalid("principal", "must not contain whitespace or control characters")
+		}
 	}
 
 	return nil

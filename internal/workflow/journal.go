@@ -59,12 +59,37 @@ func DecodeJournalEntry(encoded []byte) (domain.JournalEntry, error) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return domain.JournalEntry{}, journalEntryError("decode", "trailing JSON value")
 	}
+	if err := validateRequiredPauseJSON(encoded, entry); err != nil {
+		return domain.JournalEntry{}, err
+	}
 
 	if err := ValidateJournalEntry(entry); err != nil {
 		return domain.JournalEntry{}, err
 	}
 
 	return entry, nil
+}
+
+func validateRequiredPauseJSON(encoded []byte, entry domain.JournalEntry) error {
+	if entry.OperationState != domain.OperationPaused || entry.Pause == nil {
+		return nil
+	}
+
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		return journalEntryError("decode", err.Error())
+	}
+	var pause map[string]json.RawMessage
+	if err := json.Unmarshal(document["pause"], &pause); err != nil {
+		return journalEntryError("pause", "must be an object")
+	}
+	for _, field := range []string{"pausedAt", "pauseReason", "mutationOccurred", "resumeBy", "reapprovalRequired"} {
+		if _, exists := pause[field]; !exists {
+			return journalEntryError("pause."+field, "is required")
+		}
+	}
+
+	return nil
 }
 
 // ValidateJournalEntry checks the closed JournalEntryV1 invariants.
@@ -96,9 +121,22 @@ func ValidateJournalEntry(entry domain.JournalEntry) error {
 		if entry.Step != nil {
 			return journalEntryError("step", "must be absent for a transition")
 		}
+		if entry.OperationState == domain.OperationPaused {
+			if entry.Pause == nil {
+				return journalEntryError("pause", "is required for a PAUSED transition")
+			}
+			if err := validateJournalPause(*entry.Pause, entry.RecordedAt); err != nil {
+				return err
+			}
+		} else if entry.Pause != nil {
+			return journalEntryError("pause", "is allowed only for a PAUSED transition")
+		}
 	case domain.JournalEntryStep:
 		if entry.Step == nil {
 			return journalEntryError("step", "is required for a step entry")
+		}
+		if entry.Pause != nil {
+			return journalEntryError("pause", "must be absent for a step entry")
 		}
 		if err := validateJournalStep(*entry.Step, entry.RecordedAt); err != nil {
 			return err
@@ -122,6 +160,7 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 	var previousTime time.Time
 	attempts := make(map[string]uint32)
 	completed := make(map[string]struct{})
+	mutationMayHaveOccurred := false
 
 	for index, entry := range entries {
 		if err := ValidateJournalEntry(entry); err != nil {
@@ -151,8 +190,17 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 				machine = NewMachine()
 				continue
 			}
+			if entry.OperationState == domain.OperationCancelled && mutationMayHaveOccurred && machine.State() != domain.OperationRollback {
+				return journalStreamError(index+1, "CANCELLED after possible mutation must route through ROLLBACK")
+			}
 			if err := machine.Transition(entry.OperationState); err != nil {
 				return fmt.Errorf("%w: entry %d: %v", ErrInvalidJournalStream, index+1, err)
+			}
+			if entry.Pause != nil {
+				if mutationMayHaveOccurred && !entry.Pause.MutationOccurred {
+					return journalStreamError(index+1, "PAUSED metadata must not discard observed mutation")
+				}
+				mutationMayHaveOccurred = mutationMayHaveOccurred || entry.Pause.MutationOccurred
 			}
 			continue
 		}
@@ -175,6 +223,8 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 			return journalStreamError(index+1, "step attempts must start at 1 and increment without gaps")
 		}
 		attempts[entry.Step.ID] = entry.Step.Attempt
+		mutationMayHaveOccurred = mutationMayHaveOccurred ||
+			entry.Step.MutationOccurred || entry.Step.Outcome == domain.StepUnknown
 		if entry.Step.Outcome == domain.StepDone {
 			completed[entry.Step.ID] = struct{}{}
 		}
@@ -231,6 +281,26 @@ func validateJournalStep(step domain.JournalStep, recordedAt time.Time) error {
 	}
 	if recordedAt.Before(*step.EndedAt) {
 		return journalEntryError("recordedAt", "must not precede step.endedAt")
+	}
+
+	return nil
+}
+
+func validateJournalPause(pause domain.JournalPause, recordedAt time.Time) error {
+	if err := validateJournalTime("pause.pausedAt", pause.PausedAt); err != nil {
+		return err
+	}
+	if recordedAt.Before(pause.PausedAt) {
+		return journalEntryError("recordedAt", "must not precede pause.pausedAt")
+	}
+	if pause.PauseReason.String() == "" {
+		return journalEntryError("pause.pauseReason", "must not be empty")
+	}
+	if err := validateJournalTime("pause.resumeBy", pause.ResumeBy); err != nil {
+		return err
+	}
+	if !pause.ResumeBy.After(pause.PausedAt) {
+		return journalEntryError("pause.resumeBy", "must be later than pausedAt")
 	}
 
 	return nil

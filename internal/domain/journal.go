@@ -106,6 +106,7 @@ type JournalEntry struct {
 	RecordedAt     time.Time        `json:"recordedAt"`
 	OperationState OperationState   `json:"operationState"`
 	Step           *JournalStep     `json:"step,omitempty"`
+	Pause          *JournalPause    `json:"pause,omitempty"`
 }
 
 // JournalStep records one observed attempt without persisting raw output.
@@ -118,4 +119,15 @@ type JournalStep struct {
 	EndedAt           *time.Time        `json:"endedAt,omitempty"`
 	MutationOccurred  bool              `json:"mutationOccurred"`
 	ResultSummary     redact.Text       `json:"resultSummary"`
+}
+
+// JournalPause records all state needed to review and safely resume a pause.
+// MutationOccurred is deliberately not optional: false is meaningful durable
+// evidence that cancellation may terminate without rollback.
+type JournalPause struct {
+	PausedAt           time.Time   `json:"pausedAt"`
+	PauseReason        redact.Text `json:"pauseReason"`
+	MutationOccurred   bool        `json:"mutationOccurred"`
+	ResumeBy           time.Time   `json:"resumeBy"`
+	ReapprovalRequired bool        `json:"reapprovalRequired"`
 }

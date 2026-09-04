@@ -72,7 +72,7 @@ func TestPlanSealAndHashVerification(t *testing.T) {
 		t.Fatalf("VerifyPlanHash() returned an error: %v", err)
 	}
 
-	const knownDigest = "cdfd99dc269be17d5043b723208fa7f566657dca6e56202e9136cfc2fc0be02a"
+	const knownDigest = "836643e2a07f445f9f8b5076633b74a5343d19083924060fcf52d4e625111e77"
 	if plan.PlanHash != knownDigest {
 		t.Fatalf("sealed plan digest = %q, want known vector %q", plan.PlanHash, knownDigest)
 	}
@@ -109,7 +109,7 @@ func TestPlanSealAndHashVerification(t *testing.T) {
 	}
 }
 
-func TestPlanHashCoversEveryReviewSection(t *testing.T) {
+func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 	t.Parallel()
 
 	original := validPlan()
@@ -119,6 +119,9 @@ func TestPlanHashCoversEveryReviewSection(t *testing.T) {
 	}{
 		{name: "plan id", mutate: func(plan *domain.Plan) { plan.PlanID = "plan-fedcba9876543210" }},
 		{name: "workflow", mutate: func(plan *domain.Plan) { plan.WorkflowID = "WF-DSK-01" }},
+		{name: "environment", mutate: func(plan *domain.Plan) { plan.Environment = "staging" }},
+		{name: "principal", mutate: func(plan *domain.Plan) { plan.Principal = "reviewer@example.com" }},
+		{name: "creation time", mutate: func(plan *domain.Plan) { plan.CreatedAt = plan.CreatedAt.Add(time.Second) }},
 		{name: "approval", mutate: func(plan *domain.Plan) { plan.ApprovalClass = domain.ApprovalSecuritySensitive }},
 		{name: "expiry", mutate: func(plan *domain.Plan) { plan.ExpiresAt = plan.ExpiresAt.Add(time.Minute) }},
 		{name: "cooling off", mutate: func(plan *domain.Plan) { plan.CoolingOffSeconds++ }},
@@ -134,7 +137,12 @@ func TestPlanHashCoversEveryReviewSection(t *testing.T) {
 		}},
 		{name: "resource", mutate: func(plan *domain.Plan) { plan.Resources[0].Fingerprint = "generation-8" }},
 		{name: "precondition", mutate: func(plan *domain.Plan) { plan.Preconditions[0].Detail = redact.Sanitize("ready") }},
+		{name: "precondition outcome", mutate: func(plan *domain.Plan) { plan.Preconditions[0].OK = false }},
+		{name: "permission", mutate: func(plan *domain.Plan) { plan.Permissions[0].Granted = false }},
 		{name: "step", mutate: func(plan *domain.Plan) { plan.Steps[0].Executor = "compute-api" }},
+		{name: "step retry", mutate: func(plan *domain.Plan) { plan.Steps[0].Retry.MaxAttempts++ }},
+		{name: "step success", mutate: func(plan *domain.Plan) { plan.Steps[0].SuccessCondition = redact.Sanitize("stopped") }},
+		{name: "step failure", mutate: func(plan *domain.Plan) { plan.Steps[0].FailureBehavior = domain.FailurePause }},
 		{name: "cost", mutate: func(plan *domain.Plan) { plan.Cost.RunRate.AmountUSD++ }},
 		{name: "downtime", mutate: func(plan *domain.Plan) { plan.Downtime.ExpectedSeconds++ }},
 		{name: "exposure", mutate: func(plan *domain.Plan) { plan.Exposure = domain.ExposurePrivate }},
@@ -192,6 +200,28 @@ func TestPlanDecodeRejectsOpenOrMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestPlanDecodeRejectsMissingExecutionContractFields(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := policy.EncodePlan(validPlan())
+	if err != nil {
+		t.Fatalf("EncodePlan() returned an error: %v", err)
+	}
+
+	for _, field := range []string{
+		"environment", "principal", "createdAt", "permissions", "retry",
+		"idempotent", "cancelSafe", "successCondition", "failureBehavior",
+	} {
+		field := field
+		t.Run(field, func(t *testing.T) {
+			without := removeJSONField(t, encoded, field)
+			if _, err := policy.DecodePlan(without); !errors.Is(err, policy.ErrInvalidPlan) {
+				t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
+			}
+		})
+	}
+}
+
 func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 	t.Parallel()
 
@@ -204,6 +234,10 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 		{name: "workflow id", mutate: func(plan *domain.Plan) { plan.WorkflowID = "vm-resize" }},
 		{name: "approval class", mutate: func(plan *domain.Plan) { plan.ApprovalClass = 255 }},
 		{name: "zero expiry", mutate: func(plan *domain.Plan) { plan.ExpiresAt = time.Time{} }},
+		{name: "zero creation", mutate: func(plan *domain.Plan) { plan.CreatedAt = time.Time{} }},
+		{name: "expiry before creation", mutate: func(plan *domain.Plan) { plan.ExpiresAt = plan.CreatedAt }},
+		{name: "environment", mutate: func(plan *domain.Plan) { plan.Environment = "Production" }},
+		{name: "principal", mutate: func(plan *domain.Plan) { plan.Principal = "operator example" }},
 		{name: "non UTC expiry", mutate: func(plan *domain.Plan) {
 			plan.ExpiresAt = time.Date(2026, 9, 3, 12, 0, 0, 0, time.FixedZone("offset", 3600))
 		}},
@@ -229,12 +263,26 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 		{name: "duplicate precondition", mutate: func(plan *domain.Plan) {
 			plan.Preconditions = append(plan.Preconditions, plan.Preconditions[0])
 		}},
+		{name: "missing permissions", mutate: func(plan *domain.Plan) { plan.Permissions = nil }},
+		{name: "permission identity", mutate: func(plan *domain.Plan) { plan.Permissions[0].Identity = "root" }},
+		{name: "permission name", mutate: func(plan *domain.Plan) { plan.Permissions[0].Permission = "instances.stop" }},
+		{name: "duplicate permission", mutate: func(plan *domain.Plan) {
+			plan.Permissions = append(plan.Permissions, plan.Permissions[0])
+		}},
 		{name: "missing steps", mutate: func(plan *domain.Plan) { plan.Steps = nil }},
 		{name: "step id", mutate: func(plan *domain.Plan) { plan.Steps[0].ID = "" }},
 		{name: "duplicate step", mutate: func(plan *domain.Plan) { plan.Steps = append(plan.Steps, plan.Steps[0]) }},
 		{name: "step executor", mutate: func(plan *domain.Plan) { plan.Steps[0].Executor = "" }},
 		{name: "step identity", mutate: func(plan *domain.Plan) { plan.Steps[0].ExecutingIdentity = "root" }},
-		{name: "step timeout", mutate: func(plan *domain.Plan) { plan.Steps[0].TimeoutSeconds = -1 }},
+		{name: "empty command", mutate: func(plan *domain.Plan) { plan.Steps[0].CommandRedacted = redact.Sanitize("") }},
+		{name: "zero retry attempts", mutate: func(plan *domain.Plan) { plan.Steps[0].Retry.MaxAttempts = 0 }},
+		{name: "unbounded retry attempts", mutate: func(plan *domain.Plan) { plan.Steps[0].Retry.MaxAttempts = domain.MaxStepAttempts + 1 }},
+		{name: "zero retry backoff", mutate: func(plan *domain.Plan) { plan.Steps[0].Retry.InitialBackoffSeconds = 0 }},
+		{name: "inverted retry backoff", mutate: func(plan *domain.Plan) { plan.Steps[0].Retry.MaxBackoffSeconds = 1 }},
+		{name: "zero step timeout", mutate: func(plan *domain.Plan) { plan.Steps[0].TimeoutSeconds = 0 }},
+		{name: "unbounded step timeout", mutate: func(plan *domain.Plan) { plan.Steps[0].TimeoutSeconds = domain.MaxStepTimeoutSeconds + 1 }},
+		{name: "missing success condition", mutate: func(plan *domain.Plan) { plan.Steps[0].SuccessCondition = redact.Sanitize("") }},
+		{name: "failure behavior", mutate: func(plan *domain.Plan) { plan.Steps[0].FailureBehavior = "continue" }},
 		{name: "point of no return", mutate: func(plan *domain.Plan) { plan.PointOfNoReturn = "missing-step" }},
 		{name: "run rate amount", mutate: func(plan *domain.Plan) { plan.Cost.RunRate.AmountUSD = math.NaN() }},
 		{name: "run rate period", mutate: func(plan *domain.Plan) { plan.Cost.RunRate.Period = "" }},
@@ -303,6 +351,29 @@ func TestPlanExpiryGate(t *testing.T) {
 	}
 }
 
+func TestPlanValiditySetsCreationAndExpiry_TEST_U_PLAN_02(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	createdAt := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	sealed, err := policy.SealPlanAt(plan, createdAt, 45*time.Minute)
+	if err != nil {
+		t.Fatalf("SealPlanAt() returned an error: %v", err)
+	}
+	if sealed.CreatedAt != createdAt || sealed.ExpiresAt != createdAt.Add(45*time.Minute) {
+		t.Fatalf("SealPlanAt() boundaries = (%s, %s)", sealed.CreatedAt, sealed.ExpiresAt)
+	}
+	if err := policy.VerifyPlanHash(sealed); err != nil {
+		t.Fatalf("VerifyPlanHash() returned an error: %v", err)
+	}
+
+	for _, validity := range []time.Duration{0, -time.Second} {
+		if _, err := policy.SealPlanAt(plan, createdAt, validity); !errors.Is(err, policy.ErrInvalidPlan) {
+			t.Errorf("SealPlanAt(validity=%s) error = %v, want ErrInvalidPlan", validity, err)
+		}
+	}
+}
+
 func TestPlanAllowsScheduledDestructiveStepUp(t *testing.T) {
 	t.Parallel()
 
@@ -330,6 +401,9 @@ func validPlan() domain.Plan {
 	plan := domain.Plan{
 		PlanID:            "plan-0123456789abcdef",
 		WorkflowID:        "WF-VM-02",
+		Environment:       "production",
+		Principal:         "operator@example.com",
+		CreatedAt:         time.Date(2026, 9, 3, 11, 0, 0, 0, time.UTC),
 		ApprovalClass:     domain.ApprovalProtected,
 		ExpiresAt:         time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC),
 		CoolingOffSeconds: 0,
@@ -345,6 +419,9 @@ func validPlan() domain.Plan {
 		Preconditions: []domain.PlanPrecondition{
 			{ID: "instance-healthy", OK: true, Detail: redact.Sanitize("healthy")},
 		},
+		Permissions: []domain.PlanPermission{
+			{Identity: domain.IdentityOperator, Permission: "compute.instances.stop", Granted: true},
+		},
 		Steps: []domain.PlanStep{
 			{
 				ID:                "stop-instance",
@@ -352,8 +429,15 @@ func validPlan() domain.Plan {
 				ExecutingIdentity: domain.IdentityOperator,
 				CommandRedacted:   redact.Sanitize("gcloud compute instances stop example"),
 				Idempotent:        true,
-				CancelSafe:        false,
-				TimeoutSeconds:    300,
+				Retry: domain.RetryPolicy{
+					MaxAttempts:           3,
+					InitialBackoffSeconds: 2,
+					MaxBackoffSeconds:     10,
+				},
+				CancelSafe:       false,
+				TimeoutSeconds:   300,
+				SuccessCondition: redact.Sanitize("instance is stopped"),
+				FailureBehavior:  domain.FailureRollback,
 			},
 		},
 		Cost: domain.PlanCost{
@@ -392,4 +476,47 @@ func validPlan() domain.Plan {
 	}
 
 	return sealed
+}
+
+func removeJSONField(t *testing.T, encoded []byte, field string) []byte {
+	t.Helper()
+
+	needle := []byte(`"` + field + `":`)
+	start := bytes.Index(encoded, needle)
+	if start < 0 {
+		t.Fatalf("encoded plan omitted %q", field)
+	}
+	end := start + len(needle)
+	depth := 0
+	inString := false
+	for end < len(encoded) {
+		character := encoded[end]
+		if character == '"' && (end == 0 || encoded[end-1] != '\\') {
+			inString = !inString
+		}
+		if !inString {
+			switch character {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				if depth == 0 {
+					goto found
+				}
+				depth--
+			case ',':
+				if depth == 0 {
+					end++
+					goto found
+				}
+			}
+		}
+		end++
+	}
+
+found:
+	if end <= len(encoded) && start > 0 && end < len(encoded) && encoded[end] == '}' && encoded[start-1] == ',' {
+		start--
+	}
+
+	return append(append([]byte(nil), encoded[:start]...), encoded[end:]...)
 }

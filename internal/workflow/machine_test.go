@@ -90,7 +90,7 @@ func TestMachineFailureBranches(t *testing.T) {
 		},
 		{
 			name:  "cancel before mutation",
-			start: domain.OperationLock,
+			start: domain.OperationExecute,
 			path:  []domain.OperationState{domain.OperationCancelled},
 		},
 		{

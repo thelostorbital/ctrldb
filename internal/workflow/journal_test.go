@@ -171,6 +171,88 @@ func TestJournalUnknownStepMayHaveNoEnd(t *testing.T) {
 	}
 }
 
+func TestPausedJournalRequiresCompleteMetadata(t *testing.T) {
+	t.Parallel()
+
+	entry := validPausedEntry()
+	encoded, err := workflow.EncodeJournalEntry(entry)
+	if err != nil {
+		t.Fatalf("EncodeJournalEntry() returned an error: %v", err)
+	}
+	decoded, err := workflow.DecodeJournalEntry(encoded)
+	if err != nil {
+		t.Fatalf("DecodeJournalEntry() returned an error: %v", err)
+	}
+	if !reflect.DeepEqual(decoded, entry) {
+		t.Fatalf("decoded pause = %#v, want %#v", decoded, entry)
+	}
+
+	for _, field := range []string{"pausedAt", "pauseReason", "mutationOccurred", "resumeBy", "reapprovalRequired"} {
+		field := field
+		t.Run("missing "+field, func(t *testing.T) {
+			needle := []byte(`"` + field + `":`)
+			start := bytes.Index(encoded, needle)
+			if start < 0 {
+				t.Fatalf("encoded pause omitted %s", field)
+			}
+			end := start + len(needle)
+			inString := false
+			for end < len(encoded) {
+				if encoded[end] == '"' && (end == 0 || encoded[end-1] != '\\') {
+					inString = !inString
+				}
+				if !inString && (encoded[end] == ',' || encoded[end] == '}') {
+					break
+				}
+				end++
+			}
+			if end < len(encoded) && encoded[end] == ',' {
+				end++
+			} else if start > 0 && encoded[start-1] == ',' {
+				start--
+			}
+			without := append(append([]byte(nil), encoded[:start]...), encoded[end:]...)
+			if _, err := workflow.DecodeJournalEntry(without); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+				t.Fatalf("DecodeJournalEntry() error = %v, want ErrInvalidJournalEntry", err)
+			}
+		})
+	}
+}
+
+func TestPausedJournalRejectsInvalidMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*domain.JournalEntry)
+	}{
+		{name: "missing pause", mutate: func(entry *domain.JournalEntry) { entry.Pause = nil }},
+		{name: "recorded before pausedAt", mutate: func(entry *domain.JournalEntry) { entry.Pause.PausedAt = entry.RecordedAt.Add(time.Second) }},
+		{name: "empty reason", mutate: func(entry *domain.JournalEntry) { entry.Pause.PauseReason = redact.Sanitize("") }},
+		{name: "zero resumeBy", mutate: func(entry *domain.JournalEntry) { entry.Pause.ResumeBy = time.Time{} }},
+		{name: "expired resumeBy", mutate: func(entry *domain.JournalEntry) { entry.Pause.ResumeBy = entry.Pause.PausedAt }},
+		{name: "pause on non-paused transition", mutate: func(entry *domain.JournalEntry) { entry.OperationState = domain.OperationExecute }},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			entry := validPausedEntry()
+			test.mutate(&entry)
+			if err := workflow.ValidateJournalEntry(entry); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+				t.Fatalf("ValidateJournalEntry() error = %v, want ErrInvalidJournalEntry", err)
+			}
+		})
+	}
+
+	step := validStepEntry()
+	step.Pause = validPausedEntry().Pause
+	if err := workflow.ValidateJournalEntry(step); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("step with pause error = %v, want ErrInvalidJournalEntry", err)
+	}
+}
+
 func TestJournalValidatesCompleteHistory(t *testing.T) {
 	t.Parallel()
 
@@ -263,6 +345,62 @@ func TestJournalRejectsInconsistentHistory(t *testing.T) {
 	}
 }
 
+func TestJournalCancellationRequiresRollbackAfterPossibleMutation(t *testing.T) {
+	t.Parallel()
+
+	beforeMutation := validJournal()[:6]
+	cancelled := validTransitionEntry(7, domain.OperationCancelled)
+	cancelled.RecordedAt = beforeMutation[len(beforeMutation)-1].RecordedAt.Add(time.Second)
+	beforeMutation = append(beforeMutation, cancelled)
+	if err := workflow.ValidateJournal(beforeMutation); err != nil {
+		t.Fatalf("pre-mutation CANCELLED journal returned an error: %v", err)
+	}
+
+	for _, mutate := range []func(*domain.JournalEntry){
+		func(entry *domain.JournalEntry) { entry.Step.MutationOccurred = true },
+		func(entry *domain.JournalEntry) {
+			entry.Step.Outcome = domain.StepUnknown
+			entry.Step.EndedAt = nil
+		},
+	} {
+		entries := validJournal()[:6]
+		mutate(&entries[5])
+		cancelled := validTransitionEntry(7, domain.OperationCancelled)
+		cancelled.RecordedAt = entries[5].RecordedAt.Add(time.Second)
+		entries = append(entries, cancelled)
+		if err := workflow.ValidateJournal(entries); !errors.Is(err, workflow.ErrInvalidJournalStream) {
+			t.Fatalf("possibly mutated CANCELLED journal error = %v, want ErrInvalidJournalStream", err)
+		}
+	}
+
+	afterRollback := validJournal()[:6]
+	afterRollback[5].Step.MutationOccurred = true
+	rollback := validTransitionEntry(7, domain.OperationRollback)
+	rollback.RecordedAt = afterRollback[5].RecordedAt.Add(time.Second)
+	cancelled = validTransitionEntry(8, domain.OperationCancelled)
+	cancelled.RecordedAt = rollback.RecordedAt.Add(time.Second)
+	afterRollback = append(afterRollback, rollback, cancelled)
+	if err := workflow.ValidateJournal(afterRollback); err != nil {
+		t.Fatalf("CANCELLED through verified ROLLBACK returned an error: %v", err)
+	}
+}
+
+func TestJournalPauseCannotDiscardObservedMutation(t *testing.T) {
+	t.Parallel()
+
+	entries := validJournal()[:6]
+	entries[5].Step.MutationOccurred = true
+	pause := validPausedEntry()
+	pause.RecordedAt = entries[5].RecordedAt.Add(time.Second)
+	pause.Pause.PausedAt = pause.RecordedAt
+	pause.Pause.ResumeBy = pause.RecordedAt.Add(time.Hour)
+	entries = append(entries, pause)
+
+	if err := workflow.ValidateJournal(entries); !errors.Is(err, workflow.ErrInvalidJournalStream) {
+		t.Fatalf("ValidateJournal() error = %v, want ErrInvalidJournalStream", err)
+	}
+}
+
 func TestJournalObjectNamesSortBySequence(t *testing.T) {
 	t.Parallel()
 
@@ -341,6 +479,27 @@ func validStepEntry() domain.JournalEntry {
 			EndedAt:           &endedAt,
 			MutationOccurred:  false,
 			ResultSummary:     redact.Sanitize("healthy"),
+		},
+	}
+}
+
+func validPausedEntry() domain.JournalEntry {
+	pausedAt := time.Date(2026, 9, 3, 12, 0, 7, 0, time.UTC)
+
+	return domain.JournalEntry{
+		Schema:         domain.JournalSchemaV1,
+		OperationID:    "op-0123456789abcdef",
+		PlanID:         "plan-0123456789abcdef",
+		Sequence:       7,
+		Kind:           domain.JournalEntryTransition,
+		RecordedAt:     pausedAt,
+		OperationState: domain.OperationPaused,
+		Pause: &domain.JournalPause{
+			PausedAt:           pausedAt,
+			PauseReason:        redact.Sanitize("credential expired"),
+			MutationOccurred:   false,
+			ResumeBy:           pausedAt.Add(24 * time.Hour),
+			ReapprovalRequired: true,
 		},
 	}
 }

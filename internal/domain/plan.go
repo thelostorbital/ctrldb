@@ -15,6 +15,9 @@ type Plan struct {
 	PlanID            string             `json:"planId"`
 	PlanHash          string             `json:"planHash"`
 	WorkflowID        string             `json:"workflowId"`
+	Environment       string             `json:"environment"`
+	Principal         string             `json:"principal"`
+	CreatedAt         time.Time          `json:"createdAt"`
 	ApprovalClass     ApprovalClass      `json:"approvalClass"`
 	ExpiresAt         time.Time          `json:"expiresAt"`
 	CoolingOffSeconds int64              `json:"coolingOffSeconds"`
@@ -24,6 +27,7 @@ type Plan struct {
 	Intent            *PlanIntent        `json:"intent,omitempty"`
 	Resources         []PlanResource     `json:"resources"`
 	Preconditions     []PlanPrecondition `json:"preconditions"`
+	Permissions       []PlanPermission   `json:"permissions"`
 	Steps             []PlanStep         `json:"steps"`
 	Cost              PlanCost           `json:"cost"`
 	Downtime          PlanDowntime       `json:"downtime"`
@@ -86,8 +90,11 @@ type PlanStep struct {
 	ExecutingIdentity ExecutionIdentity `json:"executingIdentity"`
 	CommandRedacted   redact.Text       `json:"commandRedacted"`
 	Idempotent        bool              `json:"idempotent"`
+	Retry             RetryPolicy       `json:"retry"`
 	CancelSafe        bool              `json:"cancelSafe"`
 	TimeoutSeconds    int64             `json:"timeoutSeconds"`
+	SuccessCondition  redact.Text       `json:"successCondition"`
+	FailureBehavior   FailureBehavior   `json:"failureBehavior"`
 }
 
 // CostSource identifies the data source behind a plan estimate.

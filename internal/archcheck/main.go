@@ -8,6 +8,7 @@ package main
 import (
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/importer"
 	"go/parser"
 	"go/token"
@@ -37,6 +38,7 @@ type sourceFile struct {
 type sourcePolicy struct {
 	allowBubbleTeaImport    bool
 	allowSecretFormatting   bool
+	allowRedactionAssertion bool
 	allowSourceImporter     bool
 	allowTestInfrastructure bool
 	enforceVerifierBoundary bool
@@ -61,6 +63,27 @@ var formattingFunctions = map[string]map[string]struct{}{
 		"Panic":  {}, "Panicf": {}, "Panicln": {},
 		"Print": {}, "Printf": {}, "Println": {},
 	},
+	"log/slog": {
+		"Debug": {}, "DebugContext": {},
+		"Error": {}, "ErrorContext": {},
+		"Info": {}, "InfoContext": {},
+		"Log": {}, "LogAttrs": {},
+		"With": {},
+		"Warn": {}, "WarnContext": {},
+	},
+}
+
+var verifierSafeStandardImports = map[string]struct{}{
+	"bytes": {}, "cmp": {}, "context": {}, "errors": {}, "fmt": {},
+	"io": {}, "io/fs": {}, "iter": {}, "log": {}, "log/slog": {},
+	"maps": {}, "net/netip": {}, "net/url": {}, "path": {},
+	"path/filepath": {}, "reflect": {}, "regexp": {}, "slices": {},
+	"sort": {}, "strconv": {}, "strings": {}, "sync": {},
+	"sync/atomic": {}, "time": {},
+}
+
+var verifierSafeStandardPrefixes = []string{
+	"archive/", "compress/", "crypto/", "encoding/", "hash/", "math/", "text/", "unicode/",
 }
 
 var forbiddenProcessImports = map[string]string{
@@ -188,7 +211,7 @@ func scan(root string) ([]finding, error) {
 	return findings, nil
 }
 
-func findPackageSecretViolations(sources []sourceFile, packageImporter types.Importer) ([]finding, error) {
+func findPackageSecretViolations(sources []sourceFile, packageImporter *architectureImporter) ([]finding, error) {
 	parsedByPackage := make(map[string][]*ast.File)
 	policies := make(map[*ast.File]sourcePolicy, len(sources))
 	files := token.NewFileSet()
@@ -213,7 +236,7 @@ func findPackageSecretViolations(sources []sourceFile, packageImporter types.Imp
 			Error:                    func(error) {},
 		}
 		checkedPackage, _ := configuration.Check(modulePath+"/.archcheck/package/"+packageName, files, parsedFiles, information)
-		facts := findFlowFacts(parsedFiles, information, checkedPackage)
+		facts := findFlowFacts(parsedFiles, information, checkedPackage, packageImporter.summaries, nil)
 
 		for _, parsed := range parsedFiles {
 			if policies[parsed].allowSecretFormatting {
@@ -224,8 +247,9 @@ func findPackageSecretViolations(sources []sourceFile, packageImporter types.Imp
 				if !ok || !isFormattingCall(call, information, facts) {
 					return true
 				}
+				allowRedactionAssertion := policies[parsed].allowRedactionAssertion && isRedactionAssertionCall(call, information)
 				for _, argument := range call.Args {
-					message := formattingArgumentViolationMessage(argument, information, facts)
+					message := formattingArgumentViolationMessage(argument, information, facts, allowRedactionAssertion)
 					if message == "" {
 						continue
 					}
@@ -324,8 +348,9 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 	uses := make(map[*ast.Ident]types.Object)
 	definitions := make(map[*ast.Ident]types.Object)
 	expressionTypes := make(map[ast.Expr]types.TypeAndValue)
+	packageImporter := newArchitectureImporter("")
 	configuration := types.Config{
-		Importer:                 newArchitectureImporter(""),
+		Importer:                 packageImporter,
 		DisableUnusedImportCheck: true,
 		Error:                    func(error) {},
 	}
@@ -336,13 +361,14 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 		Uses:  uses,
 	}
 	checkedPackage, _ := configuration.Check(checkedPackagePath, files, []*ast.File{parsed}, typeInformation)
-	facts := findFlowFacts([]*ast.File{parsed}, typeInformation, checkedPackage)
+	facts := findFlowFacts([]*ast.File{parsed}, typeInformation, checkedPackage, packageImporter.summaries, nil)
 
 	ast.Inspect(parsed, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if ok && !policy.allowSecretFormatting && isFormattingCall(call, typeInformation, facts) {
+			allowRedactionAssertion := policy.allowRedactionAssertion && isRedactionAssertionCall(call, typeInformation)
 			for _, argument := range call.Args {
-				message := formattingArgumentViolationMessage(argument, typeInformation, facts)
+				message := formattingArgumentViolationMessage(argument, typeInformation, facts, allowRedactionAssertion)
 				if message == "" {
 					continue
 				}
@@ -396,20 +422,22 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 // repository's internal secret package, and any unresolved value reaching a
 // formatting boundary is rejected separately.
 type architectureImporter struct {
-	root     string
-	files    *token.FileSet
-	standard types.Importer
-	packages map[string]*types.Package
-	loading  map[string]bool
+	root      string
+	files     *token.FileSet
+	standard  types.Importer
+	packages  map[string]*types.Package
+	loading   map[string]bool
+	summaries *flowSummaries
 }
 
 func newArchitectureImporter(root string) *architectureImporter {
 	files := token.NewFileSet()
 	loader := &architectureImporter{
-		root:     root,
-		files:    files,
-		packages: make(map[string]*types.Package),
-		loading:  make(map[string]bool),
+		root:      root,
+		files:     files,
+		packages:  make(map[string]*types.Package),
+		loading:   make(map[string]bool),
+		summaries: newFlowSummaries(),
 	}
 	if root != "" {
 		loader.standard = importer.ForCompiler(files, "source", nil)
@@ -452,14 +480,10 @@ func (loader *architectureImporter) Import(importPath string) (*types.Package, e
 		}
 	case "log":
 		addVariadicFunctions(imported, formattingFunctions["log"])
-		logger := types.NewNamed(types.NewTypeName(token.NoPos, imported, "Logger", nil), types.NewStruct(nil, nil), nil)
-		imported.Scope().Insert(logger.Obj())
-		for name := range formattingFunctions["log"] {
-			receiver := types.NewVar(token.NoPos, imported, "logger", types.NewPointer(logger))
-			logger.AddMethod(types.NewFunc(token.NoPos, imported, name, variadicSignature(receiver, nil)))
-		}
-		addFunction(imported, "Default", []types.Type{types.NewPointer(logger)})
-		addFunction(imported, "New", []types.Type{types.NewPointer(logger)})
+		addLoggerType(imported, formattingFunctions["log"])
+	case "log/slog":
+		addVariadicFunctions(imported, formattingFunctions["log/slog"])
+		addLoggerType(imported, formattingFunctions["log/slog"])
 	case "go/importer":
 		// The syntax-only unit-test importer needs enough metadata to prove
 		// importer.Default is rejected even where importing go/importer itself
@@ -480,11 +504,31 @@ func (loader *architectureImporter) Import(importPath string) (*types.Package, e
 		for _, name := range []string{"String", "GoString"} {
 			secretValue.AddMethod(types.NewFunc(token.NoPos, imported, name, fixedSignature(receiver, []types.Type{types.Typ[types.String]})))
 		}
+		secretValue.AddMethod(types.NewFunc(token.NoPos, imported, "Reveal", fixedSignature(receiver, []types.Type{types.NewSlice(types.Typ[types.Byte])})))
+		secretValue.AddMethod(types.NewFunc(token.NoPos, imported, "Empty", fixedSignature(receiver, []types.Type{types.Typ[types.Bool]})))
+		secretValue.AddMethod(types.NewFunc(token.NoPos, imported, "Zero", fixedSignature(receiver, nil)))
+		for _, name := range []string{"MarshalJSON", "MarshalText"} {
+			secretValue.AddMethod(types.NewFunc(token.NoPos, imported, name, fixedSignature(receiver, []types.Type{
+				types.NewSlice(types.Typ[types.Byte]),
+				types.Universe.Lookup("error").Type(),
+			})))
+		}
 		addFunction(imported, "New", []types.Type{types.NewPointer(secretValue)})
 	}
 	imported.MarkComplete()
 	loader.packages[importPath] = imported
 	return imported, nil
+}
+
+func addLoggerType(imported *types.Package, methods map[string]struct{}) {
+	logger := types.NewNamed(types.NewTypeName(token.NoPos, imported, "Logger", nil), types.NewStruct(nil, nil), nil)
+	imported.Scope().Insert(logger.Obj())
+	for name := range methods {
+		receiver := types.NewVar(token.NoPos, imported, "logger", types.NewPointer(logger))
+		logger.AddMethod(types.NewFunc(token.NoPos, imported, name, variadicSignature(receiver, nil)))
+	}
+	addFunction(imported, "Default", []types.Type{types.NewPointer(logger)})
+	addFunction(imported, "New", []types.Type{types.NewPointer(logger)})
 }
 
 func (loader *architectureImporter) importRepositoryPackage(importPath string) (*types.Package, error) {
@@ -506,7 +550,18 @@ func (loader *architectureImporter) importRepositoryPackage(importPath string) (
 			continue
 		}
 		filename := filepath.Join(directory, entry.Name())
-		parsed, parseErr := parser.ParseFile(loader.files, filename, nil, parser.SkipObjectResolution)
+		matches, matchErr := build.Default.MatchFile(directory, entry.Name())
+		if matchErr != nil {
+			return nil, fmt.Errorf("evaluate build constraints for %s: %w", filename, matchErr)
+		}
+		if !matches {
+			continue
+		}
+		contents, readErr := os.ReadFile(filename)
+		if readErr != nil {
+			return nil, fmt.Errorf("read repository package %s: %w", importPath, readErr)
+		}
+		parsed, parseErr := parser.ParseFile(loader.files, filename, contents, parser.SkipObjectResolution)
 		if parseErr != nil {
 			return nil, fmt.Errorf("parse repository package %s: %w", importPath, parseErr)
 		}
@@ -516,17 +571,126 @@ func (loader *architectureImporter) importRepositoryPackage(importPath string) (
 		return nil, fmt.Errorf("repository package %s has no source files", importPath)
 	}
 
+	uses := make(map[*ast.Ident]types.Object)
+	definitions := make(map[*ast.Ident]types.Object)
+	expressionTypes := make(map[ast.Expr]types.TypeAndValue)
+	information := &types.Info{Defs: definitions, Types: expressionTypes, Uses: uses}
 	configuration := types.Config{
 		Importer:                 loader,
 		DisableUnusedImportCheck: true,
 		Error:                    func(error) {},
 	}
-	imported, checkErr := configuration.Check(importPath, loader.files, parsedFiles, nil)
-	if checkErr != nil {
-		return nil, fmt.Errorf("type-check repository package %s: %w", importPath, checkErr)
-	}
+	imported, checkErr := configuration.Check(importPath, loader.files, parsedFiles, information)
 	loader.packages[importPath] = imported
+	if checkErr != nil {
+		// A repository package may depend on an intentionally opaque third-party
+		// stub. Preserve the usable partial type information, but conservatively
+		// treat every exported object from that package as a potential formatter
+		// so an unresolved check cannot hide a secret-bearing call.
+		for _, object := range information.Defs {
+			if object != nil && object.Pkg() == imported && ast.IsExported(object.Name()) {
+				loader.summaries.formattingFunctions[object] = true
+			}
+		}
+	}
+	loader.summarizeRepositoryPackage(parsedFiles, information, imported)
 	return imported, nil
+}
+
+func (loader *architectureImporter) summarizeRepositoryPackage(parsedFiles []*ast.File, information *types.Info, imported *types.Package) {
+	actual := findFlowFacts(parsedFiles, information, imported, loader.summaries, nil)
+	for object := range actual.secretObjects {
+		if object.Pkg() == imported {
+			loader.summaries.secretObjects[object] = true
+		}
+	}
+	for object := range actual.secretReturns {
+		if object.Pkg() == imported {
+			loader.summaries.secretReturns[object] = true
+		}
+	}
+	for object := range actual.formatterReturns {
+		if object.Pkg() == imported {
+			loader.summaries.formatterReturns[object] = true
+		}
+	}
+	for object := range actual.formatterObjects {
+		if object.Pkg() == imported {
+			loader.summaries.formattingFunctions[object] = true
+		}
+	}
+
+	var parameters []types.Object
+	for function, functionParameters := range actual.functionParameters {
+		if function.Pkg() != imported {
+			continue
+		}
+		for _, parameter := range functionParameters {
+			if parameter != nil {
+				parameters = append(parameters, parameter)
+			}
+		}
+	}
+	for _, literalParameters := range actual.literalParameters {
+		for _, parameter := range literalParameters {
+			if parameter != nil {
+				parameters = append(parameters, parameter)
+			}
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		symbolic := findFlowFacts(parsedFiles, information, imported, loader.summaries, parameters)
+		for _, parsed := range parsedFiles {
+			for _, declaration := range parsed.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				if !ok || function.Body == nil {
+					continue
+				}
+				object := information.Defs[function.Name]
+				if functionBodyFormatsSecret(function.Body, information, symbolic) && !loader.summaries.formattingFunctions[object] {
+					loader.summaries.formattingFunctions[object] = true
+					changed = true
+				}
+			}
+		}
+		for object, literals := range symbolic.functionLiterals {
+			if object.Pkg() != imported || loader.summaries.formattingFunctions[object] {
+				continue
+			}
+			for literal := range literals {
+				if functionBodyFormatsSecret(literal.Body, information, symbolic) {
+					loader.summaries.formattingFunctions[object] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+}
+
+func functionBodyFormatsSecret(body *ast.BlockStmt, information *types.Info, facts *flowFacts) bool {
+	formatsSecret := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		if formatsSecret {
+			return false
+		}
+		if _, nestedFunction := node.(*ast.FuncLit); nestedFunction {
+			return false
+		}
+		call, ok := node.(*ast.CallExpr)
+		if !ok || !isFormattingCall(call, information, facts) {
+			return true
+		}
+		for _, argument := range call.Args {
+			if expressionContainsSecret(argument, information, facts) {
+				formatsSecret = true
+				break
+			}
+		}
+		return !formatsSecret
+	})
+	return formatsSecret
 }
 
 func addVariadicFunctions(imported *types.Package, names map[string]struct{}) {
@@ -562,7 +726,8 @@ func policyForSource(relativePath string) sourcePolicy {
 	normalized := filepath.ToSlash(filepath.Clean(relativePath))
 	policy := sourcePolicy{
 		allowBubbleTeaImport:    strings.HasPrefix(normalized, "internal/tui/"),
-		allowSecretFormatting:   strings.HasPrefix(normalized, "internal/secret/") || strings.HasSuffix(normalized, "_test.go"),
+		allowSecretFormatting:   strings.HasPrefix(normalized, "internal/secret/") && !strings.HasSuffix(normalized, "_test.go"),
+		allowRedactionAssertion: normalized == "internal/secret/value_test.go",
 		allowSourceImporter:     normalized == "internal/archcheck/main.go",
 		allowTestInfrastructure: strings.HasSuffix(normalized, "_test.go"),
 		enforceVerifierBoundary: strings.HasPrefix(normalized, "internal/verify/"),
@@ -582,7 +747,7 @@ func policyForSource(relativePath string) sourcePolicy {
 }
 
 func forbiddenVerifierImportMessage(importPath string) (string, bool) {
-	if isStandardLibraryImport(importPath) {
+	if verifierSafeStandardImport(importPath) {
 		return "", false
 	}
 	if internalPath, internal := strings.CutPrefix(importPath, modulePath+"/internal/"); internal {
@@ -592,33 +757,86 @@ func forbiddenVerifierImportMessage(importPath string) (string, bool) {
 			return "", false
 		}
 	}
-	return "C-VERIFY may import only the standard library, internal/domain, internal/verify, and read-only observation contracts", true
+	return "C-VERIFY may import only approved side-effect-free standard-library packages, internal/domain, internal/verify, and read-only observation contracts", true
+}
+
+func verifierSafeStandardImport(importPath string) bool {
+	if _, allowed := verifierSafeStandardImports[importPath]; allowed {
+		return isStandardLibraryImport(importPath)
+	}
+	for _, prefix := range verifierSafeStandardPrefixes {
+		if strings.HasPrefix(importPath, prefix) {
+			return isStandardLibraryImport(importPath)
+		}
+	}
+	return false
 }
 
 type flowFacts struct {
-	secretObjects      map[types.Object]bool
-	formatterObjects   map[types.Object]bool
-	secretReturns      map[types.Object]bool
-	formatterReturns   map[types.Object]bool
-	functionParameters map[types.Object][]types.Object
-	methodParameters   map[string][][]types.Object
-	aliases            map[types.Object]map[types.Object]bool
+	secretObjects           map[types.Object]bool
+	formatterObjects        map[types.Object]bool
+	secretReturns           map[types.Object]bool
+	formatterReturns        map[types.Object]bool
+	functionParameters      map[types.Object][]types.Object
+	methodParameters        map[string][][]types.Object
+	aliases                 map[types.Object]map[types.Object]bool
+	functionLiterals        map[types.Object]map[*ast.FuncLit]bool
+	literalParameters       map[*ast.FuncLit][]types.Object
+	literalSecretReturns    map[*ast.FuncLit]bool
+	literalFormatterReturns map[*ast.FuncLit]bool
+	literals                []*ast.FuncLit
 }
 
-func newFlowFacts() *flowFacts {
-	return &flowFacts{
-		secretObjects:      make(map[types.Object]bool),
-		formatterObjects:   make(map[types.Object]bool),
-		secretReturns:      make(map[types.Object]bool),
-		formatterReturns:   make(map[types.Object]bool),
-		functionParameters: make(map[types.Object][]types.Object),
-		methodParameters:   make(map[string][][]types.Object),
-		aliases:            make(map[types.Object]map[types.Object]bool),
+type flowSummaries struct {
+	secretObjects       map[types.Object]bool
+	secretReturns       map[types.Object]bool
+	formatterReturns    map[types.Object]bool
+	formattingFunctions map[types.Object]bool
+}
+
+func newFlowSummaries() *flowSummaries {
+	return &flowSummaries{
+		secretObjects:       make(map[types.Object]bool),
+		secretReturns:       make(map[types.Object]bool),
+		formatterReturns:    make(map[types.Object]bool),
+		formattingFunctions: make(map[types.Object]bool),
 	}
 }
 
-func findFlowFacts(parsedFiles []*ast.File, information *types.Info, checkedPackage *types.Package) *flowFacts {
-	facts := newFlowFacts()
+func newFlowFacts(summaries *flowSummaries) *flowFacts {
+	facts := &flowFacts{
+		secretObjects:           make(map[types.Object]bool),
+		formatterObjects:        make(map[types.Object]bool),
+		secretReturns:           make(map[types.Object]bool),
+		formatterReturns:        make(map[types.Object]bool),
+		functionParameters:      make(map[types.Object][]types.Object),
+		methodParameters:        make(map[string][][]types.Object),
+		aliases:                 make(map[types.Object]map[types.Object]bool),
+		functionLiterals:        make(map[types.Object]map[*ast.FuncLit]bool),
+		literalParameters:       make(map[*ast.FuncLit][]types.Object),
+		literalSecretReturns:    make(map[*ast.FuncLit]bool),
+		literalFormatterReturns: make(map[*ast.FuncLit]bool),
+	}
+	if summaries == nil {
+		return facts
+	}
+	for object := range summaries.secretObjects {
+		facts.secretObjects[object] = true
+	}
+	for object := range summaries.secretReturns {
+		facts.secretReturns[object] = true
+	}
+	for object := range summaries.formatterReturns {
+		facts.formatterReturns[object] = true
+	}
+	for object := range summaries.formattingFunctions {
+		facts.formatterObjects[object] = true
+	}
+	return facts
+}
+
+func findFlowFacts(parsedFiles []*ast.File, information *types.Info, checkedPackage *types.Package, summaries *flowSummaries, seedSecrets []types.Object) *flowFacts {
+	facts := newFlowFacts(summaries)
 	for _, parsed := range parsedFiles {
 		for _, declaration := range parsed.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
@@ -629,21 +847,24 @@ func findFlowFacts(parsedFiles []*ast.File, information *types.Info, checkedPack
 			if object == nil || function.Type.Params == nil {
 				continue
 			}
-			var parameters []types.Object
-			for _, field := range function.Type.Params.List {
-				if len(field.Names) == 0 {
-					parameters = append(parameters, nil)
-					continue
-				}
-				for _, name := range field.Names {
-					parameters = append(parameters, information.Defs[name])
-				}
-			}
+			parameters := parameterObjects(function.Type.Params, information)
 			facts.functionParameters[object] = parameters
 			if function.Recv != nil {
 				facts.methodParameters[function.Name.Name] = append(facts.methodParameters[function.Name.Name], parameters)
 			}
 		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			literal, ok := node.(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+			facts.literals = append(facts.literals, literal)
+			facts.literalParameters[literal] = parameterObjects(literal.Type.Params, information)
+			return true
+		})
+	}
+	for _, object := range seedSecrets {
+		markObject(object, facts.secretObjects)
 	}
 
 	for changed := true; changed; {
@@ -705,8 +926,47 @@ func findFlowFacts(parsedFiles []*ast.File, information *types.Info, checkedPack
 				})
 			}
 		}
+		for _, literal := range facts.literals {
+			ast.Inspect(literal.Body, func(node ast.Node) bool {
+				if nested, ok := node.(*ast.FuncLit); ok && nested != literal {
+					return false
+				}
+				returned, ok := node.(*ast.ReturnStmt)
+				if !ok {
+					return true
+				}
+				for _, result := range returned.Results {
+					if expressionContainsSecret(result, information, facts) && !facts.literalSecretReturns[literal] {
+						facts.literalSecretReturns[literal] = true
+						changed = true
+					}
+					if expressionIsFormatter(result, information, facts) && !facts.literalFormatterReturns[literal] {
+						facts.literalFormatterReturns[literal] = true
+						changed = true
+					}
+				}
+				return true
+			})
+		}
 	}
 	return facts
+}
+
+func parameterObjects(fields *ast.FieldList, information *types.Info) []types.Object {
+	if fields == nil {
+		return nil
+	}
+	var parameters []types.Object
+	for _, field := range fields.List {
+		if len(field.Names) == 0 {
+			parameters = append(parameters, nil)
+			continue
+		}
+		for _, name := range field.Names {
+			parameters = append(parameters, information.Defs[name])
+		}
+	}
+	return parameters
 }
 
 func propagateAssignments(left, right []ast.Expr, information *types.Info, facts *flowFacts) bool {
@@ -729,7 +989,7 @@ func propagateAssignments(left, right []ast.Expr, information *types.Info, facts
 	for index, target := range left {
 		secretAtIndex := secretResult
 		if tuple != nil && index < tuple.Len() {
-			secretAtIndex = containsSecretType(tuple.At(index).Type(), make(map[types.Type]bool))
+			secretAtIndex = secretAtIndex || containsSecretType(tuple.At(index).Type(), make(map[types.Type]bool))
 		}
 		if secretAtIndex {
 			changed = markFlowTarget(target, information, facts.secretObjects, facts.aliases) || changed
@@ -743,6 +1003,7 @@ func propagateAssignments(left, right []ast.Expr, information *types.Info, facts
 
 func propagateAssignment(left, right ast.Expr, information *types.Info, facts *flowFacts) bool {
 	changed := linkFlowAliases(left, right, information, facts)
+	changed = linkFunctionLiteral(left, right, information, facts) || changed
 	if expressionContainsSecret(right, information, facts) {
 		changed = markFlowTarget(left, information, facts.secretObjects, facts.aliases) || changed
 	}
@@ -773,6 +1034,9 @@ func propagateCallArguments(call *ast.CallExpr, information *types.Info, checked
 				}
 			}
 		}
+	}
+	for _, literal := range calledFunctionLiterals(call.Fun, information, facts) {
+		changed = propagateParameters(facts.literalParameters[literal], call.Args, information, facts) || changed
 	}
 	return changed
 }
@@ -861,6 +1125,33 @@ func linkFlowAliases(left, right ast.Expr, information *types.Info, facts *flowF
 		return false
 	}
 	return linkObjects(flowRootObject(left, information), flowRootObject(right, information), facts)
+}
+
+func linkFunctionLiteral(left, right ast.Expr, information *types.Info, facts *flowFacts) bool {
+	literal := directFunctionLiteral(right)
+	object := flowRootObject(left, information)
+	if literal == nil || object == nil {
+		return false
+	}
+	if facts.functionLiterals[object] == nil {
+		facts.functionLiterals[object] = make(map[*ast.FuncLit]bool)
+	}
+	if facts.functionLiterals[object][literal] {
+		return false
+	}
+	facts.functionLiterals[object][literal] = true
+	return true
+}
+
+func directFunctionLiteral(expression ast.Expr) *ast.FuncLit {
+	switch value := expression.(type) {
+	case *ast.FuncLit:
+		return value
+	case *ast.ParenExpr:
+		return directFunctionLiteral(value.X)
+	default:
+		return nil
+	}
 }
 
 func linkObjectToExpression(object types.Object, expression ast.Expr, information *types.Info, facts *flowFacts) bool {
@@ -975,34 +1266,18 @@ func expressionIsFormatter(expression ast.Expr, information *types.Info, facts *
 		if function := calledFunctionObject(value.Fun, information); function != nil && facts.formatterReturns[function] {
 			return true
 		}
+		for _, literal := range calledFunctionLiterals(value.Fun, information, facts) {
+			if facts.literalFormatterReturns[literal] {
+				return true
+			}
+		}
 		for _, argument := range value.Args {
 			if expressionIsFormatter(argument, information, facts) {
 				return true
 			}
 		}
-	case *ast.FuncLit:
-		return functionLiteralUsesFormatter(value, information, facts)
 	}
 	return false
-}
-
-func functionLiteralUsesFormatter(literal *ast.FuncLit, information *types.Info, facts *flowFacts) bool {
-	usesFormatter := false
-	ast.Inspect(literal.Body, func(node ast.Node) bool {
-		if usesFormatter {
-			return false
-		}
-		if _, nestedFunction := node.(*ast.FuncLit); nestedFunction {
-			return false
-		}
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		usesFormatter = expressionIsFormatter(call.Fun, information, facts)
-		return !usesFormatter
-	})
-	return usesFormatter
 }
 
 func expressionContainsSecret(expression ast.Expr, information *types.Info, facts *flowFacts) bool {
@@ -1044,6 +1319,11 @@ func expressionContainsSecret(expression ast.Expr, information *types.Info, fact
 		}
 		if function := calledFunctionObject(value.Fun, information); function != nil && facts.secretReturns[function] {
 			return true
+		}
+		for _, literal := range calledFunctionLiterals(value.Fun, information, facts) {
+			if facts.literalSecretReturns[literal] {
+				return true
+			}
 		}
 		if selector, ok := value.Fun.(*ast.SelectorExpr); ok && expressionContainsSecret(selector.X, information, facts) {
 			return true
@@ -1101,6 +1381,38 @@ func calledFunctionCandidates(expression ast.Expr, information *types.Info, fact
 	return functions
 }
 
+func calledFunctionLiterals(expression ast.Expr, information *types.Info, facts *flowFacts) []*ast.FuncLit {
+	if literal := directFunctionLiteral(expression); literal != nil {
+		return []*ast.FuncLit{literal}
+	}
+	root := flowRootObject(expression, information)
+	if root == nil {
+		return nil
+	}
+	var literals []*ast.FuncLit
+	seenObjects := make(map[types.Object]bool)
+	seenLiterals := make(map[*ast.FuncLit]bool)
+	pending := []types.Object{root}
+	for len(pending) != 0 {
+		object := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if object == nil || seenObjects[object] {
+			continue
+		}
+		seenObjects[object] = true
+		for literal := range facts.functionLiterals[object] {
+			if !seenLiterals[literal] {
+				seenLiterals[literal] = true
+				literals = append(literals, literal)
+			}
+		}
+		for alias := range facts.aliases[object] {
+			pending = append(pending, alias)
+		}
+	}
+	return literals
+}
+
 func isMonitoredFormattingFunction(object types.Object) bool {
 	function, ok := object.(*types.Func)
 	if !ok || function.Pkg() == nil {
@@ -1124,18 +1436,44 @@ func isExplicitRedactedStringCall(call *ast.CallExpr, information *types.Info) b
 		(function.Name() == "String" || function.Name() == "GoString")
 }
 
+func isRedactionAssertionCall(call *ast.CallExpr, information *types.Info) bool {
+	function := calledFunctionObject(call.Fun, information)
+	if function == nil || function.Pkg() == nil || function.Pkg().Path() != "fmt" {
+		return false
+	}
+	return function.Name() == "Sprint" || function.Name() == "Sprintf"
+}
+
 func hasUnresolvedType(expression ast.Expr, information *types.Info) bool {
 	return containsInvalidType(information.TypeOf(expression), make(map[types.Type]bool))
 }
 
-func formattingArgumentViolationMessage(expression ast.Expr, information *types.Info, facts *flowFacts) string {
+func formattingArgumentViolationMessage(expression ast.Expr, information *types.Info, facts *flowFacts, allowRedactionAssertion bool) string {
 	if expressionContainsSecret(expression, information, facts) {
-		return "secret.Value must not be passed to fmt or log; output an explicit redacted string instead"
+		if allowRedactionAssertion && isDirectSecretValueType(information.TypeOf(expression)) {
+			return ""
+		}
+		return "secret.Value must not be passed to fmt or log (including slog); output an explicit redacted string instead"
 	}
 	if hasUnresolvedType(expression, information) {
 		return "formatting argument type could not be resolved; refusing a possible secret.Value flow"
 	}
 	return ""
+}
+
+func isDirectSecretValueType(valueType types.Type) bool {
+	if valueType == nil {
+		return false
+	}
+	valueType = types.Unalias(valueType)
+	if pointer, ok := valueType.(*types.Pointer); ok {
+		valueType = types.Unalias(pointer.Elem())
+	}
+	named, ok := valueType.(*types.Named)
+	if !ok || named.Obj() == nil || named.Obj().Pkg() == nil {
+		return false
+	}
+	return named.Obj().Pkg().Path() == secretPackagePath && named.Obj().Name() == "Value"
 }
 
 func containsInvalidType(valueType types.Type, seen map[types.Type]bool) bool {
@@ -1243,7 +1581,7 @@ func isTestInfrastructureImport(importPath string) bool {
 }
 
 func forbiddenProcessImportMessage(importPath string, policy sourcePolicy) (string, bool) {
-	if importPath == "go/importer" && policy.allowSourceImporter {
+	if (importPath == "go/importer" || importPath == "go/build") && policy.allowSourceImporter {
 		return "", false
 	}
 	if message, forbidden := forbiddenProcessImports[importPath]; forbidden {

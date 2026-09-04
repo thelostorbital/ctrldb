@@ -5,6 +5,7 @@ package verify
 
 import (
 	"context"
+	"net/url"
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
 	"github.com/thelostorbital/ctrldb/internal/observation"
@@ -13,3 +14,5 @@ import (
 type Observer interface {
 	Observe(context.Context, domain.OperationID) (observation.Snapshot, error)
 }
+
+var _ = url.PathEscape

@@ -284,7 +284,9 @@ func validateExecutionContract(
 	blockers []PlanBlocker,
 ) ([]PlanBlocker, bool, bool) {
 	contractSteps := contract.Steps()
-	if contract.WorkflowID() != plan.WorkflowID || len(contractSteps) != len(plan.Steps) {
+	if contract.WorkflowID() != plan.WorkflowID || len(contractSteps) != len(plan.Steps) ||
+		contract.RollbackBoundary() != plan.Rollback.Boundary ||
+		contract.PointOfNoReturn() != plan.PointOfNoReturn {
 		return append(blockers, PlanBlocker{Kind: BlockerContract, ID: "workflow-or-step-set"}), true, true
 	}
 

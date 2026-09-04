@@ -45,18 +45,80 @@ var (
 	zeroPlanHash      = strings.Repeat("0", sha256.Size*2)
 )
 
-var canonicalPlanJSONKeys = canonicalJSONKeyMap(
-	"planId", "planHash", "workflowId", "projectId", "environment", "environmentClass", "principal",
-	"createdAt", "approvalClass", "expiresAt", "coolingOffSeconds", "identity", "policyHash",
-	"stepUpRequired", "intent", "resources", "preconditions", "permissions", "steps", "cost", "downtime",
-	"exposure", "protection", "rollback", "pointOfNoReturn", "verification", "default", "hostControlSteps",
-	"deleteSteps", "bootstrapSteps", "local", "approved", "match", "validUntil", "windowStart", "kind",
-	"scope", "name", "fingerprint", "id", "ok", "detail", "stepId", "permission", "resource", "granted",
-	"executor", "executingIdentity", "commandRedacted", "idempotent", "retry", "cancelSafe", "timeoutSeconds",
-	"successCondition", "failureBehavior", "targets", "maxAttempts", "initialBackoffSeconds", "maxBackoffSeconds",
-	"runRate", "items", "incremental", "source", "priceTableDate", "stale", "assumptions", "unpriced", "budget",
-	"amountUSD", "period", "plan", "state", "reason", "ceilingUSD", "expectedSeconds", "boundary", "assets",
+type planJSONSchema struct {
+	fields  map[string]*planJSONSchema
+	element *planJSONSchema
+}
+
+var (
+	planJSONScalar      = &planJSONSchema{}
+	planJSONStringArray = &planJSONSchema{element: planJSONScalar}
+	planJSONResource    = planJSONObject(map[string]*planJSONSchema{
+		"kind": planJSONScalar, "scope": planJSONScalar, "name": planJSONScalar, "fingerprint": planJSONScalar,
+	})
+	planJSONRetry = planJSONObject(map[string]*planJSONSchema{
+		"maxAttempts": planJSONScalar, "initialBackoffSeconds": planJSONScalar, "maxBackoffSeconds": planJSONScalar,
+	})
+	planJSONRoot = planJSONObject(map[string]*planJSONSchema{
+		"planId": planJSONScalar, "planHash": planJSONScalar, "workflowId": planJSONScalar,
+		"projectId": planJSONScalar, "environment": planJSONScalar, "environmentClass": planJSONScalar,
+		"principal": planJSONScalar, "createdAt": planJSONScalar, "approvalClass": planJSONScalar,
+		"expiresAt": planJSONScalar, "coolingOffSeconds": planJSONScalar, "stepUpRequired": planJSONScalar,
+		"exposure": planJSONScalar, "pointOfNoReturn": planJSONScalar,
+		"identity": planJSONObject(map[string]*planJSONSchema{
+			"default": planJSONScalar, "hostControlSteps": planJSONScalar,
+			"deleteSteps": planJSONScalar, "bootstrapSteps": planJSONScalar,
+		}),
+		"policyHash": planJSONObject(map[string]*planJSONSchema{
+			"local": planJSONScalar, "approved": planJSONScalar, "match": planJSONScalar,
+		}),
+		"intent": planJSONObject(map[string]*planJSONSchema{
+			"validUntil": planJSONScalar, "windowStart": planJSONScalar,
+		}),
+		"resources": {element: planJSONResource},
+		"preconditions": {element: planJSONObject(map[string]*planJSONSchema{
+			"id": planJSONScalar, "ok": planJSONScalar, "detail": planJSONScalar,
+		})},
+		"permissions": {element: planJSONObject(map[string]*planJSONSchema{
+			"stepId": planJSONScalar, "identity": planJSONScalar, "permission": planJSONScalar,
+			"resource": planJSONResource, "granted": planJSONScalar,
+		})},
+		"steps": {element: planJSONObject(map[string]*planJSONSchema{
+			"id": planJSONScalar, "executor": planJSONScalar, "executingIdentity": planJSONScalar,
+			"commandRedacted": planJSONScalar, "idempotent": planJSONScalar, "retry": planJSONRetry,
+			"cancelSafe": planJSONScalar, "timeoutSeconds": planJSONScalar, "successCondition": planJSONScalar,
+			"failureBehavior": planJSONScalar, "targets": {element: planJSONResource},
+		})},
+		"cost": planJSONObject(map[string]*planJSONSchema{
+			"runRate": planJSONObject(map[string]*planJSONSchema{
+				"amountUSD": planJSONScalar, "period": planJSONScalar,
+			}),
+			"items": {element: planJSONObject(map[string]*planJSONSchema{
+				"resource": planJSONScalar, "kind": planJSONScalar, "amountUSD": planJSONScalar,
+			})},
+			"incremental": planJSONObject(map[string]*planJSONSchema{
+				"amountUSD": planJSONScalar, "period": planJSONScalar, "plan": planJSONScalar,
+			}),
+			"source": planJSONScalar, "priceTableDate": planJSONScalar, "stale": planJSONScalar,
+			"assumptions": planJSONStringArray, "unpriced": planJSONStringArray,
+			"budget": planJSONObject(map[string]*planJSONSchema{
+				"state": planJSONScalar, "reason": planJSONScalar, "ceilingUSD": planJSONScalar,
+			}),
+		}),
+		"downtime": planJSONObject(map[string]*planJSONSchema{
+			"expectedSeconds": planJSONScalar, "kind": planJSONScalar,
+		}),
+		"protection": planJSONStringArray,
+		"rollback": planJSONObject(map[string]*planJSONSchema{
+			"boundary": planJSONScalar, "assets": planJSONStringArray,
+		}),
+		"verification": planJSONStringArray,
+	})
 )
+
+func planJSONObject(fields map[string]*planJSONSchema) *planJSONSchema {
+	return &planJSONSchema{fields: fields}
+}
 
 // SealPlan structurally validates plan and returns a copy carrying the digest
 // of its complete reviewable contents. The input value is never modified.
@@ -181,7 +243,7 @@ func DecodePlan(encoded []byte) (domain.Plan, error) {
 
 func rejectDuplicateJSONKeys(encoded []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	if err := consumeUniqueJSONValue(decoder); err != nil {
+	if err := consumeUniqueJSONValue(decoder, planJSONRoot); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
@@ -191,7 +253,7 @@ func rejectDuplicateJSONKeys(encoded []byte) error {
 	return nil
 }
 
-func consumeUniqueJSONValue(decoder *json.Decoder) error {
+func consumeUniqueJSONValue(decoder *json.Decoder, schema *planJSONSchema) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return invalid("decode", err.Error())
@@ -203,6 +265,9 @@ func consumeUniqueJSONValue(decoder *json.Decoder) error {
 
 	switch delimiter {
 	case '{':
+		if schema == nil || schema.fields == nil {
+			return invalid("decode", "object is not allowed at this schema position")
+		}
 		seen := make(map[string]struct{})
 		for decoder.More() {
 			keyToken, err := decoder.Token()
@@ -213,15 +278,15 @@ func consumeUniqueJSONValue(decoder *json.Decoder) error {
 			if !ok {
 				return invalid("decode", "object key must be a string")
 			}
-			foldedKey := strings.ToLower(key)
-			if canonical, known := canonicalPlanJSONKeys[foldedKey]; known && key != canonical {
+			childSchema, canonical := schema.fields[key]
+			if !canonical {
 				return invalid("decode", "object contains a noncanonical key")
 			}
-			if _, exists := seen[foldedKey]; exists {
+			if _, exists := seen[key]; exists {
 				return invalid("decode", "object contains a duplicate key")
 			}
-			seen[foldedKey] = struct{}{}
-			if err := consumeUniqueJSONValue(decoder); err != nil {
+			seen[key] = struct{}{}
+			if err := consumeUniqueJSONValue(decoder, childSchema); err != nil {
 				return err
 			}
 		}
@@ -229,8 +294,11 @@ func consumeUniqueJSONValue(decoder *json.Decoder) error {
 			return invalid("decode", err.Error())
 		}
 	case '[':
+		if schema == nil || schema.element == nil {
+			return invalid("decode", "array is not allowed at this schema position")
+		}
 		for decoder.More() {
-			if err := consumeUniqueJSONValue(decoder); err != nil {
+			if err := consumeUniqueJSONValue(decoder, schema.element); err != nil {
 				return err
 			}
 		}
@@ -242,15 +310,6 @@ func consumeUniqueJSONValue(decoder *json.Decoder) error {
 	}
 
 	return nil
-}
-
-func canonicalJSONKeyMap(keys ...string) map[string]string {
-	result := make(map[string]string, len(keys))
-	for _, key := range keys {
-		result[strings.ToLower(key)] = key
-	}
-
-	return result
 }
 
 func validateRequiredPlanJSON(encoded []byte) error {

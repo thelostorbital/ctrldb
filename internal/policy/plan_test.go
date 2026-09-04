@@ -209,10 +209,17 @@ func TestPlanDecodeRejectsOpenOrMalformedJSON(t *testing.T) {
 
 	tests := map[string][]byte{
 		"unknown top-level field": bytes.Replace(encoded, []byte(`{"planId"`), []byte(`{"unknown":true,"planId"`), 1),
+		"nested key at top level": bytes.Replace(encoded, []byte(`{"planId"`), []byte(`{"id":"wrong-level","planId"`), 1),
 		"unknown nested field": bytes.Replace(
 			encoded,
 			[]byte(`"identity":{"default"`),
 			[]byte(`"identity":{"unknown":true,"default"`),
+			1,
+		),
+		"top-level key nested": bytes.Replace(
+			encoded,
+			[]byte(`"retry":{"maxAttempts"`),
+			[]byte(`"retry":{"planId":"plan-0123456789abcdef","maxAttempts"`),
 			1,
 		),
 		"trailing value": append(append([]byte(nil), encoded...), []byte(` {}`)...),
@@ -311,6 +318,14 @@ func TestPlanDecodeRejectsNoncanonicalKeySpelling(t *testing.T) {
 	noncanonical := bytes.Replace(encoded, []byte(`"commandRedacted"`), []byte(`"COMMANDREDACTED"`), 1)
 	if _, err := policy.DecodePlan(noncanonical); !errors.Is(err, policy.ErrInvalidPlan) {
 		t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
+	}
+	unicodeFold := bytes.Replace(encoded, []byte(`"resources"`), []byte(`"reſources"`), 1)
+	_, err = policy.DecodePlan(unicodeFold)
+	if !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan(unicode-folded key) error = %v, want ErrInvalidPlan", err)
+	}
+	if strings.Contains(err.Error(), "reſources") {
+		t.Fatalf("DecodePlan() error disclosed Unicode-folded key: %q", err)
 	}
 }
 

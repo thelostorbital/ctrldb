@@ -30,12 +30,36 @@ var (
 	stepIDPattern        = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
 )
 
-var canonicalJournalJSONKeys = journalJSONKeyMap(
-	"schema", "operationId", "planId", "sequence", "kind", "recordedAt", "operationState", "step", "pause",
-	"cancellation", "requestedAt", "currentStepId", "mutationObservation", "requiredRoute", "id", "outcome",
-	"executingIdentity", "attempt", "startedAt", "endedAt", "mutationOccurred", "resultSummary", "pausedAt",
-	"pauseReason", "resumeBy", "reapprovalRequired",
+type journalJSONSchema struct {
+	fields map[string]*journalJSONSchema
+}
+
+var (
+	journalJSONScalar = &journalJSONSchema{}
+	journalJSONRoot   = journalJSONObject(map[string]*journalJSONSchema{
+		"schema": journalJSONScalar, "operationId": journalJSONScalar, "planId": journalJSONScalar,
+		"sequence": journalJSONScalar, "kind": journalJSONScalar, "recordedAt": journalJSONScalar,
+		"operationState": journalJSONScalar,
+		"step": journalJSONObject(map[string]*journalJSONSchema{
+			"id": journalJSONScalar, "outcome": journalJSONScalar, "executingIdentity": journalJSONScalar,
+			"attempt": journalJSONScalar, "startedAt": journalJSONScalar, "endedAt": journalJSONScalar,
+			"mutationOccurred": journalJSONScalar, "resultSummary": journalJSONScalar,
+		}),
+		"pause": journalJSONObject(map[string]*journalJSONSchema{
+			"pausedAt": journalJSONScalar, "pauseReason": journalJSONScalar,
+			"mutationOccurred": journalJSONScalar, "resumeBy": journalJSONScalar,
+			"reapprovalRequired": journalJSONScalar,
+		}),
+		"cancellation": journalJSONObject(map[string]*journalJSONSchema{
+			"requestedAt": journalJSONScalar, "currentStepId": journalJSONScalar,
+			"mutationObservation": journalJSONScalar, "requiredRoute": journalJSONScalar,
+		}),
+	})
 )
+
+func journalJSONObject(fields map[string]*journalJSONSchema) *journalJSONSchema {
+	return &journalJSONSchema{fields: fields}
+}
 
 // EncodeJournalEntry validates entry and returns its compact JSON encoding.
 func EncodeJournalEntry(entry domain.JournalEntry) ([]byte, error) {
@@ -83,7 +107,7 @@ func DecodeJournalEntry(encoded []byte) (domain.JournalEntry, error) {
 
 func rejectDuplicateJournalJSONKeys(encoded []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	if err := consumeUniqueJournalJSONValue(decoder); err != nil {
+	if err := consumeUniqueJournalJSONValue(decoder, journalJSONRoot); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
@@ -93,7 +117,7 @@ func rejectDuplicateJournalJSONKeys(encoded []byte) error {
 	return nil
 }
 
-func consumeUniqueJournalJSONValue(decoder *json.Decoder) error {
+func consumeUniqueJournalJSONValue(decoder *json.Decoder, schema *journalJSONSchema) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return journalEntryError("decode", err.Error())
@@ -105,6 +129,9 @@ func consumeUniqueJournalJSONValue(decoder *json.Decoder) error {
 
 	switch delimiter {
 	case '{':
+		if schema == nil || schema.fields == nil {
+			return journalEntryError("decode", "object is not allowed at this schema position")
+		}
 		seen := make(map[string]struct{})
 		for decoder.More() {
 			keyToken, err := decoder.Token()
@@ -115,15 +142,15 @@ func consumeUniqueJournalJSONValue(decoder *json.Decoder) error {
 			if !ok {
 				return journalEntryError("decode", "object key must be a string")
 			}
-			foldedKey := strings.ToLower(key)
-			if canonical, known := canonicalJournalJSONKeys[foldedKey]; known && key != canonical {
+			childSchema, canonical := schema.fields[key]
+			if !canonical {
 				return journalEntryError("decode", "object contains a noncanonical key")
 			}
-			if _, duplicate := seen[foldedKey]; duplicate {
+			if _, duplicate := seen[key]; duplicate {
 				return journalEntryError("decode", "object contains a duplicate key")
 			}
-			seen[foldedKey] = struct{}{}
-			if err := consumeUniqueJournalJSONValue(decoder); err != nil {
+			seen[key] = struct{}{}
+			if err := consumeUniqueJournalJSONValue(decoder, childSchema); err != nil {
 				return err
 			}
 		}
@@ -131,28 +158,12 @@ func consumeUniqueJournalJSONValue(decoder *json.Decoder) error {
 			return journalEntryError("decode", err.Error())
 		}
 	case '[':
-		for decoder.More() {
-			if err := consumeUniqueJournalJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		if _, err := decoder.Token(); err != nil {
-			return journalEntryError("decode", err.Error())
-		}
+		return journalEntryError("decode", "array is not allowed at this schema position")
 	default:
 		return journalEntryError("decode", "contains an unexpected delimiter")
 	}
 
 	return nil
-}
-
-func journalJSONKeyMap(keys ...string) map[string]string {
-	result := make(map[string]string, len(keys))
-	for _, key := range keys {
-		result[strings.ToLower(key)] = key
-	}
-
-	return result
 }
 
 func validateRequiredJournalJSON(encoded []byte, entry domain.JournalEntry) error {

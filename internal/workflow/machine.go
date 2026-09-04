@@ -80,7 +80,8 @@ var transitions = map[domain.OperationState]map[domain.OperationState]struct{}{
 // Machine validates durable operation-state transitions. Persistence and
 // side-effects are deliberately owned by higher-level engine components.
 type Machine struct {
-	state domain.OperationState
+	state      domain.OperationState
+	generation uint64
 }
 
 // NewMachine creates a workflow at its mandatory discovery boundary.
@@ -133,6 +134,7 @@ func (machine *Machine) transition(next domain.OperationState, cancellationAutho
 	}
 
 	machine.state = next
+	machine.generation++
 
 	return nil
 }

@@ -50,7 +50,9 @@ func TestWorkflowDefinitionsRequireBoundedExecutionContracts_TEST_U_PLAN_04(t *t
 			t.Parallel()
 			step := validDefinitionStep()
 			test.mutate(&step)
-			if _, err := workflow.NewDefinition("WF-VM-02", []workflow.StepDefinition{step}); !errors.Is(err, workflow.ErrInvalidDefinition) {
+			if _, err := workflow.NewDefinition(
+				"WF-VM-02", "before-old-instance-delete", "stop-instance", []workflow.StepDefinition{step},
+			); !errors.Is(err, workflow.ErrInvalidDefinition) {
 				t.Fatalf("NewDefinition() error = %v, want ErrInvalidDefinition", err)
 			}
 		})
@@ -61,7 +63,7 @@ func TestWorkflowDefinitionAndRegistryAreImmutable(t *testing.T) {
 	t.Parallel()
 
 	steps := []workflow.StepDefinition{validDefinitionStep()}
-	definition, err := workflow.NewDefinition("WF-VM-02", steps)
+	definition, err := workflow.NewDefinition("WF-VM-02", "before-old-instance-delete", "stop-instance", steps)
 	if err != nil {
 		t.Fatalf("NewDefinition() returned an error: %v", err)
 	}
@@ -101,6 +103,31 @@ func TestWorkflowDefinitionAndRegistryAreImmutable(t *testing.T) {
 	}
 	if _, err := workflow.NewRegistry(definition, definition); !errors.Is(err, workflow.ErrInvalidDefinition) {
 		t.Fatalf("duplicate registration error = %v, want ErrInvalidDefinition", err)
+	}
+}
+
+func TestWorkflowDefinitionRequiresCoherentRecoveryContract(t *testing.T) {
+	t.Parallel()
+
+	step := validDefinitionStep()
+	for _, test := range []struct {
+		name             string
+		rollbackBoundary string
+		pointOfNoReturn  string
+	}{
+		{name: "missing rollback boundary", pointOfNoReturn: step.ID},
+		{name: "no rollback for mutation", rollbackBoundary: "none", pointOfNoReturn: step.ID},
+		{name: "unknown point of no return", rollbackBoundary: "before-delete", pointOfNoReturn: "unknown-step"},
+		{name: "noncanonical boundary", rollbackBoundary: "before delete", pointOfNoReturn: step.ID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := workflow.NewDefinition(
+				"WF-VM-02", test.rollbackBoundary, test.pointOfNoReturn, []workflow.StepDefinition{step},
+			); !errors.Is(err, workflow.ErrInvalidDefinition) {
+				t.Fatalf("NewDefinition() error = %v, want ErrInvalidDefinition", err)
+			}
+		})
 	}
 }
 

@@ -40,13 +40,18 @@ type StepDefinition struct {
 // Definition is immutable after construction. Its fields are intentionally
 // private so callers cannot weaken a validated step contract in place.
 type Definition struct {
-	workflowID string
-	steps      []StepDefinition
-	contract   domain.ExecutionContract
+	workflowID       string
+	rollbackBoundary string
+	pointOfNoReturn  string
+	steps            []StepDefinition
+	contract         domain.ExecutionContract
 }
 
 // NewDefinition validates and defensively copies one implemented workflow.
-func NewDefinition(workflowID string, steps []StepDefinition) (Definition, error) {
+func NewDefinition(
+	workflowID, rollbackBoundary, pointOfNoReturn string,
+	steps []StepDefinition,
+) (Definition, error) {
 	if !definitionWorkflowIDPattern.MatchString(workflowID) {
 		return Definition{}, definitionError("workflowId", "must match WF-<GROUP>-<NN>")
 	}
@@ -104,12 +109,15 @@ func NewDefinition(workflowID string, steps []StepDefinition) (Definition, error
 			FailureBehavior:     step.FailureBehavior,
 		}
 	}
-	contract, err := domain.NewExecutionContract(workflowID, contractSteps)
+	contract, err := domain.NewExecutionContract(workflowID, rollbackBoundary, pointOfNoReturn, contractSteps)
 	if err != nil {
 		return Definition{}, definitionError("steps", "contain an invalid execution contract")
 	}
 
-	return Definition{workflowID: workflowID, steps: copyOfSteps, contract: contract}, nil
+	return Definition{
+		workflowID: workflowID, rollbackBoundary: rollbackBoundary, pointOfNoReturn: pointOfNoReturn,
+		steps: copyOfSteps, contract: contract,
+	}, nil
 }
 
 // WorkflowID returns the stable workflow registry key.
@@ -164,7 +172,10 @@ func (registry Registry) Lookup(workflowID string) (Definition, bool) {
 func (registry Registry) Len() int { return len(registry.definitions) }
 
 func cloneDefinition(definition Definition) Definition {
-	return Definition{workflowID: definition.workflowID, steps: definition.Steps(), contract: definition.contract}
+	return Definition{
+		workflowID: definition.workflowID, rollbackBoundary: definition.rollbackBoundary,
+		pointOfNoReturn: definition.pointOfNoReturn, steps: definition.Steps(), contract: definition.contract,
+	}
 }
 
 func cloneStepDefinition(step StepDefinition) StepDefinition {

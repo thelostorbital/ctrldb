@@ -106,6 +106,20 @@ func TestExecutionGateRequiresTrustedRiskAndExactPermissions(t *testing.T) {
 				plan.Permissions = append(plan.Permissions, extra)
 			},
 		},
+		{
+			name: "untrusted rollback boundary",
+			kind: policy.BlockerContract,
+			mutate: func(plan *domain.Plan) {
+				plan.Rollback.Boundary = "after-last-recovery-point"
+			},
+		},
+		{
+			name: "omitted point of no return",
+			kind: policy.BlockerContract,
+			mutate: func(plan *domain.Plan) {
+				plan.PointOfNoReturn = ""
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -532,7 +546,7 @@ func validExecutionEvidence(plan domain.Plan, checkedAt time.Time) policy.Execut
 
 func validExecutionContract(t *testing.T) domain.ExecutionContract {
 	t.Helper()
-	definition, err := workflow.NewDefinition("WF-VM-02", []workflow.StepDefinition{
+	definition, err := workflow.NewDefinition("WF-VM-02", "before-old-instance-delete", "stop-instance", []workflow.StepDefinition{
 		{
 			ID:                  "stop-instance",
 			Executor:            "gcloud",
@@ -583,7 +597,7 @@ func ap4ExecutionPlan(
 	if err != nil {
 		t.Fatalf("SealPlan() returned an error: %v", err)
 	}
-	definition, err := workflow.NewDefinition(plan.WorkflowID, []workflow.StepDefinition{
+	definition, err := workflow.NewDefinition(plan.WorkflowID, plan.Rollback.Boundary, plan.PointOfNoReturn, []workflow.StepDefinition{
 		{
 			ID:                  stepID,
 			Executor:            plan.Steps[0].Executor,

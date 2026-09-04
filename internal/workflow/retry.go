@@ -19,8 +19,24 @@ type RetryDecision struct {
 
 // DecideRetry makes a side-effect-free retry decision for the just-completed
 // one-based attempt. Invalid input fails closed.
-func DecideRetry(step StepDefinition, attempt uint32, failure domain.RetryFailureClass, mutation domain.MutationObservation) RetryDecision {
-	if !step.Retry.Valid() || attempt == 0 || !failure.Valid() || !mutation.Valid() {
+func DecideRetry(
+	contract domain.ExecutionContract,
+	stepID string,
+	attempt uint32,
+	failure domain.RetryFailureClass,
+	mutation domain.MutationObservation,
+) RetryDecision {
+	var matched *domain.ExecutionStepContract
+	for _, step := range contract.Steps() {
+		if step.ID == stepID {
+			if matched != nil {
+				return noRetry("ambiguous retry step")
+			}
+			stepCopy := step
+			matched = &stepCopy
+		}
+	}
+	if matched == nil || !matched.Retry.Valid() || attempt == 0 || !failure.Valid() || !mutation.Valid() {
 		return noRetry("invalid retry input")
 	}
 	if failure == domain.RetryFailureValidation {
@@ -35,23 +51,23 @@ func DecideRetry(step StepDefinition, attempt uint32, failure domain.RetryFailur
 	if mutation == domain.MutationUnknown {
 		return noRetry("unknown mutation state requires rediscovery")
 	}
-	if !step.Idempotent && mutation == domain.MutationOccurred {
+	if !matched.Idempotent && mutation == domain.MutationOccurred {
 		return noRetry("non-idempotent mutation was not proven absent")
 	}
-	if attempt >= step.Retry.MaxAttempts {
+	if attempt >= matched.Retry.MaxAttempts {
 		return noRetry("retry limit reached")
 	}
 
-	delaySeconds := step.Retry.InitialBackoffSeconds
+	delaySeconds := matched.Retry.InitialBackoffSeconds
 	for exponent := uint32(1); exponent < attempt; exponent++ {
-		if delaySeconds >= step.Retry.MaxBackoffSeconds/2 {
-			delaySeconds = step.Retry.MaxBackoffSeconds
+		if delaySeconds >= matched.Retry.MaxBackoffSeconds/2 {
+			delaySeconds = matched.Retry.MaxBackoffSeconds
 			break
 		}
 		delaySeconds *= 2
 	}
-	if delaySeconds > step.Retry.MaxBackoffSeconds {
-		delaySeconds = step.Retry.MaxBackoffSeconds
+	if delaySeconds > matched.Retry.MaxBackoffSeconds {
+		delaySeconds = matched.Retry.MaxBackoffSeconds
 	}
 
 	return RetryDecision{Retry: true, Delay: time.Duration(delaySeconds) * time.Second, Reason: "bounded transient retry"}

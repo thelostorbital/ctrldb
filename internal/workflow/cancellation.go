@@ -6,6 +6,7 @@ package workflow
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
@@ -34,11 +35,20 @@ const (
 	cancellationRollbackUI    = "Cancellation accepted; rollback and independent verification are required."
 )
 
-// CancellationController is immutable request state. Methods return the next
-// value and a decision, making cancellation deterministic and side-effect free.
+// CancellationController is durable request state. Methods return the next
+// value and a decision; the transition capability in a routed decision is a
+// shared one-shot value across all decision copies.
 type CancellationController struct {
-	queued bool
-	target domain.OperationState
+	queued  bool
+	target  domain.OperationState
+	binding cancellationBinding
+}
+
+type cancellationBinding struct {
+	operationID string
+	planID      string
+	sequence    uint64
+	requestedAt time.Time
 }
 
 // CancellationRequest contains the complete data needed to construct the
@@ -63,8 +73,12 @@ type CancellationDecision struct {
 }
 
 type cancellationAuthorization struct {
-	from   domain.OperationState
-	target domain.OperationState
+	machine    *Machine
+	generation uint64
+	from       domain.OperationState
+	target     domain.OperationState
+	binding    cancellationBinding
+	used       atomic.Bool
 }
 
 // Pending reports whether a cancellation waits for a safe boundary.
@@ -93,8 +107,15 @@ func (controller CancellationController) UIState(current domain.OperationState, 
 
 // Request returns a durable record to persist during unsafe in-flight work or
 // immediately routes a safe boundary according to observed mutation state.
-func (controller CancellationController) Request(request CancellationRequest, cancelSafe bool) (CancellationController, CancellationDecision, error) {
-	current := request.OperationState
+func (controller CancellationController) Request(
+	machine *Machine,
+	request CancellationRequest,
+	cancelSafe bool,
+) (CancellationController, CancellationDecision, error) {
+	if machine == nil {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: nil machine", ErrInvalidCancellation)
+	}
+	current := machine.State()
 	if controller.queued {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: cancellation request already recorded", ErrInvalidCancellation)
 	}
@@ -106,29 +127,17 @@ func (controller CancellationController) Request(request CancellationRequest, ca
 	}
 	mutationMayHaveOccurred := request.MutationObservation != domain.MutationNotOccurred
 	target := cancellationTarget(mutationMayHaveOccurred)
+	if request.OperationState != current {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: request state does not match machine", ErrInvalidCancellation)
+	}
+	entry := cancellationJournalEntry(request, target)
+	if err := ValidateJournalEntry(entry); err != nil {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: invalid request identity or boundary", ErrInvalidCancellation)
+	}
 	if !cancellationRouteReachable(current, target) {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q has no safe cancellation route", ErrInvalidCancellation, current)
 	}
 	if !cancelSafe {
-		entry := domain.JournalEntry{
-			Schema:         domain.JournalSchemaV1,
-			OperationID:    request.OperationID,
-			PlanID:         request.PlanID,
-			Sequence:       request.Sequence,
-			Kind:           domain.JournalEntryCancellationRequest,
-			RecordedAt:     request.RequestedAt,
-			OperationState: request.OperationState,
-			Cancellation: &domain.JournalCancellationRequest{
-				RequestedAt:         request.RequestedAt,
-				CurrentStepID:       request.CurrentStepID,
-				MutationObservation: request.MutationObservation,
-				RequiredRoute:       target,
-			},
-		}
-		if err := ValidateJournalEntry(entry); err != nil {
-			return controller, CancellationDecision{}, fmt.Errorf("%w: invalid durable request", ErrInvalidCancellation)
-		}
-
 		return controller, CancellationDecision{
 			Action:       CancellationPersist,
 			JournalEntry: &entry,
@@ -136,12 +145,24 @@ func (controller CancellationController) Request(request CancellationRequest, ca
 		}, nil
 	}
 
-	return routeCancellation(controller, current, mutationMayHaveOccurred)
+	return routeCancellation(controller, machine, mutationMayHaveOccurred, cancellationBinding{
+		operationID: request.OperationID,
+		planID:      request.PlanID,
+		sequence:    request.Sequence,
+		requestedAt: request.RequestedAt,
+	})
 }
 
 // AtBoundary honours a queued request. With no queued request it produces no
 // transition and leaves the controller unchanged.
-func (controller CancellationController) AtBoundary(current domain.OperationState, mutationMayHaveOccurred bool) (CancellationController, CancellationDecision, error) {
+func (controller CancellationController) AtBoundary(
+	machine *Machine,
+	mutationMayHaveOccurred bool,
+) (CancellationController, CancellationDecision, error) {
+	if machine == nil {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: nil machine", ErrInvalidCancellation)
+	}
+	current := machine.State()
 	if !current.Valid() || current.Terminal() {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q cannot reach a cancellation boundary", ErrInvalidCancellation, current)
 	}
@@ -156,26 +177,50 @@ func (controller CancellationController) AtBoundary(current domain.OperationStat
 		return controller, CancellationDecision{Action: CancellationNone, UIState: cancellationAvailableUI}, nil
 	}
 
-	return routeCancellationTo(controller, current, target)
+	return routeCancellationTo(controller, machine, target, controller.binding)
 }
 
 // ApplyCancellation advances machine only for a decision produced for its
 // exact current state by CancellationController.
 func (machine *Machine) ApplyCancellation(decision CancellationDecision) error {
-	if machine == nil || decision.authorization == nil || decision.authorization.from != machine.State() ||
+	if machine == nil || decision.authorization == nil || decision.authorization.machine != machine ||
 		decision.authorization.target != decision.Target ||
-		(decision.Action != CancellationCancel && decision.Action != CancellationRollback) {
+		decision.authorization.binding.operationID == "" || decision.authorization.binding.planID == "" ||
+		decision.authorization.binding.sequence == 0 || decision.authorization.binding.requestedAt.IsZero() ||
+		!cancellationActionMatchesTarget(decision.Action, decision.Target) {
 		return fmt.Errorf("%w: missing or mismatched authorization", ErrInvalidCancellation)
+	}
+	if !decision.authorization.used.CompareAndSwap(false, true) {
+		return fmt.Errorf("%w: cancellation authorization already consumed", ErrInvalidCancellation)
+	}
+	if decision.authorization.generation != machine.generation || decision.authorization.from != machine.State() {
+		return fmt.Errorf("%w: cancellation boundary changed", ErrInvalidCancellation)
 	}
 
 	return machine.transition(decision.Target, true)
 }
 
-func routeCancellation(controller CancellationController, current domain.OperationState, mutationMayHaveOccurred bool) (CancellationController, CancellationDecision, error) {
-	return routeCancellationTo(controller, current, cancellationTarget(mutationMayHaveOccurred))
+func cancellationActionMatchesTarget(action CancellationAction, target domain.OperationState) bool {
+	return action == CancellationCancel && target == domain.OperationCancelled ||
+		action == CancellationRollback && target == domain.OperationRollback
 }
 
-func routeCancellationTo(controller CancellationController, current, target domain.OperationState) (CancellationController, CancellationDecision, error) {
+func routeCancellation(
+	controller CancellationController,
+	machine *Machine,
+	mutationMayHaveOccurred bool,
+	binding cancellationBinding,
+) (CancellationController, CancellationDecision, error) {
+	return routeCancellationTo(controller, machine, cancellationTarget(mutationMayHaveOccurred), binding)
+}
+
+func routeCancellationTo(
+	controller CancellationController,
+	machine *Machine,
+	target domain.OperationState,
+	binding cancellationBinding,
+) (CancellationController, CancellationDecision, error) {
+	current := machine.State()
 	action := CancellationCancel
 	uiState := cancellationCancelUI
 	if target == domain.OperationRollback {
@@ -187,10 +232,12 @@ func routeCancellationTo(controller CancellationController, current, target doma
 	}
 
 	return CancellationController{}, CancellationDecision{
-		Action:        action,
-		Target:        target,
-		UIState:       uiState,
-		authorization: &cancellationAuthorization{from: current, target: target},
+		Action:  action,
+		Target:  target,
+		UIState: uiState,
+		authorization: &cancellationAuthorization{
+			machine: machine, generation: machine.generation, from: current, target: target, binding: binding,
+		},
 	}, nil
 }
 
@@ -205,9 +252,16 @@ func RestoreCancellationController(entries []domain.JournalEntry, operationID, p
 	}
 
 	var target domain.OperationState
+	var binding cancellationBinding
 	for _, entry := range entries {
 		if entry.Kind == domain.JournalEntryCancellationRequest {
 			target = entry.Cancellation.RequiredRoute
+			binding = cancellationBinding{
+				operationID: entry.OperationID,
+				planID:      entry.PlanID,
+				sequence:    entry.Sequence,
+				requestedAt: entry.Cancellation.RequestedAt,
+			}
 			continue
 		}
 		if target != "" && entry.Kind == domain.JournalEntryStep &&
@@ -216,10 +270,29 @@ func RestoreCancellationController(entries []domain.JournalEntry, operationID, p
 		}
 		if target != "" && entry.Kind == domain.JournalEntryTransition && entry.OperationState == target {
 			target = ""
+			binding = cancellationBinding{}
 		}
 	}
 
-	return CancellationController{queued: target != "", target: target}, nil
+	return CancellationController{queued: target != "", target: target, binding: binding}, nil
+}
+
+func cancellationJournalEntry(request CancellationRequest, target domain.OperationState) domain.JournalEntry {
+	return domain.JournalEntry{
+		Schema:         domain.JournalSchemaV1,
+		OperationID:    request.OperationID,
+		PlanID:         request.PlanID,
+		Sequence:       request.Sequence,
+		Kind:           domain.JournalEntryCancellationRequest,
+		RecordedAt:     request.RequestedAt,
+		OperationState: request.OperationState,
+		Cancellation: &domain.JournalCancellationRequest{
+			RequestedAt:         request.RequestedAt,
+			CurrentStepID:       request.CurrentStepID,
+			MutationObservation: request.MutationObservation,
+			RequiredRoute:       target,
+		},
+	}
 }
 
 func cancellationTarget(mutationMayHaveOccurred bool) domain.OperationState {

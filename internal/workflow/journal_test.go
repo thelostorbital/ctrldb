@@ -65,10 +65,17 @@ func TestJournalEntryDecodeRejectsOpenOrMalformedJSON(t *testing.T) {
 	}
 	tests := map[string][]byte{
 		"unknown top-level field": bytes.Replace(encoded, []byte(`{"schema"`), []byte(`{"extra":true,"schema"`), 1),
+		"nested key at top level": bytes.Replace(encoded, []byte(`{"schema"`), []byte(`{"id":"wrong-level","schema"`), 1),
 		"unknown nested field": bytes.Replace(
 			encoded,
 			[]byte(`"step":{"id"`),
 			[]byte(`"step":{"extra":true,"id"`),
+			1,
+		),
+		"top-level key nested": bytes.Replace(
+			encoded,
+			[]byte(`"step":{"id"`),
+			[]byte(`"step":{"schema":"JournalEntryV1","id"`),
 			1,
 		),
 		"trailing value": append(append([]byte(nil), encoded...), []byte(` {}`)...),
@@ -171,6 +178,14 @@ func TestJournalEntryDecodeRejectsDuplicateKeysWithoutDisclosure(t *testing.T) {
 	noncanonical := bytes.Replace(step, []byte(`"resultSummary"`), []byte(`"RESULTSUMMARY"`), 1)
 	if _, err := workflow.DecodeJournalEntry(noncanonical); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
 		t.Fatalf("DecodeJournalEntry(noncanonical key) error = %v", err)
+	}
+	unicodeFold := bytes.Replace(step, []byte(`"mutationOccurred"`), []byte(`"mutationOccurrеd"`), 1)
+	_, err = workflow.DecodeJournalEntry(unicodeFold)
+	if !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry(unicode-folded key) error = %v", err)
+	}
+	if strings.Contains(err.Error(), "mutationOccurrеd") {
+		t.Fatalf("DecodeJournalEntry() error disclosed Unicode-folded key: %q", err)
 	}
 }
 

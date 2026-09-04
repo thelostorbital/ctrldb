@@ -147,17 +147,24 @@ type ExecutionStepContract struct {
 // ExecutionContract is immutable after construction; slice-bearing fields are
 // defensively copied both into and out of the value.
 type ExecutionContract struct {
-	workflowID string
-	steps      []ExecutionStepContract
+	workflowID       string
+	rollbackBoundary string
+	pointOfNoReturn  string
+	steps            []ExecutionStepContract
 }
 
 // NewExecutionContract constructs a closed resource-independent contract.
-func NewExecutionContract(workflowID string, steps []ExecutionStepContract) (ExecutionContract, error) {
-	if !executionWorkflowIDPattern.MatchString(workflowID) || len(steps) == 0 {
-		return ExecutionContract{}, fmt.Errorf("%w: invalid workflow or empty steps", ErrInvalidExecutionContract)
+func NewExecutionContract(
+	workflowID, rollbackBoundary, pointOfNoReturn string,
+	steps []ExecutionStepContract,
+) (ExecutionContract, error) {
+	if !executionWorkflowIDPattern.MatchString(workflowID) ||
+		!executionIdentifierPattern.MatchString(rollbackBoundary) || len(steps) == 0 {
+		return ExecutionContract{}, fmt.Errorf("%w: invalid workflow, rollback boundary, or steps", ErrInvalidExecutionContract)
 	}
 	seen := make(map[string]struct{}, len(steps))
 	cloned := make([]ExecutionStepContract, len(steps))
+	rollbackRequired := false
 	for index, step := range steps {
 		if !executionIdentifierPattern.MatchString(step.ID) || !executionIdentifierPattern.MatchString(step.Executor) ||
 			!step.ExecutingIdentity.Valid() || !step.Effect.Valid() || !step.MinimumApproval.Valid() ||
@@ -175,6 +182,7 @@ func NewExecutionContract(workflowID string, steps []ExecutionStepContract) (Exe
 			return ExecutionContract{}, fmt.Errorf("%w: duplicate step", ErrInvalidExecutionContract)
 		}
 		seen[step.ID] = struct{}{}
+		rollbackRequired = rollbackRequired || step.Effect == StepEffectMutation || step.FailureBehavior == FailureRollback
 		if err := validateContractStrings(step.TargetKinds, executionIdentifierPattern); err != nil {
 			return ExecutionContract{}, fmt.Errorf("%w: invalid target kinds", ErrInvalidExecutionContract)
 		}
@@ -183,12 +191,32 @@ func NewExecutionContract(workflowID string, steps []ExecutionStepContract) (Exe
 		}
 		cloned[index] = cloneExecutionStepContract(step)
 	}
+	if pointOfNoReturn != "" {
+		if !executionIdentifierPattern.MatchString(pointOfNoReturn) {
+			return ExecutionContract{}, fmt.Errorf("%w: invalid point of no return", ErrInvalidExecutionContract)
+		}
+		if _, exists := seen[pointOfNoReturn]; !exists {
+			return ExecutionContract{}, fmt.Errorf("%w: point of no return is not a step", ErrInvalidExecutionContract)
+		}
+	}
+	if rollbackRequired && rollbackBoundary == "none" {
+		return ExecutionContract{}, fmt.Errorf("%w: mutation or rollback step requires a rollback boundary", ErrInvalidExecutionContract)
+	}
 
-	return ExecutionContract{workflowID: workflowID, steps: cloned}, nil
+	return ExecutionContract{
+		workflowID: workflowID, rollbackBoundary: rollbackBoundary, pointOfNoReturn: pointOfNoReturn, steps: cloned,
+	}, nil
 }
 
 // WorkflowID returns the immutable workflow binding.
 func (contract ExecutionContract) WorkflowID() string { return contract.workflowID }
+
+// RollbackBoundary returns the immutable reviewed rollback boundary.
+func (contract ExecutionContract) RollbackBoundary() string { return contract.rollbackBoundary }
+
+// PointOfNoReturn returns the exact optional step after which rollback is no
+// longer promised.
+func (contract ExecutionContract) PointOfNoReturn() string { return contract.pointOfNoReturn }
 
 // Steps returns a detached copy of the trusted step contracts.
 func (contract ExecutionContract) Steps() []ExecutionStepContract {

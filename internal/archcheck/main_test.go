@@ -158,7 +158,27 @@ import _ "unsafe"
 //go:linkname startProcess os.StartProcess
 func startProcess()
 `,
-			want: 1,
+			want: 2,
+		},
+		{
+			name:   "production reflection",
+			source: "package fixture\nimport _ \"reflect\"\n",
+			want:   1,
+		},
+		{
+			name:   "production unsafe",
+			source: "package fixture\nimport _ \"unsafe\"\n",
+			want:   1,
+		},
+		{
+			name:     "test reflection",
+			filename: "internal/example/fixture_test.go",
+			source:   "package fixture\nimport _ \"reflect\"\n",
+		},
+		{
+			name:     "test unsafe",
+			filename: "internal/example/fixture_test.go",
+			source:   "package fixture\nimport _ \"unsafe\"\n",
 		},
 		{
 			name: "cgo import directive",
@@ -413,6 +433,21 @@ func launch()
 
 const validSecretValueSource = `package secret
 import "fmt"
+type Value struct { access func(func(*[]byte)) }
+func New(value []byte) *Value {
+	return &Value{access: func(operation func(*[]byte)) { operation(&value) }}
+}
+func (*Value) Zero() {}
+func (*Value) Empty() bool { return false }
+func (*Value) String() string { return "[redacted]" }
+func (*Value) GoString() string { return "[redacted]" }
+func (*Value) Format(fmt.State, rune) {}
+func (*Value) MarshalJSON() ([]byte, error) { return nil, nil }
+func (*Value) MarshalText() ([]byte, error) { return nil, nil }
+`
+
+const primitiveSecretValueSource = `package secret
+import "fmt"
 type Value struct { bytes []byte }
 func New(value []byte) *Value { return &Value{bytes: value} }
 func (*Value) Zero() {}
@@ -466,12 +501,17 @@ func TestScanEnforcesSecretAPISurface(t *testing.T) {
 		},
 		{
 			name:  "exported field",
-			value: strings.Replace(strings.Replace(validSecretValueSource, "bytes []byte", "Bytes []byte", 1), "{bytes: value}", "{Bytes: value}", 1),
+			value: strings.Replace(validSecretValueSource, "access func(func(*[]byte))", "access func(func(*[]byte)); Bytes []byte", 1),
+			want:  1,
+		},
+		{
+			name:  "primitive raw storage",
+			value: primitiveSecretValueSource,
 			want:  1,
 		},
 		{
 			name:  "wrong constructor signature",
-			value: strings.Replace(validSecretValueSource, "func New(value []byte) *Value { return &Value{bytes: value} }", "func New(string) *Value { return nil }", 1),
+			value: strings.Replace(validSecretValueSource, "func New(value []byte) *Value {\n\treturn &Value{access: func(operation func(*[]byte)) { operation(&value) }}\n}", "func New(string) *Value { return nil }", 1),
 			want:  1,
 		},
 		{
@@ -483,7 +523,23 @@ func TestScanEnforcesSecretAPISurface(t *testing.T) {
 			name:  "darwin-only exported accessor",
 			value: validSecretValueSource,
 			extra: map[string]string{
-				"reveal_darwin.go": "//go:build darwin\n\npackage secret\nfunc (*Value) Reveal() []byte { return nil }\n",
+				"reveal_darwin.go": "package secret\nfunc (*Value) Reveal() []byte { return nil }\n",
+			},
+			want: 2,
+		},
+		{
+			name:  "custom-tag exported accessor",
+			value: validSecretValueSource,
+			extra: map[string]string{
+				"reveal_custom.go": "//go:build raw_secret_test\n\npackage secret\nfunc (*Value) Reveal() []byte { return nil }\n",
+			},
+			want: 1,
+		},
+		{
+			name:  "legacy custom-tag exported accessor",
+			value: validSecretValueSource,
+			extra: map[string]string{
+				"reveal_legacy.go": "// +build raw_secret_test\n\npackage secret\nfunc (*Value) Reveal() []byte { return nil }\n",
 			},
 			want: 1,
 		},
@@ -696,6 +752,104 @@ func TestScanEnforcesVerifierBoundaryThroughObservationContract(t *testing.T) {
 			}
 			if test.want != 0 && !strings.HasSuffix(filepath.ToSlash(findings[0].filename), "internal/observation/contract.go") {
 				t.Fatalf("finding path = %q, want observation contract", findings[0].filename)
+			}
+		})
+	}
+}
+
+func TestScanEnforcesVerifierBoundaryAcrossFirstPartyImportClosure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		files         map[string]string
+		findingSuffix string
+		wantFinding   bool
+	}{
+		{
+			name: "safe domain dependency",
+			files: map[string]string{
+				"internal/domain/model.go": "package domain\nimport _ \"context\"\n",
+			},
+		},
+		{
+			name: "nested domain TLS dependency",
+			files: map[string]string{
+				"internal/domain/model.go":       "package domain\nimport _ \"github.com/thelostorbital/ctrldb/internal/domain/support\"\n",
+				"internal/domain/support/tls.go": "package support\nimport _ \"crypto/tls\"\n",
+			},
+			findingSuffix: "internal/domain/support/tls.go",
+			wantFinding:   true,
+		},
+		{
+			name: "domain reflection dependency",
+			files: map[string]string{
+				"internal/domain/model.go": "package domain\nimport _ \"reflect\"\n",
+			},
+			findingSuffix: "internal/domain/model.go",
+			wantFinding:   true,
+		},
+		{
+			name: "domain unsafe dependency",
+			files: map[string]string{
+				"internal/domain/model.go": "package domain\nimport _ \"unsafe\"\n",
+			},
+			findingSuffix: "internal/domain/model.go",
+			wantFinding:   true,
+		},
+		{
+			name: "domain network dependency",
+			files: map[string]string{
+				"internal/domain/model.go": "package domain\nimport _ \"net\"\n",
+			},
+			findingSuffix: "internal/domain/model.go",
+			wantFinding:   true,
+		},
+		{
+			name: "domain runner dependency",
+			files: map[string]string{
+				"internal/domain/model.go": "package domain\nimport _ \"github.com/thelostorbital/ctrldb/internal/runner\"\n",
+			},
+			findingSuffix: "internal/domain/model.go",
+			wantFinding:   true,
+		},
+		{
+			name: "domain workflow dependency",
+			files: map[string]string{
+				"internal/domain/model.go": "package domain\nimport _ \"github.com/thelostorbital/ctrldb/internal/workflow\"\n",
+			},
+			findingSuffix: "internal/domain/model.go",
+			wantFinding:   true,
+		},
+		{
+			name: "domain provider dependency",
+			files: map[string]string{
+				"internal/domain/model.go": "package domain\nimport _ \"github.com/thelostorbital/ctrldb/internal/provider\"\n",
+			},
+			findingSuffix: "internal/domain/model.go",
+			wantFinding:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			test.files["internal/verify/check.go"] = "package verify\nimport _ \"github.com/thelostorbital/ctrldb/internal/domain\"\n"
+			writeScanFixtureFiles(t, root, test.files)
+
+			findings, err := scan(root)
+			if err != nil {
+				t.Fatalf("scan verifier import closure: %v", err)
+			}
+			found := false
+			for _, result := range findings {
+				if strings.Contains(result.message, "C-VERIFY") && strings.HasSuffix(filepath.ToSlash(result.filename), test.findingSuffix) {
+					found = true
+				}
+			}
+			if found != test.wantFinding {
+				t.Fatalf("C-VERIFY closure finding = %v, want %v; all findings: %v", found, test.wantFinding, findings)
 			}
 		})
 	}

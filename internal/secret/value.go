@@ -18,7 +18,7 @@ const redacted = "[redacted]"
 // A Value must not be copied after first use and must not be used concurrently.
 // Call Zero as soon as the secret is no longer needed.
 type Value struct {
-	bytes []byte
+	access func(func(*[]byte))
 }
 
 // New creates a Value that owns a copy of value.
@@ -26,24 +26,34 @@ func New(value []byte) *Value {
 	owned := make([]byte, len(value))
 	copy(owned, value)
 
-	return &Value{bytes: owned}
+	return &Value{access: func(operation func(*[]byte)) {
+		operation(&owned)
+	}}
 }
 
 // Zero overwrites the owned bytes and releases the slice. It is idempotent.
 func (value *Value) Zero() {
-	if value == nil {
+	if value == nil || value.access == nil {
 		return
 	}
 
-	for index := range value.bytes {
-		value.bytes[index] = 0
-	}
-	value.bytes = nil
+	value.access(func(owned *[]byte) {
+		clear(*owned)
+		*owned = nil
+	})
+	value.access = nil
 }
 
 // Empty reports whether value contains no secret bytes.
 func (value *Value) Empty() bool {
-	return value == nil || len(value.bytes) == 0
+	if value == nil || value.access == nil {
+		return true
+	}
+	empty := true
+	value.access(func(owned *[]byte) {
+		empty = len(*owned) == 0
+	})
+	return empty
 }
 
 // String implements fmt.Stringer without revealing secret material.

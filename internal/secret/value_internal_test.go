@@ -13,16 +13,21 @@ func TestValueOwnsInput(t *testing.T) {
 	t.Cleanup(value.Zero)
 
 	input[0] = 'X'
-	if string(value.bytes) != "SECRET_MARKER_COPY_2" {
-		t.Fatalf("owned bytes = %q, want an independent copy", value.bytes)
-	}
+	value.access(func(owned *[]byte) {
+		if string(*owned) != "SECRET_MARKER_COPY_2" {
+			t.Fatalf("owned bytes = %q, want an independent copy", *owned)
+		}
+	})
 }
 
 func TestValueZeroOverwritesOwnedBytes(t *testing.T) {
 	t.Parallel()
 
 	value := New([]byte("SECRET_MARKER_ZERO_4"))
-	owned := value.bytes
+	var owned []byte
+	value.access(func(stored *[]byte) {
+		owned = *stored
+	})
 	value.Zero()
 
 	for index, element := range owned {
@@ -30,7 +35,7 @@ func TestValueZeroOverwritesOwnedBytes(t *testing.T) {
 			t.Fatalf("owned byte %d was not zeroed", index)
 		}
 	}
-	if value.bytes != nil {
-		t.Fatal("Value retained its byte slice after Zero")
+	if value.access != nil {
+		t.Fatal("Value retained its storage closure after Zero")
 	}
 }

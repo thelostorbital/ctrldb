@@ -6,13 +6,16 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/build"
+	"go/build/constraint"
 	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -30,16 +33,19 @@ type finding struct {
 }
 
 type sourceFile struct {
-	filename string
-	contents []byte
+	filename     string
+	relativePath string
+	contents     []byte
 }
 
 type sourcePolicy struct {
-	allowBubbleTeaImport    bool
-	allowSourceImporter     bool
-	allowTestInfrastructure bool
-	enforceVerifierBoundary bool
-	enforceSecretAPISurface bool
+	allowBubbleTeaImport         bool
+	allowRuntimeIntrospection    bool
+	allowSourceImporter          bool
+	allowTestInfrastructure      bool
+	enforceVerifierBoundary      bool
+	enforceSecretAPISurface      bool
+	forbidSecretBuildConstraints bool
 }
 
 const (
@@ -105,6 +111,7 @@ func main() {
 func scan(root string) ([]finding, error) {
 	var findings []finding
 	var secretSources []sourceFile
+	var repositorySources []sourceFile
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -162,8 +169,12 @@ func scan(root string) ([]finding, error) {
 			return err
 		}
 		findings = append(findings, fileFindings...)
+		source := sourceFile{filename: path, relativePath: relativePath, contents: contents}
+		if !strings.HasSuffix(filepath.ToSlash(relativePath), "_test.go") {
+			repositorySources = append(repositorySources, source)
+		}
 		if policy.enforceSecretAPISurface {
-			secretSources = append(secretSources, sourceFile{filename: path, contents: contents})
+			secretSources = append(secretSources, source)
 		}
 		return nil
 	})
@@ -175,6 +186,11 @@ func scan(root string) ([]finding, error) {
 		return nil, err
 	}
 	findings = append(findings, secretFindings...)
+	verifierFindings, err := findTransitiveVerifierViolations(repositorySources)
+	if err != nil {
+		return nil, err
+	}
+	findings = append(findings, verifierFindings...)
 	findings = uniqueFindings(findings)
 
 	sort.Slice(findings, func(i, j int) bool {
@@ -234,6 +250,76 @@ func findVendorNativeViolations(filename string, contents []byte) ([]finding, er
 	return findings, nil
 }
 
+type repositoryImport struct {
+	path     string
+	position token.Position
+}
+
+func findTransitiveVerifierViolations(sources []sourceFile) ([]finding, error) {
+	importsByPackage := make(map[string][]repositoryImport)
+	for _, source := range sources {
+		files := token.NewFileSet()
+		parsed, err := parser.ParseFile(files, source.filename, source.contents, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", source.filename, err)
+		}
+		packagePath := repositoryPackagePath(source.relativePath)
+		for _, imported := range parsed.Imports {
+			importPath, err := strconv.Unquote(imported.Path.Value)
+			if err != nil {
+				return nil, fmt.Errorf("decode import in %s: %w", source.filename, err)
+			}
+			importsByPackage[packagePath] = append(importsByPackage[packagePath], repositoryImport{
+				path:     importPath,
+				position: files.Position(imported.Path.Pos()),
+			})
+		}
+	}
+
+	queue := make([]string, 0)
+	for packagePath := range importsByPackage {
+		if packagePath == modulePath+"/internal/verify" || strings.HasPrefix(packagePath, modulePath+"/internal/verify/") {
+			queue = append(queue, packagePath)
+		}
+	}
+	sort.Strings(queue)
+
+	visited := make(map[string]bool, len(queue))
+	var findings []finding
+	for len(queue) != 0 {
+		packagePath := queue[0]
+		queue = queue[1:]
+		if visited[packagePath] {
+			continue
+		}
+		visited[packagePath] = true
+		for _, imported := range importsByPackage[packagePath] {
+			if message, forbidden := forbiddenVerifierImportMessage(imported.path); forbidden {
+				findings = append(findings, finding{
+					filename: imported.position.Filename,
+					line:     imported.position.Line,
+					column:   imported.position.Column,
+					message:  message,
+				})
+			}
+			if strings.HasPrefix(imported.path, modulePath+"/") && !visited[imported.path] {
+				if _, exists := importsByPackage[imported.path]; exists {
+					queue = append(queue, imported.path)
+				}
+			}
+		}
+	}
+	return findings, nil
+}
+
+func repositoryPackagePath(relativePath string) string {
+	directory := filepath.ToSlash(filepath.Dir(relativePath))
+	if directory == "." {
+		return modulePath
+	}
+	return modulePath + "/" + directory
+}
+
 func uniqueFindings(findings []finding) []finding {
 	seen := make(map[finding]struct{}, len(findings))
 	unique := make([]finding, 0, len(findings))
@@ -255,8 +341,31 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 	}
 
 	var findings []finding
+	if policy.forbidSecretBuildConstraints {
+		filenameConstrained, err := hasFilenameBuildConstraint(filename, contents)
+		if err != nil {
+			return nil, fmt.Errorf("evaluate filename build constraints for %s: %w", filename, err)
+		}
+		if filenameConstrained {
+			findings = append(findings, finding{
+				filename: filename,
+				line:     1,
+				column:   1,
+				message:  "internal/secret source files must not use GOOS or GOARCH filename constraints; its sealed API must be identical for every build",
+			})
+		}
+	}
 	for _, group := range parsed.Comments {
 		for _, comment := range group.List {
+			if policy.forbidSecretBuildConstraints && isBuildConstraint(comment.Text) {
+				position := files.Position(comment.Pos())
+				findings = append(findings, finding{
+					filename: position.Filename,
+					line:     position.Line,
+					column:   position.Column,
+					message:  "internal/secret source files must not use build constraints; its sealed API must be identical for every build",
+				})
+			}
 			message, forbidden := forbiddenCompilerDirective(comment.Text)
 			if !forbidden {
 				continue
@@ -287,6 +396,9 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 		var messages []string
 		if message, forbidden := forbiddenProcessImportMessage(importPath, policy); forbidden {
 			messages = append(messages, message)
+		}
+		if !policy.allowRuntimeIntrospection && !policy.enforceVerifierBoundary && (importPath == "reflect" || importPath == "unsafe") {
+			messages = append(messages, "production code must not import reflect or unsafe; runtime introspection can bypass sealed data boundaries")
 		}
 		if isBubbleTeaImport(importPath) && !policy.allowBubbleTeaImport {
 			messages = append(messages, "Bubble Tea is restricted to internal/tui")
@@ -511,15 +623,21 @@ func validSecretValueType(object types.Object) bool {
 		return false
 	}
 	structure, ok := value.Underlying().(*types.Struct)
-	if !ok {
+	if !ok || structure.NumFields() != 1 || structure.Field(0).Exported() {
 		return false
 	}
-	for index := 0; index < structure.NumFields(); index++ {
-		if structure.Field(index).Exported() {
-			return false
-		}
+	access, ok := types.Unalias(structure.Field(0).Type()).(*types.Signature)
+	if !ok || access.Recv() != nil || access.TypeParams().Len() != 0 || access.Variadic() ||
+		access.Params().Len() != 1 || access.Results().Len() != 0 {
+		return false
 	}
-	return true
+	operation, ok := types.Unalias(access.Params().At(0).Type()).(*types.Signature)
+	if !ok || operation.Recv() != nil || operation.TypeParams().Len() != 0 || operation.Variadic() ||
+		operation.Params().Len() != 1 || operation.Results().Len() != 0 {
+		return false
+	}
+	bytesPointer, ok := types.Unalias(operation.Params().At(0).Type()).(*types.Pointer)
+	return ok && isByteSlice(bytesPointer.Elem())
 }
 
 func validSecretNew(object, valueObject types.Object) bool {
@@ -591,12 +709,15 @@ func secretAPIFinding(files *token.FileSet, object types.Object, message string)
 
 func policyForSource(relativePath string) sourcePolicy {
 	normalized := filepath.ToSlash(filepath.Clean(relativePath))
+	isTest := strings.HasSuffix(normalized, "_test.go")
 	policy := sourcePolicy{
-		allowBubbleTeaImport:    strings.HasPrefix(normalized, "internal/tui/"),
-		allowSourceImporter:     normalized == "internal/archcheck/main.go",
-		allowTestInfrastructure: strings.HasSuffix(normalized, "_test.go"),
-		enforceVerifierBoundary: strings.HasPrefix(normalized, "internal/verify/") || strings.HasPrefix(normalized, "internal/observation/"),
-		enforceSecretAPISurface: strings.HasPrefix(normalized, "internal/secret/") && !strings.HasSuffix(normalized, "_test.go"),
+		allowBubbleTeaImport:         strings.HasPrefix(normalized, "internal/tui/"),
+		allowRuntimeIntrospection:    isTest,
+		allowSourceImporter:          normalized == "internal/archcheck/main.go",
+		allowTestInfrastructure:      isTest,
+		enforceVerifierBoundary:      strings.HasPrefix(normalized, "internal/verify/") || strings.HasPrefix(normalized, "internal/observation/"),
+		enforceSecretAPISurface:      strings.HasPrefix(normalized, "internal/secret/") && !isTest,
+		forbidSecretBuildConstraints: strings.HasPrefix(normalized, "internal/secret/"),
 	}
 	if policy.allowTestInfrastructure {
 		return policy
@@ -610,6 +731,44 @@ func policyForSource(relativePath string) sourcePolicy {
 		}
 	}
 	return policy
+}
+
+func isBuildConstraint(comment string) bool {
+	return constraint.IsGoBuild(comment) || constraint.IsPlusBuild(comment)
+}
+
+func hasFilenameBuildConstraint(filename string, contents []byte) (bool, error) {
+	base := strings.TrimSuffix(filepath.Base(filename), ".go")
+	base = strings.TrimSuffix(base, "_test")
+	components := strings.Split(base, "_")
+	if len(components) < 2 {
+		return false, nil
+	}
+	last := components[len(components)-1]
+	operatingSystem := last
+	if len(components) >= 3 {
+		operatingSystem = components[len(components)-2]
+	}
+
+	matches := func(goos, goarch string) (bool, error) {
+		context := build.Default
+		context.GOOS = goos
+		context.GOARCH = goarch
+		context.CgoEnabled = false
+		context.OpenFile = func(string) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(contents)), nil
+		}
+		return context.MatchFile(filepath.Dir(filename), filepath.Base(filename))
+	}
+	candidateMatches, err := matches(operatingSystem, last)
+	if err != nil {
+		return false, err
+	}
+	unconstrainedMatches, err := matches("ctrldb_invalid_goos", "ctrldb_invalid_goarch")
+	if err != nil {
+		return false, err
+	}
+	return candidateMatches && !unconstrainedMatches, nil
 }
 
 func forbiddenVerifierImportMessage(importPath string) (string, bool) {

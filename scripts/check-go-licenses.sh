@@ -16,19 +16,25 @@ trap cleanup EXIT
 
 check_report() {
   local report_file=$1
-  local package_name license_name remainder
+  local line package_name license_file license_name comma_markers
   local rows=0
 
-  while IFS=, read -r package_name _ license_name remainder; do
-    [[ -z $package_name && -z $license_name ]] && continue
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -z $line ]] && continue
     rows=$((rows + 1))
-    license_name=${license_name%$'\r'}
-    if [[ -n $remainder ]]; then
-      echo "malformed go-licenses CSV row for $package_name" >&2
+    comma_markers=${line//[^,]/}
+    if [[ $comma_markers != ",," ]]; then
+      echo "malformed go-licenses CSV row" >&2
+      return 1
+    fi
+    IFS=, read -r package_name license_file license_name <<< "$line"
+    if [[ -z $package_name || -z $license_file || -z $license_name ]]; then
+      echo "malformed go-licenses CSV row" >&2
       return 1
     fi
     case "$license_name" in
-      Apache-2.0 | MIT | BSD-* | ISC | MPL-2.0)
+      Apache-2.0 | MIT | BSD-2-Clause | BSD-3-Clause | ISC | MPL-2.0)
         ;;
       "" | Unknown)
         echo "dependency $package_name has an unknown license" >&2
@@ -77,5 +83,7 @@ check_report "$fixture_root/allowed.csv"
 assert_rejected "$fixture_root/gpl.csv" "GPL-3.0-only"
 assert_rejected "$fixture_root/agpl.csv" "AGPL-3.0-only"
 assert_rejected "$fixture_root/unknown.csv" "unknown license"
+assert_rejected "$fixture_root/future-bsd.csv" "BSD-4-Clause"
+assert_rejected "$fixture_root/malformed.csv" "malformed"
 
 echo "Go dependency licenses satisfy the D-084 allowlist; rejection fixtures passed"

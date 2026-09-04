@@ -66,6 +66,18 @@ func TestFindArchitectureViolations(t *testing.T) {
 			want:   1,
 		},
 		{
+			name:     "source importer in archcheck implementation",
+			filename: "internal/archcheck/main.go",
+			source:   "package main\nimport _ \"go/importer\"\n",
+		},
+		{
+			name:     "default importer in archcheck implementation",
+			filename: "internal/archcheck/main.go",
+			source:   "package main\nimport \"go/importer\"\nfunc load() { importer.Default() }\n",
+			want:     1,
+			message:  "go/importer.Default is forbidden",
+		},
+		{
 			name:   "go packages import",
 			source: "package fixture\nimport _ \"golang.org/x/tools/go/packages\"\n",
 			want:   1,
@@ -279,6 +291,128 @@ func expose(value *secret.Value) { logger := log.Default(); logger.Printf("%v", 
 			message: "secret.Value must not be passed to fmt or log",
 		},
 		{
+			name: "formatter function alias",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { printer := fmt.Printf; printer("%v", value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "formatter function alias reassignment",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) {
+	var printer func(string, ...any) (int, error)
+	printer = fmt.Printf
+	printer("%v", value)
+}
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "formatter alias through variable indirection",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { first := fmt.Printf; second := first; second("%v", value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "formatter alias written into container",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) {
+	printers := make([]func(string, ...any) (int, error), 1)
+	printers[0] = fmt.Printf
+	_, _ = printers[0]("%v", value)
+}
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "formatter returned by helper",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func printer() func(string, ...any) (int, error) { return fmt.Printf }
+func expose(value *secret.Value) { _, _ = printer()("%v", value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "logger method function alias",
+			source: `package fixture
+import (
+	"log"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { logger := log.Default(); printer := logger.Printf; printer("%v", value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "formatter passed through helper parameter",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func invoke(printer func(string, ...any) (int, error), value any) { _, _ = printer("%v", value) }
+func expose(value *secret.Value) { invoke(fmt.Printf, value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "formatter function literal alias",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) {
+	printer := func(argument any) { fmt.Print(argument) }
+	printer(value)
+}
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "ordinary formatting helper function alias",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func printValue(value any) { fmt.Print(value) }
+func expose(value *secret.Value) { printer := printValue; printer(value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
 			name: "secret nested in struct",
 			source: `package fixture
 import (
@@ -314,6 +448,146 @@ func expose(value *secret.Value) { arguments := []any{value}; fmt.Print(argument
 `,
 			want:    1,
 			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret written into interface field",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+type holder struct { value any }
+func expose(value *secret.Value) { var wrapped holder; wrapped.value = value; fmt.Print(wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret written into interface slice",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { wrapped := make([]any, 1); wrapped[0] = value; fmt.Print(wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret written into interface map",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { wrapped := map[string]any{}; wrapped["credential"] = value; fmt.Print(wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret used as interface map key",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { wrapped := map[any]string{}; wrapped[value] = "credential"; fmt.Print(wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret written through pointer alias",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+type holder struct { value any }
+func expose(value *secret.Value) { var wrapped holder; alias := &wrapped; alias.value = value; fmt.Print(wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret written through ordinary helper",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+type holder struct { value any }
+func store(target *holder, value any) { target.value = value }
+func expose(value *secret.Value) { var wrapped holder; store(&wrapped, value); fmt.Print(wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret formatted by interface-dispatched helper",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+type printer interface { Print(any) }
+type output struct{}
+func (output) Print(value any) { fmt.Print(value) }
+func expose(value *secret.Value) { var destination printer = output{}; destination.Print(value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret copied into interface slice",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { wrapped := make([]any, 1); copy(wrapped, []any{value}); fmt.Print(wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret sent through interface channel",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { wrapped := make(chan any, 1); wrapped <- value; fmt.Print(<-wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret propagated through ordinary wrapper",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func wrap(value any) any { return value }
+func expose(value *secret.Value) { fmt.Print(wrap(value)) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "unresolved formatting argument fails closed",
+			source: `package fixture
+import (
+	"fmt"
+	"example.test/provider"
+)
+func expose() { fmt.Print(provider.Credential()) }
+`,
+			want:    1,
+			message: "formatting argument type could not be resolved",
 		},
 		{
 			name: "defined secret wrapper",
@@ -352,6 +626,13 @@ func safe(value *Value) { fmt.Print(value) }
 type formatter struct{}
 func (formatter) Print(...any) {}
 func safe() { fmt := formatter{}; fmt.Print(struct{ Value string }{Value: "safe"}) }
+`,
+		},
+		{
+			name: "local formatter function alias",
+			source: `package fixture
+func Print(...any) {}
+func safe() { printer := Print; printer("safe") }
 `,
 		},
 		{
@@ -407,7 +688,10 @@ func TestVerifierImportBoundaryFixtures(t *testing.T) {
 		{name: "allowed.go.txt"},
 		{name: "forbidden-app.go.txt", want: 1},
 		{name: "forbidden-executor-step.go.txt", want: 1},
+		{name: "forbidden-external-provider.go.txt", want: 1},
+		{name: "forbidden-internal-package.go.txt", want: 1},
 		{name: "forbidden-runner.go.txt", want: 1},
+		{name: "forbidden-stdlib-lookalike.go.txt", want: 1},
 		{name: "forbidden-workflow.go.txt", want: 1},
 	}
 
@@ -507,5 +791,44 @@ func expose(value *credential) { fmt.Printf("%v", value) }
 	}
 	if !strings.Contains(findings[0].message, "secret.Value") {
 		t.Fatalf("finding message = %q, want secret.Value", findings[0].message)
+	}
+}
+
+func TestScanResolvesSecretReturnedByRepositoryPackage(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	files := map[string]string{
+		"provider/credential.go": `package provider
+import "github.com/thelostorbital/ctrldb/internal/secret"
+func Credential() *secret.Value { return nil }
+`,
+		"consumer/expose.go": `package consumer
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/provider"
+)
+func expose() { fmt.Printf("%v", provider.Credential()) }
+`,
+	}
+	for name, contents := range files {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("create fixture directory: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+	}
+
+	findings, err := scan(root)
+	if err != nil {
+		t.Fatalf("scan imported secret result: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings (%v), want 1", len(findings), findings)
+	}
+	if !strings.Contains(findings[0].message, "secret.Value") || strings.Contains(findings[0].message, "could not be resolved") {
+		t.Fatalf("finding message = %q, want resolved secret.Value flow", findings[0].message)
 	}
 }

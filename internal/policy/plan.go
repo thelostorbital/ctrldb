@@ -45,6 +45,19 @@ var (
 	zeroPlanHash      = strings.Repeat("0", sha256.Size*2)
 )
 
+var canonicalPlanJSONKeys = canonicalJSONKeyMap(
+	"planId", "planHash", "workflowId", "projectId", "environment", "environmentClass", "principal",
+	"createdAt", "approvalClass", "expiresAt", "coolingOffSeconds", "identity", "policyHash",
+	"stepUpRequired", "intent", "resources", "preconditions", "permissions", "steps", "cost", "downtime",
+	"exposure", "protection", "rollback", "pointOfNoReturn", "verification", "default", "hostControlSteps",
+	"deleteSteps", "bootstrapSteps", "local", "approved", "match", "validUntil", "windowStart", "kind",
+	"scope", "name", "fingerprint", "id", "ok", "detail", "stepId", "permission", "resource", "granted",
+	"executor", "executingIdentity", "commandRedacted", "idempotent", "retry", "cancelSafe", "timeoutSeconds",
+	"successCondition", "failureBehavior", "targets", "maxAttempts", "initialBackoffSeconds", "maxBackoffSeconds",
+	"runRate", "items", "incremental", "source", "priceTableDate", "stale", "assumptions", "unpriced", "budget",
+	"amountUSD", "period", "plan", "state", "reason", "ceilingUSD", "expectedSeconds", "boundary", "assets",
+)
+
 // SealPlan structurally validates plan and returns a copy carrying the digest
 // of its complete reviewable contents. The input value is never modified.
 func SealPlan(plan domain.Plan) (domain.Plan, error) {
@@ -200,10 +213,14 @@ func consumeUniqueJSONValue(decoder *json.Decoder) error {
 			if !ok {
 				return invalid("decode", "object key must be a string")
 			}
-			if _, exists := seen[key]; exists {
+			foldedKey := strings.ToLower(key)
+			if canonical, known := canonicalPlanJSONKeys[foldedKey]; known && key != canonical {
+				return invalid("decode", "object contains a noncanonical key")
+			}
+			if _, exists := seen[foldedKey]; exists {
 				return invalid("decode", "object contains a duplicate key")
 			}
-			seen[key] = struct{}{}
+			seen[foldedKey] = struct{}{}
 			if err := consumeUniqueJSONValue(decoder); err != nil {
 				return err
 			}
@@ -225,6 +242,15 @@ func consumeUniqueJSONValue(decoder *json.Decoder) error {
 	}
 
 	return nil
+}
+
+func canonicalJSONKeyMap(keys ...string) map[string]string {
+	result := make(map[string]string, len(keys))
+	for _, key := range keys {
+		result[strings.ToLower(key)] = key
+	}
+
+	return result
 }
 
 func validateRequiredPlanJSON(encoded []byte) error {
@@ -278,13 +304,16 @@ func validateRequiredPlanJSON(encoded []byte) error {
 		path := fmt.Sprintf("steps[%d]", index)
 		if err := requireJSONFields(step, path,
 			"id", "executor", "executingIdentity", "commandRedacted", "idempotent", "retry",
-			"cancelSafe", "timeoutSeconds", "successCondition", "failureBehavior",
+			"cancelSafe", "timeoutSeconds", "successCondition", "failureBehavior", "targets",
 		); err != nil {
 			return err
 		}
 		if err := requireNestedJSONFields(step["retry"], path+".retry",
 			"maxAttempts", "initialBackoffSeconds", "maxBackoffSeconds",
 		); err != nil {
+			return err
+		}
+		if err := requireJSONArrayFields(step["targets"], path+".targets", "kind", "scope", "name", "fingerprint"); err != nil {
 			return err
 		}
 	}
@@ -396,7 +425,7 @@ func validatePlanStructure(plan domain.Plan) error {
 	if err := validatePreconditions(plan.Preconditions); err != nil {
 		return err
 	}
-	if err := validateSteps(plan.Steps, plan.PointOfNoReturn); err != nil {
+	if err := validateSteps(plan.Steps, plan.PointOfNoReturn, plan.Resources); err != nil {
 		return err
 	}
 	if err := validatePermissions(plan.Permissions, plan.ApprovalClass, plan.Steps, plan.Resources); err != nil {
@@ -523,12 +552,17 @@ func validatePreconditions(preconditions []domain.PlanPrecondition) error {
 	return nil
 }
 
-func validateSteps(steps []domain.PlanStep, pointOfNoReturn string) error {
+func validateSteps(steps []domain.PlanStep, pointOfNoReturn string, resources []domain.PlanResource) error {
 	if len(steps) == 0 {
 		return invalid("steps", "must contain at least one step")
 	}
 
 	seen := make(map[string]struct{}, len(steps))
+	resourcesByKey := make(map[string]domain.PlanResource, len(resources))
+	for _, resource := range resources {
+		resourcesByKey[planResourceKey(resource)] = resource
+	}
+	coveredResources := make(map[string]struct{}, len(resources))
 	for index, step := range steps {
 		path := fmt.Sprintf("steps[%d]", index)
 		if !identifierPattern.MatchString(step.ID) {
@@ -560,6 +594,25 @@ func validateSteps(steps []domain.PlanStep, pointOfNoReturn string) error {
 		if !step.FailureBehavior.Valid() {
 			return invalid(path+".failureBehavior", "unknown value")
 		}
+		if len(step.Targets) == 0 {
+			return invalid(path+".targets", "must bind at least one fingerprinted plan resource")
+		}
+		seenTargets := make(map[string]struct{}, len(step.Targets))
+		for _, target := range step.Targets {
+			key := planResourceKey(target)
+			resource, exists := resourcesByKey[key]
+			if !exists || target != resource {
+				return invalid(path+".targets", "must exactly match a fingerprinted plan resource")
+			}
+			if _, duplicate := seenTargets[key]; duplicate {
+				return invalid(path+".targets", "contains a duplicate resource")
+			}
+			seenTargets[key] = struct{}{}
+			coveredResources[key] = struct{}{}
+		}
+	}
+	if len(coveredResources) != len(resources) {
+		return invalid("steps.targets", "must cover every plan resource")
 	}
 
 	if pointOfNoReturn != "" {

@@ -21,15 +21,19 @@ var definitionWorkflowIDPattern = regexp.MustCompile(`^WF-[A-Z0-9]+-[0-9]{2}$`)
 // StepDefinition is the resource-independent execution contract registered by
 // an implemented workflow.
 type StepDefinition struct {
-	ID                string
-	Executor          string
-	ExecutingIdentity domain.ExecutionIdentity
-	Idempotent        bool
-	Retry             domain.RetryPolicy
-	CancelSafe        bool
-	TimeoutSeconds    int64
-	SuccessCondition  redact.Text
-	FailureBehavior   domain.FailureBehavior
+	ID                  string
+	Executor            string
+	ExecutingIdentity   domain.ExecutionIdentity
+	Effect              domain.StepEffect
+	MinimumApproval     domain.ApprovalClass
+	TargetKinds         []string
+	RequiredPermissions []string
+	Idempotent          bool
+	Retry               domain.RetryPolicy
+	CancelSafe          bool
+	TimeoutSeconds      int64
+	SuccessCondition    redact.Text
+	FailureBehavior     domain.FailureBehavior
 }
 
 // Definition is immutable after construction. Its fields are intentionally
@@ -37,6 +41,7 @@ type StepDefinition struct {
 type Definition struct {
 	workflowID string
 	steps      []StepDefinition
+	contract   domain.ExecutionContract
 }
 
 // NewDefinition validates and defensively copies one implemented workflow.
@@ -77,10 +82,32 @@ func NewDefinition(workflowID string, steps []StepDefinition) (Definition, error
 		if !step.FailureBehavior.Valid() {
 			return Definition{}, definitionError(path+".failureBehavior", "unknown value")
 		}
-		copyOfSteps[index] = step
+		copyOfSteps[index] = cloneStepDefinition(step)
+	}
+	contractSteps := make([]domain.ExecutionStepContract, len(copyOfSteps))
+	for index, step := range copyOfSteps {
+		contractSteps[index] = domain.ExecutionStepContract{
+			ID:                  step.ID,
+			Executor:            step.Executor,
+			ExecutingIdentity:   step.ExecutingIdentity,
+			Effect:              step.Effect,
+			MinimumApproval:     step.MinimumApproval,
+			TargetKinds:         step.TargetKinds,
+			RequiredPermissions: step.RequiredPermissions,
+			Idempotent:          step.Idempotent,
+			Retry:               step.Retry,
+			CancelSafe:          step.CancelSafe,
+			TimeoutSeconds:      step.TimeoutSeconds,
+			SuccessCondition:    step.SuccessCondition,
+			FailureBehavior:     step.FailureBehavior,
+		}
+	}
+	contract, err := domain.NewExecutionContract(workflowID, contractSteps)
+	if err != nil {
+		return Definition{}, definitionError("steps", "contain an invalid execution contract")
 	}
 
-	return Definition{workflowID: workflowID, steps: copyOfSteps}, nil
+	return Definition{workflowID: workflowID, steps: copyOfSteps, contract: contract}, nil
 }
 
 // WorkflowID returns the stable workflow registry key.
@@ -89,10 +116,15 @@ func (definition Definition) WorkflowID() string { return definition.workflowID 
 // Steps returns a detached copy of the validated step contracts.
 func (definition Definition) Steps() []StepDefinition {
 	steps := make([]StepDefinition, len(definition.steps))
-	copy(steps, definition.steps)
+	for index, step := range definition.steps {
+		steps[index] = cloneStepDefinition(step)
+	}
 
 	return steps
 }
+
+// ExecutionContract returns the immutable domain contract consumed by policy.
+func (definition Definition) ExecutionContract() domain.ExecutionContract { return definition.contract }
 
 // Registry contains only definitions supplied by implemented workflow code.
 // It intentionally has no catalogue-derived placeholder population.
@@ -104,7 +136,7 @@ type Registry struct {
 func NewRegistry(definitions ...Definition) (Registry, error) {
 	registered := make(map[string]Definition, len(definitions))
 	for index, definition := range definitions {
-		if definition.workflowID == "" || len(definition.steps) == 0 {
+		if definition.workflowID == "" || len(definition.steps) == 0 || definition.contract.WorkflowID() == "" {
 			return Registry{}, definitionError(fmt.Sprintf("definitions[%d]", index), "was not constructed by NewDefinition")
 		}
 		if _, exists := registered[definition.workflowID]; exists {
@@ -130,7 +162,14 @@ func (registry Registry) Lookup(workflowID string) (Definition, bool) {
 func (registry Registry) Len() int { return len(registry.definitions) }
 
 func cloneDefinition(definition Definition) Definition {
-	return Definition{workflowID: definition.workflowID, steps: definition.Steps()}
+	return Definition{workflowID: definition.workflowID, steps: definition.Steps(), contract: definition.contract}
+}
+
+func cloneStepDefinition(step StepDefinition) StepDefinition {
+	step.TargetKinds = append([]string(nil), step.TargetKinds...)
+	step.RequiredPermissions = append([]string(nil), step.RequiredPermissions...)
+
+	return step
 }
 
 func definitionError(path, reason string) error {

@@ -30,6 +30,7 @@ type PlanBlockerKind string
 
 const (
 	BlockerPlanBinding  PlanBlockerKind = "plan-binding"
+	BlockerContract     PlanBlockerKind = "execution-contract"
 	BlockerPlanTime     PlanBlockerKind = "plan-time"
 	BlockerApproval     PlanBlockerKind = "approval"
 	BlockerCoolingOff   PlanBlockerKind = "cooling-off"
@@ -219,7 +220,7 @@ func (err *BlockedPlanError) Blockers() []PlanBlocker {
 
 // ValidatePlanForExecution consumes only typed current evidence. It performs
 // no discovery or mutation and fails closed before an executor is reachable.
-func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence) error {
+func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence, contract domain.ExecutionContract) error {
 	if err := ValidatePlan(plan); err != nil {
 		return err
 	}
@@ -246,8 +247,10 @@ func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence) erro
 		evidence.Principal != plan.Principal {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanBinding, ID: "execution-evidence"})
 	}
+	var contractRequiresApproval bool
+	blockers, contractRequiresApproval = validateExecutionContract(plan, contract, blockers)
 
-	requireApproval := plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil
+	requireApproval := contractRequiresApproval || plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil
 	if requireApproval {
 		blockers = validateApprovalEvidence(plan, evidence, blockers)
 	} else if evidence.Approval != nil {
@@ -268,6 +271,76 @@ func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence) erro
 	}
 
 	return nil
+}
+
+func validateExecutionContract(
+	plan domain.Plan,
+	contract domain.ExecutionContract,
+	blockers []PlanBlocker,
+) ([]PlanBlocker, bool) {
+	contractSteps := contract.Steps()
+	if contract.WorkflowID() != plan.WorkflowID || len(contractSteps) != len(plan.Steps) {
+		return append(blockers, PlanBlocker{Kind: BlockerContract, ID: "workflow-or-step-set"}), true
+	}
+
+	minimumApproval := domain.ApprovalRead
+	mutationCapable := false
+	for _, step := range contractSteps {
+		if step.MinimumApproval > minimumApproval {
+			minimumApproval = step.MinimumApproval
+		}
+		mutationCapable = mutationCapable || step.Effect == domain.StepEffectMutation
+	}
+
+	expectedPermissions := make(map[string]struct{})
+	contractMismatch := false
+	for index, step := range plan.Steps {
+		expected := contractSteps[index]
+		if step.ID != expected.ID || !planStepMatchesContract(step, expected) {
+			contractMismatch = true
+			continue
+		}
+		allowedKinds := make(map[string]struct{}, len(expected.TargetKinds))
+		for _, kind := range expected.TargetKinds {
+			allowedKinds[kind] = struct{}{}
+		}
+		for _, target := range step.Targets {
+			if _, allowed := allowedKinds[target.Kind]; !allowed {
+				contractMismatch = true
+				continue
+			}
+			for _, permission := range expected.RequiredPermissions {
+				required := domain.PlanPermission{
+					StepID: step.ID, Identity: step.ExecutingIdentity, Permission: permission, Resource: target,
+				}
+				expectedPermissions[planPermissionKey(required)] = struct{}{}
+			}
+		}
+	}
+	if contractMismatch || plan.ApprovalClass < minimumApproval ||
+		(mutationCapable && plan.ApprovalClass == domain.ApprovalRead) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerContract, ID: "step-or-risk-mismatch"})
+	}
+	if len(plan.Permissions) != len(expectedPermissions) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerPermission, ID: "workflow-required-set"})
+	} else {
+		for _, permission := range plan.Permissions {
+			if _, expected := expectedPermissions[planPermissionKey(permission)]; !expected {
+				blockers = append(blockers, PlanBlocker{Kind: BlockerPermission, ID: "workflow-required-set"})
+				break
+			}
+		}
+	}
+
+	return blockers, minimumApproval != domain.ApprovalRead || mutationCapable
+}
+
+func planStepMatchesContract(step domain.PlanStep, expected domain.ExecutionStepContract) bool {
+	return step.Executor == expected.Executor && step.ExecutingIdentity == expected.ExecutingIdentity &&
+		step.Idempotent == expected.Idempotent && step.Retry == expected.Retry &&
+		step.CancelSafe == expected.CancelSafe && step.TimeoutSeconds == expected.TimeoutSeconds &&
+		step.SuccessCondition.String() == expected.SuccessCondition.String() &&
+		step.FailureBehavior == expected.FailureBehavior
 }
 
 func validateApprovalEvidence(plan domain.Plan, evidence ExecutionEvidence, blockers []PlanBlocker) []PlanBlocker {

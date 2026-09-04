@@ -112,6 +112,12 @@ func TestJournalEntryDecodeRejectsDuplicateKeysWithoutDisclosure(t *testing.T) {
 			duplicated: `"schema":"JournalEntryV2","schema":"JournalEntryV1"`,
 		},
 		{
+			name:       "case-folded top level",
+			encoded:    step,
+			unique:     `"schema":"JournalEntryV1"`,
+			duplicated: `"SCHEMA":"JournalEntryV2","schema":"JournalEntryV1"`,
+		},
+		{
 			name:       "nested step",
 			encoded:    step,
 			unique:     `"attempt":1`,
@@ -122,6 +128,12 @@ func TestJournalEntryDecodeRejectsDuplicateKeysWithoutDisclosure(t *testing.T) {
 			encoded:    pause,
 			unique:     `"reapprovalRequired":true`,
 			duplicated: `"reapprovalRequired":false,"reapprovalRequired":true`,
+		},
+		{
+			name:       "nested cancellation",
+			encoded:    mustEncodeJournalEntry(t, validCancellationEntry()),
+			unique:     `"requiredRoute":"ROLLBACK"`,
+			duplicated: `"requiredRoute":"CANCELLED","requiredRoute":"ROLLBACK"`,
 		},
 	}
 	for _, test := range tests {
@@ -146,6 +158,45 @@ func TestJournalEntryDecodeRejectsDuplicateKeysWithoutDisclosure(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "SECRET_MARKER_HOSTILE") || strings.ContainsRune(err.Error(), '\x1b') {
 		t.Fatalf("DecodeJournalEntry() error disclosed hostile key: %q", err)
+	}
+
+	withoutMutation := bytes.Replace(step, []byte(`,"mutationOccurred":false`), nil, 1)
+	if bytes.Equal(withoutMutation, step) {
+		t.Fatal("step fixture did not contain mutationOccurred")
+	}
+	if _, err := workflow.DecodeJournalEntry(withoutMutation); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry(missing mutationOccurred) error = %v", err)
+	}
+
+	noncanonical := bytes.Replace(step, []byte(`"resultSummary"`), []byte(`"RESULTSUMMARY"`), 1)
+	if _, err := workflow.DecodeJournalEntry(noncanonical); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry(noncanonical key) error = %v", err)
+	}
+}
+
+func TestCancellationJournalEntryRequiresCompleteDurableRecord(t *testing.T) {
+	t.Parallel()
+
+	entry := validCancellationEntry()
+	encoded := mustEncodeJournalEntry(t, entry)
+	decoded, err := workflow.DecodeJournalEntry(encoded)
+	if err != nil || !reflect.DeepEqual(decoded, entry) {
+		t.Fatalf("DecodeJournalEntry() = (%#v, %v), want %#v", decoded, err, entry)
+	}
+	for _, mutate := range []func(*domain.JournalEntry){
+		func(entry *domain.JournalEntry) { entry.Cancellation = nil },
+		func(entry *domain.JournalEntry) { entry.Cancellation.CurrentStepID = "unsafe/id" },
+		func(entry *domain.JournalEntry) { entry.Cancellation.MutationObservation = "maybe" },
+		func(entry *domain.JournalEntry) { entry.Cancellation.RequiredRoute = domain.OperationCancelled },
+		func(entry *domain.JournalEntry) {
+			entry.Cancellation.RequestedAt = entry.RecordedAt.Add(-time.Nanosecond)
+		},
+	} {
+		changed := validCancellationEntry()
+		mutate(&changed)
+		if err := workflow.ValidateJournalEntry(changed); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+			t.Fatalf("ValidateJournalEntry() error = %v, want ErrInvalidJournalEntry", err)
+		}
 	}
 }
 
@@ -502,6 +553,14 @@ func TestJournalResumeEnforcesPauseDeadlineAndReapproval(t *testing.T) {
 	if err := workflow.ValidateJournal(append(reapproval, resume)); !errors.Is(err, workflow.ErrInvalidJournalStream) {
 		t.Fatalf("resume without typed reapproval error = %v, want ErrInvalidJournalStream", err)
 	}
+
+	expiredRecovery := makePaused()
+	expiredRecovery[6].Pause.MutationOccurred = true
+	rollback := validTransitionEntry(8, domain.OperationRollback)
+	rollback.RecordedAt = expiredRecovery[6].Pause.ResumeBy
+	if err := workflow.ValidateJournal(append(expiredRecovery, rollback)); err != nil {
+		t.Fatalf("expired pause rollback returned an error: %v", err)
+	}
 }
 
 func TestJournalObjectNamesSortBySequence(t *testing.T) {
@@ -525,6 +584,25 @@ func TestJournalObjectNamesSortBySequence(t *testing.T) {
 	if want := "00000000000000000042-check-health.json"; got != want {
 		t.Fatalf("JournalObjectName() = %q, want %q", got, want)
 	}
+
+	cancellation := validCancellationEntry()
+	got, err = workflow.JournalObjectName(cancellation)
+	if err != nil {
+		t.Fatalf("JournalObjectName(cancellation) returned an error: %v", err)
+	}
+	if want := "00000000000000000006-cancellation-request.json"; got != want {
+		t.Fatalf("JournalObjectName(cancellation) = %q, want %q", got, want)
+	}
+}
+
+func mustEncodeJournalEntry(t *testing.T, entry domain.JournalEntry) []byte {
+	t.Helper()
+	encoded, err := workflow.EncodeJournalEntry(entry)
+	if err != nil {
+		t.Fatalf("EncodeJournalEntry() returned an error: %v", err)
+	}
+
+	return encoded
 }
 
 func validJournal() []domain.JournalEntry {
@@ -582,6 +660,26 @@ func validStepEntry() domain.JournalEntry {
 			EndedAt:           &endedAt,
 			MutationOccurred:  false,
 			ResultSummary:     redact.Sanitize("healthy"),
+		},
+	}
+}
+
+func validCancellationEntry() domain.JournalEntry {
+	requestedAt := time.Date(2026, 9, 3, 12, 0, 5, 0, time.UTC)
+
+	return domain.JournalEntry{
+		Schema:         domain.JournalSchemaV1,
+		OperationID:    "op-0123456789abcdef",
+		PlanID:         "plan-0123456789abcdef",
+		Sequence:       6,
+		Kind:           domain.JournalEntryCancellationRequest,
+		RecordedAt:     requestedAt,
+		OperationState: domain.OperationExecute,
+		Cancellation: &domain.JournalCancellationRequest{
+			RequestedAt:         requestedAt,
+			CurrentStepID:       "stop-instance",
+			MutationObservation: domain.MutationUnknown,
+			RequiredRoute:       domain.OperationRollback,
 		},
 	}
 }

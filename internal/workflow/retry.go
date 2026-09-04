@@ -32,7 +32,10 @@ func DecideRetry(step StepDefinition, attempt uint32, failure domain.RetryFailur
 	if failure == domain.RetryFailureStaleFingerprint {
 		return noRetry("stale fingerprints require rediscovery and a new plan")
 	}
-	if !step.Idempotent && mutation != domain.MutationNotOccurred {
+	if mutation == domain.MutationUnknown {
+		return noRetry("unknown mutation state requires rediscovery")
+	}
+	if !step.Idempotent && mutation == domain.MutationOccurred {
 		return noRetry("non-idempotent mutation was not proven absent")
 	}
 	if attempt >= step.Retry.MaxAttempts {

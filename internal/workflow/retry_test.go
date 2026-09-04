@@ -32,6 +32,9 @@ func TestRetryExcludesSafetyFailuresAndUnobservedNonIdempotentMutation(t *testin
 	t.Parallel()
 
 	step := validDefinitionStep()
+	if got := workflow.DecideRetry(step, 1, domain.RetryFailureTransient, domain.MutationUnknown); got.Retry || got.Delay != 0 {
+		t.Fatalf("DecideRetry(idempotent, unknown mutation) = %#v, want refusal", got)
+	}
 	for _, failure := range []domain.RetryFailureClass{
 		domain.RetryFailureValidation,
 		domain.RetryFailurePermission,

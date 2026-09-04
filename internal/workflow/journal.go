@@ -30,6 +30,13 @@ var (
 	stepIDPattern        = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
 )
 
+var canonicalJournalJSONKeys = journalJSONKeyMap(
+	"schema", "operationId", "planId", "sequence", "kind", "recordedAt", "operationState", "step", "pause",
+	"cancellation", "requestedAt", "currentStepId", "mutationObservation", "requiredRoute", "id", "outcome",
+	"executingIdentity", "attempt", "startedAt", "endedAt", "mutationOccurred", "resultSummary", "pausedAt",
+	"pauseReason", "resumeBy", "reapprovalRequired",
+)
+
 // EncodeJournalEntry validates entry and returns its compact JSON encoding.
 func EncodeJournalEntry(entry domain.JournalEntry) ([]byte, error) {
 	if err := ValidateJournalEntry(entry); err != nil {
@@ -63,7 +70,7 @@ func DecodeJournalEntry(encoded []byte) (domain.JournalEntry, error) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return domain.JournalEntry{}, journalEntryError("decode", "trailing JSON value")
 	}
-	if err := validateRequiredPauseJSON(encoded, entry); err != nil {
+	if err := validateRequiredJournalJSON(encoded, entry); err != nil {
 		return domain.JournalEntry{}, err
 	}
 
@@ -108,10 +115,14 @@ func consumeUniqueJournalJSONValue(decoder *json.Decoder) error {
 			if !ok {
 				return journalEntryError("decode", "object key must be a string")
 			}
-			if _, duplicate := seen[key]; duplicate {
+			foldedKey := strings.ToLower(key)
+			if canonical, known := canonicalJournalJSONKeys[foldedKey]; known && key != canonical {
+				return journalEntryError("decode", "object contains a noncanonical key")
+			}
+			if _, duplicate := seen[foldedKey]; duplicate {
 				return journalEntryError("decode", "object contains a duplicate key")
 			}
-			seen[key] = struct{}{}
+			seen[foldedKey] = struct{}{}
 			if err := consumeUniqueJournalJSONValue(decoder); err != nil {
 				return err
 			}
@@ -135,8 +146,19 @@ func consumeUniqueJournalJSONValue(decoder *json.Decoder) error {
 	return nil
 }
 
-func validateRequiredPauseJSON(encoded []byte, entry domain.JournalEntry) error {
-	if entry.OperationState != domain.OperationPaused || entry.Pause == nil {
+func journalJSONKeyMap(keys ...string) map[string]string {
+	result := make(map[string]string, len(keys))
+	for _, key := range keys {
+		result[strings.ToLower(key)] = key
+	}
+
+	return result
+}
+
+func validateRequiredJournalJSON(encoded []byte, entry domain.JournalEntry) error {
+	if (entry.OperationState != domain.OperationPaused || entry.Pause == nil) &&
+		(entry.Kind != domain.JournalEntryStep || entry.Step == nil) &&
+		(entry.Kind != domain.JournalEntryCancellationRequest || entry.Cancellation == nil) {
 		return nil
 	}
 
@@ -144,13 +166,35 @@ func validateRequiredPauseJSON(encoded []byte, entry domain.JournalEntry) error 
 	if err := json.Unmarshal(encoded, &document); err != nil {
 		return journalEntryError("decode", err.Error())
 	}
-	var pause map[string]json.RawMessage
-	if err := json.Unmarshal(document["pause"], &pause); err != nil {
-		return journalEntryError("pause", "must be an object")
+	if entry.OperationState == domain.OperationPaused && entry.Pause != nil {
+		var pause map[string]json.RawMessage
+		if err := json.Unmarshal(document["pause"], &pause); err != nil {
+			return journalEntryError("pause", "must be an object")
+		}
+		for _, field := range []string{"pausedAt", "pauseReason", "mutationOccurred", "resumeBy", "reapprovalRequired"} {
+			if _, exists := pause[field]; !exists {
+				return journalEntryError("pause."+field, "is required")
+			}
+		}
 	}
-	for _, field := range []string{"pausedAt", "pauseReason", "mutationOccurred", "resumeBy", "reapprovalRequired"} {
-		if _, exists := pause[field]; !exists {
-			return journalEntryError("pause."+field, "is required")
+	if entry.Kind == domain.JournalEntryStep && entry.Step != nil {
+		var step map[string]json.RawMessage
+		if err := json.Unmarshal(document["step"], &step); err != nil {
+			return journalEntryError("step", "must be an object")
+		}
+		if _, exists := step["mutationOccurred"]; !exists {
+			return journalEntryError("step.mutationOccurred", "is required")
+		}
+	}
+	if entry.Kind == domain.JournalEntryCancellationRequest && entry.Cancellation != nil {
+		var cancellation map[string]json.RawMessage
+		if err := json.Unmarshal(document["cancellation"], &cancellation); err != nil {
+			return journalEntryError("cancellation", "must be an object")
+		}
+		for _, field := range []string{"requestedAt", "currentStepId", "mutationObservation", "requiredRoute"} {
+			if _, exists := cancellation[field]; !exists {
+				return journalEntryError("cancellation."+field, "is required")
+			}
 		}
 	}
 
@@ -196,6 +240,9 @@ func ValidateJournalEntry(entry domain.JournalEntry) error {
 		} else if entry.Pause != nil {
 			return journalEntryError("pause", "is allowed only for a PAUSED transition")
 		}
+		if entry.Cancellation != nil {
+			return journalEntryError("cancellation", "must be absent for a transition")
+		}
 	case domain.JournalEntryStep:
 		if entry.Step == nil {
 			return journalEntryError("step", "is required for a step entry")
@@ -203,7 +250,20 @@ func ValidateJournalEntry(entry domain.JournalEntry) error {
 		if entry.Pause != nil {
 			return journalEntryError("pause", "must be absent for a step entry")
 		}
+		if entry.Cancellation != nil {
+			return journalEntryError("cancellation", "must be absent for a step entry")
+		}
 		if err := validateJournalStep(*entry.Step, entry.RecordedAt); err != nil {
+			return err
+		}
+	case domain.JournalEntryCancellationRequest:
+		if entry.Step != nil || entry.Pause != nil {
+			return journalEntryError("cancellation", "request must not contain step or pause data")
+		}
+		if entry.Cancellation == nil {
+			return journalEntryError("cancellation", "is required for a cancellation request")
+		}
+		if err := validateJournalCancellation(*entry.Cancellation, entry.RecordedAt); err != nil {
 			return err
 		}
 	}
@@ -227,6 +287,9 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 	completed := make(map[string]struct{})
 	mutationMayHaveOccurred := false
 	var paused *domain.JournalPause
+	var pendingCancellation domain.OperationState
+	var pendingCurrentStepID string
+	var pendingStepStartBoundary time.Time
 
 	for index, entry := range entries {
 		if err := ValidateJournalEntry(entry); err != nil {
@@ -248,6 +311,30 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 			return journalStreamError(index+1, "entry follows a terminal transition")
 		}
 
+		if entry.Kind == domain.JournalEntryCancellationRequest {
+			if machine == nil {
+				return journalStreamError(index+1, "cancellation request precedes the initial transition")
+			}
+			if entry.OperationState != machine.State() {
+				return journalStreamError(index+1, "cancellation request state does not match the current state")
+			}
+			if pendingCancellation != "" {
+				return journalStreamError(index+1, "multiple pending cancellation requests are ambiguous")
+			}
+			if mutationMayHaveOccurred && entry.Cancellation.MutationObservation == domain.MutationNotOccurred {
+				return journalStreamError(index+1, "cancellation request discards observed mutation")
+			}
+			mutationMayHaveOccurred = mutationMayHaveOccurred ||
+				entry.Cancellation.MutationObservation != domain.MutationNotOccurred
+			pendingCancellation = entry.Cancellation.RequiredRoute
+			pendingCurrentStepID = entry.Cancellation.CurrentStepID
+			pendingStepStartBoundary = priorTime
+			if !cancellationRouteReachable(machine.State(), pendingCancellation) {
+				return journalStreamError(index+1, "cancellation request has no reachable route")
+			}
+			continue
+		}
+
 		if entry.Kind == domain.JournalEntryTransition {
 			if machine == nil {
 				if entry.OperationState != domain.OperationDiscover {
@@ -256,11 +343,15 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 				machine = NewMachine()
 				continue
 			}
+			if pendingCancellation != "" && CanTransition(machine.State(), pendingCancellation) &&
+				entry.OperationState != pendingCancellation {
+				return journalStreamError(index+1, "pending cancellation was not honored at the first compatible boundary")
+			}
 			if machine.State() == domain.OperationPaused {
 				if paused == nil {
 					return journalStreamError(index+1, "PAUSED state is missing its durable metadata")
 				}
-				if !entry.RecordedAt.Before(paused.ResumeBy) {
+				if entry.OperationState == domain.OperationDiscover && !entry.RecordedAt.Before(paused.ResumeBy) {
 					return journalStreamError(index+1, "transition leaves PAUSED at or after resumeBy")
 				}
 				if entry.OperationState == domain.OperationDiscover && paused.ReapprovalRequired {
@@ -273,11 +364,24 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 			if err := machine.Transition(entry.OperationState); err != nil {
 				return fmt.Errorf("%w: entry %d: %v", ErrInvalidJournalStream, index+1, err)
 			}
+			if entry.OperationState == pendingCancellation {
+				pendingCancellation = ""
+				pendingCurrentStepID = ""
+				pendingStepStartBoundary = time.Time{}
+			} else if pendingCancellation != "" && !cancellationRouteReachable(machine.State(), pendingCancellation) {
+				return journalStreamError(index+1, "transition made the pending cancellation unreachable")
+			} else if pendingCancellation != "" {
+				pendingCurrentStepID = ""
+				pendingStepStartBoundary = time.Time{}
+			}
 			if entry.Pause != nil {
 				if mutationMayHaveOccurred && !entry.Pause.MutationOccurred {
 					return journalStreamError(index+1, "PAUSED metadata must not discard observed mutation")
 				}
 				mutationMayHaveOccurred = mutationMayHaveOccurred || entry.Pause.MutationOccurred
+				if pendingCancellation != "" && mutationMayHaveOccurred {
+					pendingCancellation = domain.OperationRollback
+				}
 				pauseCopy := *entry.Pause
 				paused = &pauseCopy
 			} else {
@@ -295,7 +399,21 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 		if entry.OperationState != machine.State() {
 			return journalStreamError(index+1, "step operationState does not match the current state")
 		}
-		if entry.Step.StartedAt.Before(priorTime) {
+		if pendingCancellation != "" {
+			if pendingCurrentStepID == "" && CanTransition(machine.State(), pendingCancellation) {
+				return journalStreamError(index+1, "step follows a cancellation-safe boundary")
+			}
+			if pendingCurrentStepID != "" && entry.Step.ID != pendingCurrentStepID {
+				return journalStreamError(index+1, "cancellation request does not match the in-flight step")
+			}
+		}
+		stepStartBoundary := priorTime
+		if pendingCurrentStepID != "" {
+			stepStartBoundary = pendingStepStartBoundary
+		}
+		pendingCurrentStepID = ""
+		pendingStepStartBoundary = time.Time{}
+		if entry.Step.StartedAt.Before(stepStartBoundary) {
 			return journalStreamError(index+1, "step started before the current journal boundary")
 		}
 		if _, exists := completed[entry.Step.ID]; exists {
@@ -309,6 +427,9 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 		attempts[entry.Step.ID] = entry.Step.Attempt
 		mutationMayHaveOccurred = mutationMayHaveOccurred ||
 			entry.Step.MutationOccurred || entry.Step.Outcome == domain.StepUnknown
+		if pendingCancellation != "" && mutationMayHaveOccurred {
+			pendingCancellation = domain.OperationRollback
+		}
 		if entry.Step.Outcome == domain.StepDone {
 			completed[entry.Step.ID] = struct{}{}
 		}
@@ -327,9 +448,35 @@ func JournalObjectName(entry domain.JournalEntry) (string, error) {
 	entryID := "state-" + strings.ToLower(strings.ReplaceAll(string(entry.OperationState), "_", "-"))
 	if entry.Kind == domain.JournalEntryStep {
 		entryID = entry.Step.ID
+	} else if entry.Kind == domain.JournalEntryCancellationRequest {
+		entryID = "cancellation-request"
 	}
 
 	return fmt.Sprintf("%020d-%s.json", entry.Sequence, entryID), nil
+}
+
+func validateJournalCancellation(request domain.JournalCancellationRequest, recordedAt time.Time) error {
+	if err := validateJournalTime("cancellation.requestedAt", request.RequestedAt); err != nil {
+		return err
+	}
+	if !request.RequestedAt.Equal(recordedAt) {
+		return journalEntryError("cancellation.requestedAt", "must equal recordedAt")
+	}
+	if !stepIDPattern.MatchString(request.CurrentStepID) {
+		return journalEntryError("cancellation.currentStepId", "must be a canonical step identifier")
+	}
+	if !request.MutationObservation.Valid() {
+		return journalEntryError("cancellation.mutationObservation", "unknown value")
+	}
+	wantRoute := domain.OperationCancelled
+	if request.MutationObservation != domain.MutationNotOccurred {
+		wantRoute = domain.OperationRollback
+	}
+	if request.RequiredRoute != wantRoute {
+		return journalEntryError("cancellation.requiredRoute", "does not match the mutation observation")
+	}
+
+	return nil
 }
 
 func validateJournalStep(step domain.JournalStep, recordedAt time.Time) error {

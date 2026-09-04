@@ -11,6 +11,8 @@ import (
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
 	"github.com/thelostorbital/ctrldb/internal/policy"
+	"github.com/thelostorbital/ctrldb/internal/redact"
+	"github.com/thelostorbital/ctrldb/internal/workflow"
 )
 
 func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
@@ -23,13 +25,13 @@ func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
 		StepID:    plan.Steps[0].ID,
 		Identity:  domain.IdentityOperator,
 		Resource:  plan.Resources[0],
-		Required:  []string{"compute.instances.get"},
+		Required:  []string{"compute.instances.stop"},
 		Granted:   nil,
 	})
 	if err != nil {
 		t.Fatalf("PermissionChecks() returned an error: %v", err)
 	}
-	plan.Permissions = append(plan.Permissions, checks...)
+	plan.Permissions = checks
 	plan, err = policy.SealPlan(plan)
 	if err != nil {
 		t.Fatalf("SealPlan() returned an error: %v", err)
@@ -38,7 +40,7 @@ func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
 		t.Fatalf("blocked review artifact was not serializable: %v", err)
 	}
 
-	err = policy.ValidatePlanForExecution(plan, validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute)))
+	err = policy.ValidatePlanForExecution(plan, validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute)), validExecutionContract(t))
 	if !errors.Is(err, policy.ErrPlanBlocked) {
 		t.Fatalf("ValidatePlanForExecution() error = %v, want ErrPlanBlocked", err)
 	}
@@ -51,7 +53,7 @@ func TestPermissionProbeBlocksPlanBeforeExecution_TEST_U_PLAN_03(t *testing.T) {
 	}
 	want := []policy.PlanBlocker{
 		{Kind: policy.BlockerPrecondition, ID: "quota-ready"},
-		{Kind: policy.BlockerPermission, ID: "compute.instances.get", Identity: domain.IdentityOperator},
+		{Kind: policy.BlockerPermission, ID: "compute.instances.stop", Identity: domain.IdentityOperator},
 	}
 	if got := blocked.Blockers(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Blockers() = %#v, want %#v", got, want)
@@ -68,8 +70,56 @@ func TestExecutionGateAcceptsCompleteFreshEvidence(t *testing.T) {
 
 	plan := validPlan()
 	evidence := validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute))
-	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+	if err := policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)); err != nil {
 		t.Fatalf("ValidatePlanForExecution() returned an error: %v", err)
+	}
+}
+
+func TestExecutionGateRequiresTrustedRiskAndExactPermissions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		kind   policy.PlanBlockerKind
+		mutate func(*domain.Plan)
+	}{
+		{
+			name: "mutation misclassified as read",
+			kind: policy.BlockerContract,
+			mutate: func(plan *domain.Plan) {
+				plan.ApprovalClass = domain.ApprovalRead
+			},
+		},
+		{
+			name: "mutation has get instead of required permission",
+			kind: policy.BlockerPermission,
+			mutate: func(plan *domain.Plan) {
+				plan.Permissions[0].Permission = "compute.instances.get"
+			},
+		},
+		{
+			name: "unexpected permission",
+			kind: policy.BlockerPermission,
+			mutate: func(plan *domain.Plan) {
+				extra := plan.Permissions[0]
+				extra.Permission = "compute.instances.get"
+				plan.Permissions = append(plan.Permissions, extra)
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			plan := validPlan()
+			test.mutate(&plan)
+			plan, err := policy.SealPlan(plan)
+			if err != nil {
+				t.Fatalf("SealPlan() returned an error: %v", err)
+			}
+			evidence := validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute))
+			expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)), test.kind)
+		})
 	}
 }
 
@@ -130,7 +180,7 @@ func TestExecutionGateRejectsMissingStaleOrMismatchedEvidence(t *testing.T) {
 			plan := validPlan()
 			evidence := validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute))
 			test.mutate(&plan, &evidence)
-			expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), test.kind)
+			expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)), test.kind)
 		})
 	}
 }
@@ -143,11 +193,11 @@ func TestExecutionEvidenceFreshnessBoundary(t *testing.T) {
 	evidence := validExecutionEvidence(plan, checkedAt)
 	evidence.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
 	evidence.ObservedAt = checkedAt.Add(-10 * time.Minute)
-	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+	if err := policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)); err != nil {
 		t.Fatalf("exact ten-minute evidence boundary returned an error: %v", err)
 	}
 	evidence.ObservedAt = checkedAt.Add(-10*time.Minute - time.Nanosecond)
-	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerPlanTime)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)), policy.BlockerPlanTime)
 }
 
 func TestExecutionGateUsesServerApprovalTimeForCoolingOff(t *testing.T) {
@@ -163,13 +213,13 @@ func TestExecutionGateUsesServerApprovalTimeForCoolingOff(t *testing.T) {
 	evidence := validExecutionEvidence(plan, checkedAt)
 	evidence.Approval.ServerTimeCreated = checkedAt.Add(-5 * time.Minute)
 
-	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerCoolingOff)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)), policy.BlockerCoolingOff)
 	evidence.Approval.ServerTimeCreated = checkedAt.Add(-10 * time.Minute)
-	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+	if err := policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)); err != nil {
 		t.Fatalf("cooling boundary should use server approval time: %v", err)
 	}
 	evidence.ObservedAt = checkedAt.Add(-10*time.Minute - time.Nanosecond)
-	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerCoolingOff)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)), policy.BlockerCoolingOff)
 }
 
 func TestExecutionGateEnforcesIntentWindowAndBinding(t *testing.T) {
@@ -207,12 +257,12 @@ func TestExecutionGateEnforcesIntentWindowAndBinding(t *testing.T) {
 			if test.mutate != nil {
 				test.mutate(&evidence)
 			}
-			expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerIntent)
+			expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)), policy.BlockerIntent)
 		})
 	}
 
 	evidence := validExecutionEvidence(plan, plan.Intent.WindowStart)
-	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+	if err := policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)); err != nil {
 		t.Fatalf("valid intent boundary returned an error: %v", err)
 	}
 }
@@ -229,7 +279,7 @@ func TestExecutionGateBlocksUnapprovedPolicy(t *testing.T) {
 	}
 	evidence := validExecutionEvidence(plan, plan.CreatedAt.Add(10*time.Minute))
 
-	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence), policy.BlockerPolicy)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)), policy.BlockerPolicy)
 }
 
 func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
@@ -248,7 +298,7 @@ func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
 	evidence.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
 	evidence.ObservedAt = checkedAt.Add(-10 * time.Minute)
 	evidence.StepUp.ServerTimeCreated = checkedAt.Add(-10 * time.Minute)
-	if err := policy.ValidatePlanForExecution(plan, evidence); err != nil {
+	if err := policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)); err != nil {
 		t.Fatalf("fresh step-up returned an error: %v", err)
 	}
 
@@ -268,7 +318,7 @@ func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
 		changed := validExecutionEvidence(plan, checkedAt)
 		changed.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
 		mutate(&changed)
-		expectBlockedKind(t, policy.ValidatePlanForExecution(plan, changed), policy.BlockerStepUp)
+		expectBlockedKind(t, policy.ValidatePlanForExecution(plan, changed, validExecutionContract(t)), policy.BlockerStepUp)
 	}
 }
 
@@ -334,6 +384,7 @@ func TestPlanPermissionCoverageIncludesEveryStepIdentityAndResource(t *testing.T
 		Fingerprint: "generation-2",
 	}
 	plan.Resources = append(plan.Resources, secondResource)
+	plan.Steps[0].Targets = append(plan.Steps[0].Targets, secondResource)
 	if _, err := policy.SealPlan(plan); !errors.Is(err, policy.ErrInvalidPlan) {
 		t.Fatalf("SealPlan() missing resource permission error = %v, want ErrInvalidPlan", err)
 	}
@@ -423,6 +474,36 @@ func validExecutionEvidence(plan domain.Plan, checkedAt time.Time) policy.Execut
 	}
 
 	return evidence
+}
+
+func validExecutionContract(t *testing.T) domain.ExecutionContract {
+	t.Helper()
+	definition, err := workflow.NewDefinition("WF-VM-02", []workflow.StepDefinition{
+		{
+			ID:                  "stop-instance",
+			Executor:            "gcloud",
+			ExecutingIdentity:   domain.IdentityOperator,
+			Effect:              domain.StepEffectMutation,
+			MinimumApproval:     domain.ApprovalProtected,
+			TargetKinds:         []string{"instance"},
+			RequiredPermissions: []string{"compute.instances.stop"},
+			Idempotent:          true,
+			Retry: domain.RetryPolicy{
+				MaxAttempts:           3,
+				InitialBackoffSeconds: 2,
+				MaxBackoffSeconds:     10,
+			},
+			CancelSafe:       false,
+			TimeoutSeconds:   300,
+			SuccessCondition: redact.Sanitize("instance is stopped"),
+			FailureBehavior:  domain.FailureRollback,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDefinition() returned an error: %v", err)
+	}
+
+	return definition.ExecutionContract()
 }
 
 func expectBlockedKind(t *testing.T, err error, kind policy.PlanBlockerKind) {

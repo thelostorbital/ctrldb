@@ -72,7 +72,7 @@ func TestPlanSealAndHashVerification(t *testing.T) {
 		t.Fatalf("VerifyPlanHash() returned an error: %v", err)
 	}
 
-	const knownDigest = "c58c6fe193e5a6c0b7f54a4884a66939b2506af5855ad0f78121a12ac6b3bddc"
+	const knownDigest = "c31baf4907abcaa87b5fcff769a69d71b8a754bb09faa43fda9fd5e8be4052c1"
 	if plan.PlanHash != knownDigest {
 		t.Fatalf("sealed plan digest = %q, want known vector %q", plan.PlanHash, knownDigest)
 	}
@@ -123,6 +123,7 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 			plan.ProjectID = "ctrldb-stage-123"
 			plan.Resources[0].Scope = "projects/ctrldb-stage-123/zones/us-central1-a"
 			plan.Permissions[0].Resource.Scope = plan.Resources[0].Scope
+			plan.Steps[0].Targets[0].Scope = plan.Resources[0].Scope
 		}},
 		{name: "environment", mutate: func(plan *domain.Plan) { plan.Environment = "staging" }},
 		{name: "environment class", mutate: func(plan *domain.Plan) { plan.EnvironmentClass = domain.EnvironmentStaging }},
@@ -144,10 +145,12 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 		{name: "resource", mutate: func(plan *domain.Plan) {
 			plan.Resources[0].Fingerprint = "generation-8"
 			plan.Permissions[0].Resource.Fingerprint = "generation-8"
+			plan.Steps[0].Targets[0].Fingerprint = "generation-8"
 		}},
 		{name: "resource scope", mutate: func(plan *domain.Plan) {
 			plan.Resources[0].Scope = "projects/ctrldb-prod-123/zones/us-central1-b"
 			plan.Permissions[0].Resource.Scope = plan.Resources[0].Scope
+			plan.Steps[0].Targets[0].Scope = plan.Resources[0].Scope
 		}},
 		{name: "precondition", mutate: func(plan *domain.Plan) { plan.Preconditions[0].Detail = redact.Sanitize("ready") }},
 		{name: "precondition outcome", mutate: func(plan *domain.Plan) { plan.Preconditions[0].OK = false }},
@@ -165,6 +168,7 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 		{name: "permission target", mutate: func(plan *domain.Plan) {
 			plan.Permissions[0].Resource.Name = "other-instance"
 			plan.Resources[0].Name = "other-instance"
+			plan.Steps[0].Targets[0].Name = "other-instance"
 		}},
 		{name: "step", mutate: func(plan *domain.Plan) { plan.Steps[0].Executor = "compute-api" }},
 		{name: "step retry", mutate: func(plan *domain.Plan) { plan.Steps[0].Retry.MaxAttempts++ }},
@@ -246,6 +250,11 @@ func TestPlanDecodeRejectsDuplicateKeysAtEveryNestingLevel(t *testing.T) {
 			duplicated: `"planId":"plan-fedcba9876543210","planId":"plan-0123456789abcdef"`,
 		},
 		{
+			name:       "case-folded top level",
+			unique:     `"planId":"plan-0123456789abcdef"`,
+			duplicated: `"PLANID":"plan-fedcba9876543210","planId":"plan-0123456789abcdef"`,
+		},
+		{
 			name:       "nested object",
 			unique:     `"identity":{"default":"operator"`,
 			duplicated: `"identity":{"default":"provisioner","default":"operator"`,
@@ -292,6 +301,19 @@ func TestPlanDuplicateKeyErrorDoesNotEchoHostileInput(t *testing.T) {
 	}
 }
 
+func TestPlanDecodeRejectsNoncanonicalKeySpelling(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := policy.EncodePlan(validPlan())
+	if err != nil {
+		t.Fatalf("EncodePlan() returned an error: %v", err)
+	}
+	noncanonical := bytes.Replace(encoded, []byte(`"commandRedacted"`), []byte(`"COMMANDREDACTED"`), 1)
+	if _, err := policy.DecodePlan(noncanonical); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
+	}
+}
+
 func TestPlanDecodeRejectsMissingExecutionContractFields(t *testing.T) {
 	t.Parallel()
 
@@ -302,7 +324,7 @@ func TestPlanDecodeRejectsMissingExecutionContractFields(t *testing.T) {
 
 	for _, field := range []string{
 		"projectId", "environment", "environmentClass", "principal", "createdAt", "permissions", "retry",
-		"idempotent", "cancelSafe", "successCondition", "failureBehavior", "stepId", "resource", "scope",
+		"idempotent", "cancelSafe", "successCondition", "failureBehavior", "targets", "stepId", "resource", "scope",
 	} {
 		field := field
 		t.Run(field, func(t *testing.T) {
@@ -389,6 +411,7 @@ func TestPlanValidationRejectsUnsafeValues(t *testing.T) {
 			plan.Permissions = append(plan.Permissions, plan.Permissions[0])
 		}},
 		{name: "missing steps", mutate: func(plan *domain.Plan) { plan.Steps = nil }},
+		{name: "missing step targets", mutate: func(plan *domain.Plan) { plan.Steps[0].Targets = nil }},
 		{name: "step id", mutate: func(plan *domain.Plan) { plan.Steps[0].ID = "" }},
 		{name: "hostile step id", mutate: func(plan *domain.Plan) { plan.Steps[0].ID = "step\nSECRET_MARKER" }},
 		{name: "duplicate step", mutate: func(plan *domain.Plan) { plan.Steps = append(plan.Steps, plan.Steps[0]) }},
@@ -606,6 +629,14 @@ func validPlan() domain.Plan {
 				TimeoutSeconds:   300,
 				SuccessCondition: redact.Sanitize("instance is stopped"),
 				FailureBehavior:  domain.FailureRollback,
+				Targets: []domain.PlanResource{
+					{
+						Kind:        "instance",
+						Scope:       "projects/ctrldb-prod-123/zones/us-central1-a",
+						Name:        "example-instance",
+						Fingerprint: "generation-7",
+					},
+				},
 			},
 		},
 		Cost: domain.PlanCost{

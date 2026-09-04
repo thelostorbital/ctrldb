@@ -4,9 +4,20 @@
 package domain
 
 import (
+	"errors"
+	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/redact"
+)
+
+var ErrInvalidExecutionContract = errors.New("invalid execution contract")
+
+var (
+	executionWorkflowIDPattern = regexp.MustCompile(`^WF-[A-Z0-9]+-[0-9]{2}$`)
+	executionIdentifierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+	executionPermissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
 )
 
 // Plan is the immutable review artifact produced before a workflow executes.
@@ -98,6 +109,116 @@ type PlanStep struct {
 	TimeoutSeconds    int64             `json:"timeoutSeconds"`
 	SuccessCondition  redact.Text       `json:"successCondition"`
 	FailureBehavior   FailureBehavior   `json:"failureBehavior"`
+	Targets           []PlanResource    `json:"targets"`
+}
+
+// StepEffect distinguishes read-only work from a mutation-capable step.
+type StepEffect string
+
+const (
+	StepEffectRead     StepEffect = "read"
+	StepEffectMutation StepEffect = "mutation"
+)
+
+// Valid reports whether effect is part of the closed execution contract.
+func (effect StepEffect) Valid() bool {
+	return effect == StepEffectRead || effect == StepEffectMutation
+}
+
+// ExecutionStepContract is the resource-independent trusted definition of one
+// implemented step. Runtime plans bind it to concrete Targets separately.
+type ExecutionStepContract struct {
+	ID                  string
+	Executor            string
+	ExecutingIdentity   ExecutionIdentity
+	Effect              StepEffect
+	MinimumApproval     ApprovalClass
+	TargetKinds         []string
+	RequiredPermissions []string
+	Idempotent          bool
+	Retry               RetryPolicy
+	CancelSafe          bool
+	TimeoutSeconds      int64
+	SuccessCondition    redact.Text
+	FailureBehavior     FailureBehavior
+}
+
+// ExecutionContract is immutable after construction; slice-bearing fields are
+// defensively copied both into and out of the value.
+type ExecutionContract struct {
+	workflowID string
+	steps      []ExecutionStepContract
+}
+
+// NewExecutionContract constructs a closed resource-independent contract.
+func NewExecutionContract(workflowID string, steps []ExecutionStepContract) (ExecutionContract, error) {
+	if !executionWorkflowIDPattern.MatchString(workflowID) || len(steps) == 0 {
+		return ExecutionContract{}, fmt.Errorf("%w: invalid workflow or empty steps", ErrInvalidExecutionContract)
+	}
+	seen := make(map[string]struct{}, len(steps))
+	cloned := make([]ExecutionStepContract, len(steps))
+	for index, step := range steps {
+		if !executionIdentifierPattern.MatchString(step.ID) || !executionIdentifierPattern.MatchString(step.Executor) ||
+			!step.ExecutingIdentity.Valid() || !step.Effect.Valid() || !step.MinimumApproval.Valid() ||
+			!step.Retry.Valid() || step.TimeoutSeconds <= 0 || step.TimeoutSeconds > MaxStepTimeoutSeconds ||
+			step.SuccessCondition.String() == "" || !step.FailureBehavior.Valid() {
+			return ExecutionContract{}, fmt.Errorf("%w: invalid step %d", ErrInvalidExecutionContract, index)
+		}
+		if step.Effect == StepEffectMutation && step.MinimumApproval == ApprovalRead {
+			return ExecutionContract{}, fmt.Errorf("%w: mutation step has read approval", ErrInvalidExecutionContract)
+		}
+		if _, duplicate := seen[step.ID]; duplicate {
+			return ExecutionContract{}, fmt.Errorf("%w: duplicate step", ErrInvalidExecutionContract)
+		}
+		seen[step.ID] = struct{}{}
+		if err := validateContractStrings(step.TargetKinds, executionIdentifierPattern); err != nil {
+			return ExecutionContract{}, fmt.Errorf("%w: invalid target kinds", ErrInvalidExecutionContract)
+		}
+		if err := validateContractStrings(step.RequiredPermissions, executionPermissionPattern); err != nil {
+			return ExecutionContract{}, fmt.Errorf("%w: invalid required permissions", ErrInvalidExecutionContract)
+		}
+		cloned[index] = cloneExecutionStepContract(step)
+	}
+
+	return ExecutionContract{workflowID: workflowID, steps: cloned}, nil
+}
+
+// WorkflowID returns the immutable workflow binding.
+func (contract ExecutionContract) WorkflowID() string { return contract.workflowID }
+
+// Steps returns a detached copy of the trusted step contracts.
+func (contract ExecutionContract) Steps() []ExecutionStepContract {
+	steps := make([]ExecutionStepContract, len(contract.steps))
+	for index, step := range contract.steps {
+		steps[index] = cloneExecutionStepContract(step)
+	}
+
+	return steps
+}
+
+func cloneExecutionStepContract(step ExecutionStepContract) ExecutionStepContract {
+	step.TargetKinds = append([]string(nil), step.TargetKinds...)
+	step.RequiredPermissions = append([]string(nil), step.RequiredPermissions...)
+
+	return step
+}
+
+func validateContractStrings(values []string, pattern *regexp.Regexp) error {
+	if len(values) == 0 {
+		return ErrInvalidExecutionContract
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !pattern.MatchString(value) {
+			return ErrInvalidExecutionContract
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return ErrInvalidExecutionContract
+		}
+		seen[value] = struct{}{}
+	}
+
+	return nil
 }
 
 // CostSource identifies the data source behind a plan estimate.

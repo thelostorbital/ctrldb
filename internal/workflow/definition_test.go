@@ -22,6 +22,10 @@ func TestWorkflowDefinitionsRequireBoundedExecutionContracts_TEST_U_PLAN_04(t *t
 		{name: "missing id", mutate: func(step *workflow.StepDefinition) { step.ID = "" }},
 		{name: "missing executor", mutate: func(step *workflow.StepDefinition) { step.Executor = "" }},
 		{name: "missing identity", mutate: func(step *workflow.StepDefinition) { step.ExecutingIdentity = "" }},
+		{name: "missing effect", mutate: func(step *workflow.StepDefinition) { step.Effect = "" }},
+		{name: "mutation with read approval", mutate: func(step *workflow.StepDefinition) { step.MinimumApproval = domain.ApprovalRead }},
+		{name: "missing target kinds", mutate: func(step *workflow.StepDefinition) { step.TargetKinds = nil }},
+		{name: "missing permissions", mutate: func(step *workflow.StepDefinition) { step.RequiredPermissions = nil }},
 		{name: "zero attempts", mutate: func(step *workflow.StepDefinition) { step.Retry.MaxAttempts = 0 }},
 		{name: "unbounded attempts", mutate: func(step *workflow.StepDefinition) { step.Retry.MaxAttempts = domain.MaxStepAttempts + 1 }},
 		{name: "zero retry backoff", mutate: func(step *workflow.StepDefinition) { step.Retry.InitialBackoffSeconds = 0 }},
@@ -53,6 +57,8 @@ func TestWorkflowDefinitionAndRegistryAreImmutable(t *testing.T) {
 		t.Fatalf("NewDefinition() returned an error: %v", err)
 	}
 	steps[0].ID = "weakened"
+	steps[0].TargetKinds[0] = "disk"
+	steps[0].RequiredPermissions[0] = "compute.instances.get"
 	if got := definition.Steps()[0].ID; got != "stop-instance" {
 		t.Fatalf("definition aliased constructor storage: %q", got)
 	}
@@ -71,6 +77,11 @@ func TestWorkflowDefinitionAndRegistryAreImmutable(t *testing.T) {
 	if again.Steps()[0].TimeoutSeconds == 0 {
 		t.Fatal("registry lookup exposed mutable step storage")
 	}
+	contractSteps := definition.ExecutionContract().Steps()
+	contractSteps[0].RequiredPermissions[0] = "compute.instances.get"
+	if got := definition.ExecutionContract().Steps()[0].RequiredPermissions[0]; got != "compute.instances.stop" {
+		t.Fatalf("execution contract exposed mutable permissions: %q", got)
+	}
 
 	empty, err := workflow.NewRegistry()
 	if err != nil || empty.Len() != 0 {
@@ -86,10 +97,14 @@ func TestWorkflowDefinitionAndRegistryAreImmutable(t *testing.T) {
 
 func validDefinitionStep() workflow.StepDefinition {
 	return workflow.StepDefinition{
-		ID:                "stop-instance",
-		Executor:          "compute-api",
-		ExecutingIdentity: domain.IdentityOperator,
-		Idempotent:        true,
+		ID:                  "stop-instance",
+		Executor:            "compute-api",
+		ExecutingIdentity:   domain.IdentityOperator,
+		Effect:              domain.StepEffectMutation,
+		MinimumApproval:     domain.ApprovalProtected,
+		TargetKinds:         []string{"instance"},
+		RequiredPermissions: []string{"compute.instances.stop"},
+		Idempotent:          true,
 		Retry: domain.RetryPolicy{
 			MaxAttempts:           3,
 			InitialBackoffSeconds: 2,

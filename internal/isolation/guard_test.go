@@ -138,6 +138,15 @@ func TestValidateCleanupTargetsRequiresPrefixAndAllLabels(t *testing.T) {
 	if err := isolation.ValidateCleanupTargets(validCleanupPolicy(), []isolation.MutationTarget{valid}); err != nil {
 		t.Fatalf("ValidateCleanupTargets() unexpected error: %v", err)
 	}
+	allowed := []isolation.ResourceIdentity{
+		testResourceIdentity("ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeRegion, "asia-south1"),
+		testResourceIdentity("ctrldb-test-run1-firewall", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"),
+	}
+	for _, identity := range allowed {
+		if err := isolation.ValidateCleanupTargets(validCleanupPolicy(), []isolation.MutationTarget{testTargetWithIdentity(identity, "run1")}); err != nil {
+			t.Fatalf("ValidateCleanupTargets(allowed kind) unexpected error: %v", err)
+		}
+	}
 
 	tests := []struct {
 		name     string
@@ -152,6 +161,20 @@ func TestValidateCleanupTargetsRequiresPrefixAndAllLabels(t *testing.T) {
 			}
 			return value
 		}()},
+		{name: "network kind", resource: testTargetWithIdentity(
+			testResourceIdentity("ctrldb-test-run1-network", isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global"), "run1",
+		)},
+		{name: "snapshot kind", resource: testTargetWithIdentity(
+			testResourceIdentity("ctrldb-test-run1-snapshot", isolation.ResourceKind("snapshots"), isolation.ResourceScopeGlobal, "global"), "run1",
+		)},
+		{name: "unknown service and kind", resource: testTargetWithIdentity(func() isolation.ResourceIdentity {
+			identity := isolation.ResourceIdentity{
+				Project: "example-test-project", Service: "example.googleapis.com", Kind: "widgets",
+				Scope: isolation.ResourceScopeGlobal, Location: "global", Name: "ctrldb-test-run1-widget",
+			}
+			identity.CanonicalKey, _ = isolation.CanonicalTargetKey(identity)
+			return identity
+		}(), "run1")},
 	}
 	for _, test := range tests {
 		test := test

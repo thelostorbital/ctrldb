@@ -324,6 +324,9 @@ func ValidateCleanupTargets(policy CleanupPolicy, resources []MutationTarget) er
 		if resource.Identity.Project != policy.ProjectID {
 			return guardError(ErrUnsafeTarget, path, "does not belong to the configured cleanup project")
 		}
+		if !supportedCleanupIdentity(resource.Identity) {
+			return guardError(ErrUnsafeTarget, path, "uses a resource kind that cleanup does not support")
+		}
 		if !config.IsTestResource(config.GeneratedResource{Name: resource.Identity.Name, Labels: resource.Labels}) {
 			return guardError(ErrUnsafeTarget, path, "does not have exact disposable identity")
 		}
@@ -333,6 +336,18 @@ func ValidateCleanupTargets(policy CleanupPolicy, resources []MutationTarget) er
 		seen[resource.Identity.CanonicalKey] = struct{}{}
 	}
 	return nil
+}
+
+func supportedCleanupIdentity(identity ResourceIdentity) bool {
+	if identity.Service != ComputeServiceName {
+		return false
+	}
+	switch identity.Kind {
+	case ComputeInstanceKind, ComputeDiskKind, ComputeFirewallKind:
+		return true
+	default:
+		return false
+	}
 }
 
 // ExpirableTarget is a disposable resource considered by the nightly wipe.

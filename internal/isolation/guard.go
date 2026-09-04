@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/config"
@@ -31,9 +32,14 @@ var (
 	// ErrNonDisposableLock marks the harness as the holder of an active lock for
 	// an environment outside the disposable class.
 	ErrNonDisposableLock = errors.New("non-disposable lock held by test harness")
+	// ErrInvalidRunID marks a run identifier which cannot form an unambiguous
+	// resource namespace.
+	ErrInvalidRunID = errors.New("invalid isolation run ID")
 )
 
-var testTagPattern = regexp.MustCompile(`^ctrldb-test-[a-z0-9](?:[a-z0-9-]{0,49}[a-z0-9])?$`)
+var runIDPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+const maxRunIDLength = 32
 
 // MachineShape is the live numeric shape resolved for a GCP machine type.
 // Comparing dimensions avoids inventing an ordering across machine families.
@@ -127,13 +133,65 @@ func validateRunLimits(limits RunLimits) error {
 	return nil
 }
 
-// ValidateMutationTargets requires both the reserved name prefix and all
-// mandatory isolation labels on every resource selected for mutation.
-func ValidateMutationTargets(resources []config.GeneratedResource) error {
+// ValidateRunID accepts only a bounded lowercase identifier with single
+// hyphen separators. The restriction keeps ctrldb-test-<runId>- an
+// unambiguous namespace rather than a user-controlled prefix.
+func ValidateRunID(runID string) error {
+	if len(runID) == 0 || len(runID) > maxRunIDLength || !runIDPattern.MatchString(runID) {
+		return guardError(ErrInvalidRunID, "runID", "must be a bounded lowercase hyphen-separated identifier")
+	}
+	return nil
+}
+
+// RunResourcePrefix returns the namespace which every mutation owned by one
+// test run must use. The wider ctrldb-test- prefix is intentionally not
+// returned here; it belongs only to cleanup discovery.
+func RunResourcePrefix(runID string) (string, error) {
+	if err := ValidateRunID(runID); err != nil {
+		return "", err
+	}
+	return config.TestResourcePrefix + runID + "-", nil
+}
+
+// SelectRunMutationTargets validates and returns a detached, deterministically
+// sorted set of resources owned by exactly one run. Duplicate resource names
+// make the complete proof fail closed.
+func SelectRunMutationTargets(runID string, resources []config.GeneratedResource) ([]config.GeneratedResource, error) {
+	prefix, err := RunResourcePrefix(runID)
+	if err != nil {
+		return nil, err
+	}
+	selected := make([]config.GeneratedResource, 0, len(resources))
+	seen := make(map[string]struct{}, len(resources))
 	for index, resource := range resources {
-		if !config.IsTestResource(resource) {
-			return guardError(ErrUnsafeTarget, indexedField("targets", index), "does not have exact disposable identity")
+		path := indexedField("targets", index)
+		if !config.IsTestResource(resource) || !strings.HasPrefix(resource.Name, prefix) || len(resource.Name) == len(prefix) {
+			return nil, guardError(ErrUnsafeTarget, path, "does not have exact run-scoped disposable identity")
 		}
+		if _, exists := seen[resource.Name]; exists {
+			return nil, guardError(ErrInvalidGuardInput, path, "duplicates an earlier target")
+		}
+		seen[resource.Name] = struct{}{}
+		selected = append(selected, cloneGeneratedResource(resource))
+	}
+	sort.SliceStable(selected, func(i, j int) bool { return selected[i].Name < selected[j].Name })
+	return selected, nil
+}
+
+// ValidateCleanupTargets validates the global-prefix selector reserved for
+// teardown and nightly cleanup. Run mutations must use
+// SelectRunMutationTargets instead.
+func ValidateCleanupTargets(resources []config.GeneratedResource) error {
+	seen := make(map[string]struct{}, len(resources))
+	for index, resource := range resources {
+		path := indexedField("targets", index)
+		if !config.IsTestResource(resource) {
+			return guardError(ErrUnsafeTarget, path, "does not have exact disposable identity")
+		}
+		if _, exists := seen[resource.Name]; exists {
+			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier target")
+		}
+		seen[resource.Name] = struct{}{}
 	}
 	return nil
 }
@@ -159,7 +217,7 @@ func SelectExpiredTargets(candidates []ExpirableTarget, now time.Time, maxLifeti
 	for index, candidate := range candidates {
 		resources[index] = candidate.Resource
 	}
-	if err := ValidateMutationTargets(resources); err != nil {
+	if err := ValidateCleanupTargets(resources); err != nil {
 		return nil, err
 	}
 
@@ -176,34 +234,6 @@ func SelectExpiredTargets(candidates []ExpirableTarget, now time.Time, maxLifeti
 		return selected[i].Resource.Name < selected[j].Resource.Name
 	})
 	return selected, nil
-}
-
-// ValidateFirewallTags prevents a test rule from referencing any application
-// or production network tag. Source tags are optional for CIDR-based rules;
-// at least one target tag is mandatory.
-func ValidateFirewallTags(sourceTags, targetTags []string) error {
-	if len(targetTags) == 0 {
-		return guardError(ErrInvalidGuardInput, "targetTags", "must not be empty")
-	}
-	if err := validateTestTags("sourceTags", sourceTags); err != nil {
-		return err
-	}
-	return validateTestTags("targetTags", targetTags)
-}
-
-func validateTestTags(path string, tags []string) error {
-	seen := make(map[string]struct{}, len(tags))
-	for index, tag := range tags {
-		itemPath := indexedField(path, index)
-		if !testTagPattern.MatchString(tag) {
-			return guardError(ErrUnsafeTarget, itemPath, "must use the reserved test namespace")
-		}
-		if _, exists := seen[tag]; exists {
-			return guardError(ErrInvalidGuardInput, itemPath, "duplicates an earlier tag")
-		}
-		seen[tag] = struct{}{}
-	}
-	return nil
 }
 
 // ValidateNetworkCIDR requires a canonical private IPv4 test CIDR that does
@@ -263,6 +293,62 @@ type EnvironmentLock struct {
 	Holder      string
 }
 
+// PreMutationInput contains every local proof family required before a test
+// harness operation can reach a provider mutation boundary.
+type PreMutationInput struct {
+	RunID               string
+	Targets             []config.GeneratedResource
+	Limits              RunLimits
+	Request             RunRequest
+	TestCIDR            string
+	ProductionCIDRs     []string
+	Locks               []EnvironmentLock
+	HarnessHolder       string
+	ExpectedPermissions []PermissionObservation
+	ObservedPermissions []PermissionObservation
+	FirewallRules       []FirewallRule
+}
+
+// PreMutationDecision is a detached authorization result. Callers may retain
+// it without aliasing discovery-owned label maps.
+type PreMutationDecision struct {
+	Targets []config.GeneratedResource
+}
+
+// AuthorizePreMutation evaluates every local isolation proof before returning
+// a usable decision. It performs no I/O and has no mutation capability.
+func AuthorizePreMutation(input PreMutationInput) (PreMutationDecision, error) {
+	if len(input.Targets) == 0 {
+		return PreMutationDecision{}, guardError(ErrInvalidGuardInput, "targets", "must not be empty")
+	}
+	if len(input.ProductionCIDRs) == 0 {
+		return PreMutationDecision{}, guardError(ErrInvalidGuardInput, "productionCIDRs", "must not be empty")
+	}
+	if len(input.Locks) == 0 {
+		return PreMutationDecision{}, guardError(ErrInvalidGuardInput, "locks", "must not be empty")
+	}
+	targets, err := SelectRunMutationTargets(input.RunID, input.Targets)
+	if err != nil {
+		return PreMutationDecision{}, err
+	}
+	if err := ValidateRunRequest(input.Limits, input.Request); err != nil {
+		return PreMutationDecision{}, err
+	}
+	if err := ValidateNetworkCIDR(input.TestCIDR, input.ProductionCIDRs); err != nil {
+		return PreMutationDecision{}, err
+	}
+	if err := ValidateHarnessLocks(input.Locks, input.HarnessHolder); err != nil {
+		return PreMutationDecision{}, err
+	}
+	if err := ValidatePermissionProof(input.ExpectedPermissions, input.ObservedPermissions); err != nil {
+		return PreMutationDecision{}, err
+	}
+	if err := ValidateFirewallRules(input.FirewallRules, input.ProductionCIDRs); err != nil {
+		return PreMutationDecision{}, err
+	}
+	return PreMutationDecision{Targets: targets}, nil
+}
+
 // ValidateHarnessLocks refuses a harness identity that holds any active lock
 // outside the disposable class.
 func ValidateHarnessLocks(locks []EnvironmentLock, harnessHolder string) error {
@@ -287,12 +373,17 @@ func ValidateHarnessLocks(locks []EnvironmentLock, harnessHolder string) error {
 }
 
 func cloneExpirableTarget(target ExpirableTarget) ExpirableTarget {
-	labels := make(map[string]string, len(target.Resource.Labels))
-	for key, value := range target.Resource.Labels {
+	target.Resource = cloneGeneratedResource(target.Resource)
+	return target
+}
+
+func cloneGeneratedResource(resource config.GeneratedResource) config.GeneratedResource {
+	labels := make(map[string]string, len(resource.Labels))
+	for key, value := range resource.Labels {
 		labels[key] = value
 	}
-	target.Resource.Labels = labels
-	return target
+	resource.Labels = labels
+	return resource
 }
 
 func indexedField(base string, index int) string {

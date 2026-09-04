@@ -6,6 +6,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -17,6 +18,7 @@ func TestFindArchitectureViolations(t *testing.T) {
 		filename string
 		source   string
 		want     int
+		message  string
 	}{
 		{
 			name:   "default import",
@@ -227,6 +229,151 @@ func useLocalProcessAPI() {
 			source: "package fixture\nimport _ \"example.com/\\x66oo\"\n",
 			want:   1,
 		},
+		{
+			name: "direct secret formatting",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose() { fmt.Printf("%v", secret.New([]byte("fixture"))) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "aliased secret Errorf",
+			source: `package fixture
+import (
+	f "fmt"
+	s "github.com/thelostorbital/ctrldb/internal/secret"
+)
+type credential = s.Value
+func expose(value *credential) error { return f.Errorf("credential: %v", value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "package log",
+			source: `package fixture
+import (
+	"log"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { log.Print(value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "logger method",
+			source: `package fixture
+import (
+	"log"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { logger := log.Default(); logger.Printf("%v", value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret nested in struct",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+type envelope struct { value *secret.Value }
+func expose(value *secret.Value) { fmt.Print(envelope{value: value}) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret wrapped in interface variable",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { var wrapped any = value; fmt.Print(wrapped) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "secret wrapped in variadic slice",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func expose(value *secret.Value) { arguments := []any{value}; fmt.Print(arguments...) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "defined secret wrapper",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+type wrapped secret.Value
+func expose(value *wrapped) { fmt.Print(value) }
+`,
+			want:    1,
+			message: "secret.Value must not be passed to fmt or log",
+		},
+		{
+			name: "explicit redacted string",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func safe(value *secret.Value) { fmt.Print(value.String()) }
+`,
+		},
+		{
+			name: "local secret lookalike",
+			source: `package fixture
+import "fmt"
+type Value struct { bytes []byte }
+func safe(value *Value) { fmt.Print(value) }
+`,
+		},
+		{
+			name: "shadowed fmt",
+			source: `package fixture
+type formatter struct{}
+func (formatter) Print(...any) {}
+func safe() { fmt := formatter{}; fmt.Print(struct{ Value string }{Value: "safe"}) }
+`,
+		},
+		{
+			name:     "secret formatting in tests",
+			filename: "internal/example/example_test.go",
+			source: `package fixture
+import (
+	"fmt"
+	"github.com/thelostorbital/ctrldb/internal/secret"
+)
+func exercise(value *secret.Value) { fmt.Print(value) }
+`,
+		},
+		{
+			name:     "secret package implementation",
+			filename: "internal/secret/format.go",
+			source: `package secret
+import "fmt"
+type Value struct{}
+func safe(value *Value) { fmt.Print(value) }
+`,
+		},
 	}
 
 	for _, test := range tests {
@@ -241,7 +388,49 @@ func useLocalProcessAPI() {
 				t.Fatalf("find architecture violations: %v", err)
 			}
 			if len(findings) != test.want {
-				t.Fatalf("got %d findings, want %d", len(findings), test.want)
+				t.Fatalf("got %d findings (%v), want %d", len(findings), findings, test.want)
+			}
+			if test.message != "" && !strings.Contains(findings[0].message, test.message) {
+				t.Fatalf("finding message = %q, want it to contain %q", findings[0].message, test.message)
+			}
+		})
+	}
+}
+
+func TestVerifierImportBoundaryFixtures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		want int
+	}{
+		{name: "allowed.go.txt"},
+		{name: "forbidden-app.go.txt", want: 1},
+		{name: "forbidden-executor-step.go.txt", want: 1},
+		{name: "forbidden-runner.go.txt", want: 1},
+		{name: "forbidden-workflow.go.txt", want: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fixturePath := filepath.Join("testdata", "verify-boundary", test.name)
+			contents, err := os.ReadFile(fixturePath)
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			filename := filepath.ToSlash(filepath.Join("internal", "verify", strings.TrimSuffix(test.name, ".txt")))
+			findings, err := findArchitectureViolations(filename, contents, policyForSource(filename))
+			if err != nil {
+				t.Fatalf("find architecture violations: %v", err)
+			}
+			if len(findings) != test.want {
+				t.Fatalf("got %d findings (%v), want %d", len(findings), findings, test.want)
+			}
+			for _, result := range findings {
+				if !strings.Contains(result.message, "C-VERIFY") {
+					t.Fatalf("finding message = %q, want C-VERIFY boundary", result.message)
+				}
 			}
 		})
 	}
@@ -285,5 +474,38 @@ func TestScanIncludesImportableSpecialDirectories(t *testing.T) {
 		if foundByPath[path] != 1 {
 			t.Errorf("got %d findings for %s, want 1", foundByPath[path], name)
 		}
+	}
+}
+
+func TestScanResolvesSecretAliasesAcrossFiles(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	files := map[string]string{
+		"types.go": `package fixture
+import "github.com/thelostorbital/ctrldb/internal/secret"
+type credential = secret.Value
+`,
+		"format.go": `package fixture
+import "fmt"
+func expose(value *credential) { fmt.Printf("%v", value) }
+`,
+	}
+	for name, contents := range files {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+	}
+
+	findings, err := scan(root)
+	if err != nil {
+		t.Fatalf("scan cross-file alias: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings (%v), want 1", len(findings), findings)
+	}
+	if !strings.Contains(findings[0].message, "secret.Value") {
+		t.Fatalf("finding message = %q, want secret.Value", findings[0].message)
 	}
 }

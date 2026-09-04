@@ -14,13 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  GOWORK: "off"
   QLTY_TELEMETRY: "off"
 
 jobs:
   quality:
     name: Test and analyze
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
@@ -38,6 +39,15 @@ jobs:
       - name: Install Qlty
         uses: qltysh/qlty-action/install@08a0a862c159eae9b9003081da6663d96efef637 # v2.3.0
 
+      - name: Install pinned supply-chain tools
+        env:
+          TOOL_BIN: ${{ runner.temp }}/ctrldb-tools
+        run: |
+          mkdir -p "$TOOL_BIN"
+          GOBIN="$TOOL_BIN" go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          GOBIN="$TOOL_BIN" go install github.com/google/go-licenses/v2@v2.0.1
+          echo "$TOOL_BIN" >> "$GITHUB_PATH"
+
       - name: Verify module files are tidy
         run: go mod tidy -diff
 
@@ -51,6 +61,12 @@ jobs:
 
       - name: Run quality and security checks
         run: qlty check --all --no-fix --level=low --fail-level=low
+
+      - name: Scan for reachable Go vulnerabilities
+        run: govulncheck ./...
+
+      - name: Enforce Go dependency license policy
+        run: bash scripts/check-go-licenses.sh
 
       - name: Prove architecture rules reject violations
         run: bash scripts/test-architecture-rules.sh

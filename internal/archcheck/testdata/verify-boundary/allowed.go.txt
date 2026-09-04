@@ -1,0 +1,15 @@
+// Copyright 2026 CtrlBoard.dev
+// SPDX-License-Identifier: Apache-2.0
+
+package verify
+
+import (
+	"context"
+
+	"github.com/thelostorbital/ctrldb/internal/domain"
+	"github.com/thelostorbital/ctrldb/internal/observation"
+)
+
+type Observer interface {
+	Observe(context.Context, domain.OperationID) (observation.Snapshot, error)
+}

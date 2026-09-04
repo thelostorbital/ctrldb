@@ -39,6 +39,7 @@ const (
 	BlockerPrecondition PlanBlockerKind = "precondition"
 	BlockerResource     PlanBlockerKind = "resource"
 	BlockerRecovery     PlanBlockerKind = "recovery-asset"
+	BlockerExposure     PlanBlockerKind = "exposure"
 	BlockerPermission   PlanBlockerKind = "permission"
 	BlockerStepUp       PlanBlockerKind = "step-up"
 )
@@ -252,6 +253,7 @@ func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence, cont
 	var contractRequiresApproval, contractRequiresStepUp, contractRequiresRecovery bool
 	blockers, contractRequiresApproval, contractRequiresStepUp, contractRequiresRecovery =
 		validateExecutionContract(plan, contract, blockers)
+	blockers = validateExposureExecutionTime(plan, evidence.CheckedAt, blockers)
 
 	requireApproval := contractRequiresApproval || plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil
 	if requireApproval {
@@ -298,6 +300,8 @@ func validateExecutionContract(
 	mutationCapable := false
 	requiresStepUp := false
 	requiresRecovery := false
+	var exposureRequirement *domain.ExecutionExposureRequirement
+	exposureTargets := make(map[string]struct{})
 	for _, step := range contractSteps {
 		if step.MinimumApproval > minimumApproval {
 			minimumApproval = step.MinimumApproval
@@ -305,8 +309,11 @@ func validateExecutionContract(
 		mutationCapable = mutationCapable || step.Effect == domain.StepEffectMutation
 		requiresStepUp = requiresStepUp || step.RequiresStepUp
 		requiresRecovery = requiresRecovery || step.RequiresRecoveryAsset
+		if step.ExposureRequirement != nil {
+			requirement := *step.ExposureRequirement
+			exposureRequirement = &requirement
+		}
 	}
-
 	expectedPermissions := make(map[string]struct{})
 	contractMismatch := false
 	for index, step := range plan.Steps {
@@ -330,7 +337,16 @@ func validateExecutionContract(
 				}
 				expectedPermissions[planPermissionKey(required)] = struct{}{}
 			}
+			if expected.RequiresRecoveryAsset && !recoveryAssetsCover(plan.Rollback.Assets, target) {
+				contractMismatch = true
+			}
+			if expected.ExposureRequirement != nil {
+				exposureTargets[planResourceKey(target)] = struct{}{}
+			}
 		}
+	}
+	if !planMatchesExposureRequirement(plan, exposureRequirement, exposureTargets) {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerContract, ID: "exposure-requirement"})
 	}
 	if contractMismatch || plan.ApprovalClass < minimumApproval ||
 		(mutationCapable && plan.ApprovalClass == domain.ApprovalRead) {
@@ -379,12 +395,93 @@ func equalRecoveryAssets(left, right []domain.PlanRecoveryAsset) bool {
 	for index := range left {
 		if left[index].Kind != right[index].Kind || left[index].Resource != right[index].Resource ||
 			left[index].EvidenceRef != right[index].EvidenceRef || !left[index].VerifiedAt.Equal(right[index].VerifiedAt) ||
-			!equalOptionalTime(left[index].RestoreTo, right[index].RestoreTo) {
+			!equalOptionalTime(left[index].RestoreTo, right[index].RestoreTo) ||
+			!equalPlanResources(left[index].Protects, right[index].Protects) {
 			return false
 		}
 	}
 
 	return true
+}
+
+func equalPlanResources(left, right []domain.PlanResource) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func recoveryAssetsCover(assets []domain.PlanRecoveryAsset, target domain.PlanResource) bool {
+	for _, asset := range assets {
+		for _, protected := range asset.Protects {
+			if protected == target {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func planMatchesExposureRequirement(
+	plan domain.Plan,
+	requirement *domain.ExecutionExposureRequirement,
+	expectedTargets map[string]struct{},
+) bool {
+	if requirement == nil {
+		return plan.Exposure == domain.ExposureNone && plan.ExposureControls == nil
+	}
+	if plan.Exposure != requirement.Delta || plan.ExposureControls == nil ||
+		plan.ExposureControls.Profile != requirement.Profile ||
+		plan.ExposureControls.InternetWide != requirement.InternetWide ||
+		plan.ExposureControls.SimulationPreconditionID != requirement.SimulationPreconditionID ||
+		len(plan.ExposureControls.Targets) != len(expectedTargets) {
+		return false
+	}
+	for _, target := range plan.ExposureControls.Targets {
+		if _, expected := expectedTargets[planResourceKey(target)]; !expected {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validateExposureExecutionTime(
+	plan domain.Plan,
+	checkedAt time.Time,
+	blockers []PlanBlocker,
+) []PlanBlocker {
+	controls := plan.ExposureControls
+	if controls == nil || controls.PermanentInternetWideAcknowledged {
+		return blockers
+	}
+	if controls.ExpiresAt != nil && !controls.ExpiresAt.After(checkedAt) {
+		return append(blockers, PlanBlocker{Kind: BlockerExposure, ID: "expired"})
+	}
+	if controls.ReviewAt != nil && utcDateAfter(checkedAt, *controls.ReviewAt) {
+		return append(blockers, PlanBlocker{Kind: BlockerExposure, ID: "review-overdue"})
+	}
+
+	return blockers
+}
+
+func utcDateAfter(left, right time.Time) bool {
+	leftYear, leftMonth, leftDay := left.Date()
+	rightYear, rightMonth, rightDay := right.Date()
+	if leftYear != rightYear {
+		return leftYear > rightYear
+	}
+	if leftMonth != rightMonth {
+		return leftMonth > rightMonth
+	}
+	return leftDay > rightDay
 }
 
 func equalOptionalTime(left, right *time.Time) bool {
@@ -393,6 +490,7 @@ func equalOptionalTime(left, right *time.Time) bool {
 
 func planStepMatchesContract(step domain.PlanStep, expected domain.ExecutionStepContract) bool {
 	return step.Executor == expected.Executor && step.ExecutingIdentity == expected.ExecutingIdentity &&
+		step.CommandRedacted.String() == expected.CommandSummary.String() &&
 		step.Idempotent == expected.Idempotent && step.Retry == expected.Retry &&
 		step.CancelSafe == expected.CancelSafe && step.TimeoutSeconds == expected.TimeoutSeconds &&
 		step.SuccessCondition.String() == expected.SuccessCondition.String() &&

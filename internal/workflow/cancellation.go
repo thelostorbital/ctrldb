@@ -288,6 +288,9 @@ func RestoreCancellationController(
 	if !contractDigestPattern.MatchString(contract.Digest()) {
 		return CancellationController{}, fmt.Errorf("%w: invalid execution contract", ErrInvalidCancellation)
 	}
+	if entries[0].ContractHash != contract.Digest() {
+		return CancellationController{}, fmt.Errorf("%w: journal does not match the execution contract", ErrInvalidCancellation)
+	}
 	if pointOfNoReturnReached(contract, entries) {
 		return CancellationController{}, fmt.Errorf("%w: point of no return has been reached", ErrInvalidCancellation)
 	}
@@ -362,6 +365,11 @@ func cancellationContext(
 	}
 	if !contractDigestPattern.MatchString(contract.Digest()) {
 		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: invalid execution contract", ErrInvalidCancellation)
+	}
+	if entries[0].ContractHash != contract.Digest() {
+		return domain.ExecutionStepContract{}, "", fmt.Errorf(
+			"%w: durable journal does not match the execution contract", ErrInvalidCancellation,
+		)
 	}
 	if pointOfNoReturnReached(contract, entries) {
 		return domain.ExecutionStepContract{}, "", fmt.Errorf(
@@ -512,6 +520,7 @@ func cancellationJournalEntry(
 		Schema:         domain.JournalSchemaV1,
 		OperationID:    request.OperationID,
 		PlanID:         request.PlanID,
+		ContractHash:   contractHash,
 		Sequence:       request.Sequence,
 		Kind:           domain.JournalEntryCancellationRequest,
 		RecordedAt:     request.RequestedAt,

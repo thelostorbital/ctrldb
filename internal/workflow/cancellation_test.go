@@ -21,7 +21,7 @@ func TestCancellationQueuesUntilSafeBoundary_TEST_U_PLAN_05(t *testing.T) {
 	request := validCancellationRequest()
 	machine := machineAt(t, domain.OperationExecute)
 	contract := cancellationContract(t, "stop-instance", false)
-	base := validJournal()[:5]
+	base := journalBoundToContract(validJournal()[:5], contract)
 	next, decision, err := controller.Request(machine, request, contract, base)
 	if err != nil {
 		t.Fatalf("Request() returned an error: %v", err)
@@ -42,7 +42,7 @@ func TestCancellationQueuesUntilSafeBoundary_TEST_U_PLAN_05(t *testing.T) {
 		t.Fatalf("AtBoundary() without durable step completion error = %v, want ErrInvalidCancellation", err)
 	}
 
-	step := cancellationStepEntry("stop-instance", 7, request.RequestedAt, true)
+	step := cancellationStepEntry(contract, "stop-instance", 7, request.RequestedAt, true)
 	entries = append(entries, step)
 	cleared, decision, err := restored.AtBoundary(machine, contract, entries)
 	if err != nil {
@@ -59,7 +59,7 @@ func TestCancellationRoutesToCancelledOnlyAfterDurableNonMutationBoundary(t *tes
 	request := validCancellationRequest()
 	contract := cancellationContract(t, "stop-instance", true)
 	machine := machineAt(t, domain.OperationExecute)
-	base := validJournal()[:5]
+	base := journalBoundToContract(validJournal()[:5], contract)
 	var controller workflow.CancellationController
 	_, persist, err := controller.Request(machine, request, contract, base)
 	if err != nil {
@@ -70,7 +70,7 @@ func TestCancellationRoutesToCancelledOnlyAfterDurableNonMutationBoundary(t *tes
 	if err != nil {
 		t.Fatalf("RestoreCancellationController() returned an error: %v", err)
 	}
-	entries = append(entries, cancellationStepEntry("stop-instance", 7, request.RequestedAt, false))
+	entries = append(entries, cancellationStepEntry(contract, "stop-instance", 7, request.RequestedAt, false))
 	cleared, decision, err := restored.AtBoundary(machine, contract, entries)
 	if err != nil {
 		t.Fatalf("AtBoundary() returned an error: %v", err)
@@ -118,7 +118,7 @@ func TestMachineAppliesOnlyStateBoundCancellationDecisions(t *testing.T) {
 
 	machine = machineAt(t, domain.OperationPaused)
 	contract := cancellationContract(t, "stop-instance", false)
-	journal := pausedCancellationJournal(true)
+	journal := pausedCancellationJournal(contract, true)
 	request := validCancellationRequest()
 	request.Sequence = uint64(len(journal) + 1)
 	request.RequestedAt = journal[len(journal)-1].RecordedAt.Add(time.Second)
@@ -249,7 +249,7 @@ func TestCancellationFailsClosedOnUnsafeRoutes(t *testing.T) {
 	request := validCancellationRequest()
 	contract := cancellationContract(t, "stop-instance", true)
 	if _, decision, err := controller.Request(
-		machineAt(t, domain.OperationExecute), request, contract, validJournal()[:5],
+		machineAt(t, domain.OperationExecute), request, contract, journalBoundToContract(validJournal()[:5], contract),
 	); err != nil || decision.Action != workflow.CancellationPersist || decision.Target != "" {
 		t.Fatalf("EXECUTE cancellation = (%#v, %v), want durable persistence without authorization", decision, err)
 	} else if applyErr := machineAt(t, domain.OperationExecute).ApplyCancellation(decision); !errors.Is(applyErr, workflow.ErrInvalidCancellation) {
@@ -283,7 +283,7 @@ func TestCancellationRestoreRejectsAmbiguousOrMismatchedEvidence(t *testing.T) {
 
 	request := validCancellationRequest()
 	contract := cancellationContract(t, "stop-instance", false)
-	base := validJournal()[:5]
+	base := journalBoundToContract(validJournal()[:5], contract)
 	var controller workflow.CancellationController
 	_, decision, err := controller.Request(machineAt(t, domain.OperationExecute), request, contract, base)
 	if err != nil {
@@ -315,7 +315,7 @@ func TestCancellationRestoreRejectsAmbiguousOrMismatchedEvidence(t *testing.T) {
 	}
 	entriesWithBoundary := append(
 		append([]domain.JournalEntry(nil), entries...),
-		cancellationStepEntry("stop-instance", 7, request.RequestedAt, false),
+		cancellationStepEntry(contract, "stop-instance", 7, request.RequestedAt, false),
 	)
 	if _, _, err := restored.AtBoundary(
 		machineAt(t, domain.OperationExecute), changedContract, entriesWithBoundary,
@@ -347,7 +347,7 @@ func TestRestoredCancellationCannotRouteAnotherOperationMachine(t *testing.T) {
 
 	request := validCancellationRequest()
 	contract := cancellationContract(t, "stop-instance", false)
-	base := validJournal()[:5]
+	base := journalBoundToContract(validJournal()[:5], contract)
 	var controller workflow.CancellationController
 	_, decision, err := controller.Request(machineAt(t, domain.OperationExecute), request, contract, base)
 	if err != nil {
@@ -381,21 +381,21 @@ func TestCancellationJournalMustBeHonoredAtFirstCompatibleBoundary(t *testing.T)
 
 	request := validCancellationRequest()
 	contract := cancellationContract(t, "stop-instance", false)
-	base := validJournal()[:5]
+	base := journalBoundToContract(validJournal()[:5], contract)
 	var controller workflow.CancellationController
 	_, decision, err := controller.Request(machineAt(t, domain.OperationExecute), request, contract, base)
 	if err != nil {
 		t.Fatalf("Request() returned an error: %v", err)
 	}
 	entries := append(append([]domain.JournalEntry(nil), base...), *decision.JournalEntry)
-	skipped := validTransitionEntry(7, domain.OperationVerify)
+	skipped := journalEntryBoundToContract(validTransitionEntry(7, domain.OperationVerify), contract)
 	skipped.RecordedAt = request.RequestedAt.Add(time.Second)
 	if err := workflow.ValidateJournal(append(entries, skipped)); !errors.Is(err, workflow.ErrInvalidJournalStream) {
 		t.Fatalf("skipped cancellation error = %v, want ErrInvalidJournalStream", err)
 	}
-	step := cancellationStepEntry("stop-instance", 7, request.RequestedAt, true)
+	step := cancellationStepEntry(contract, "stop-instance", 7, request.RequestedAt, true)
 	entries = append(entries, step)
-	rollback := validTransitionEntry(8, domain.OperationRollback)
+	rollback := journalEntryBoundToContract(validTransitionEntry(8, domain.OperationRollback), contract)
 	rollback.RecordedAt = step.RecordedAt.Add(time.Second)
 	if err := workflow.ValidateJournal(append(entries, rollback)); err != nil {
 		t.Fatalf("persisted rollback route returned an error: %v", err)
@@ -407,14 +407,14 @@ func TestCancellationJournalBindsInFlightStepAndEscalatesNewMutation(t *testing.
 
 	request := validCancellationRequest()
 	contract := cancellationContract(t, "check-health", false)
-	base := validJournal()[:5]
+	base := journalBoundToContract(validJournal()[:5], contract)
 	var controller workflow.CancellationController
 	_, decision, err := controller.Request(machineAt(t, domain.OperationExecute), request, contract, base)
 	if err != nil {
 		t.Fatalf("Request() returned an error: %v", err)
 	}
 	entries := append(append([]domain.JournalEntry(nil), base...), *decision.JournalEntry)
-	step := validStepEntry()
+	step := journalEntryBoundToContract(validStepEntry(), contract)
 	step.Sequence = 7
 	step.Step.StartedAt = entries[4].RecordedAt
 	endedAt := request.RequestedAt.Add(500 * time.Millisecond)
@@ -422,7 +422,7 @@ func TestCancellationJournalBindsInFlightStepAndEscalatesNewMutation(t *testing.
 	step.RecordedAt = request.RequestedAt.Add(time.Second)
 	step.Step.MutationOccurred = true
 	entries = append(entries, step)
-	rollback := validTransitionEntry(8, domain.OperationRollback)
+	rollback := journalEntryBoundToContract(validTransitionEntry(8, domain.OperationRollback), contract)
 	rollback.RecordedAt = step.RecordedAt.Add(time.Second)
 	entries = append(entries, rollback)
 	if err := workflow.ValidateJournal(entries); err != nil {
@@ -456,7 +456,7 @@ func TestCancellationJournalRequiresInFlightStepStartAtOrBeforeRequest(t *testin
 
 	request := validCancellationRequest()
 	contract := cancellationContract(t, "check-health", false)
-	base := validJournal()[:5]
+	base := journalBoundToContract(validJournal()[:5], contract)
 	var controller workflow.CancellationController
 	_, decision, err := controller.Request(machineAt(t, domain.OperationExecute), request, contract, base)
 	if err != nil {
@@ -464,7 +464,7 @@ func TestCancellationJournalRequiresInFlightStepStartAtOrBeforeRequest(t *testin
 	}
 	makeEntries := func(startedAt time.Time) []domain.JournalEntry {
 		entries := append(append([]domain.JournalEntry(nil), base...), *decision.JournalEntry)
-		step := validStepEntry()
+		step := journalEntryBoundToContract(validStepEntry(), contract)
 		step.Sequence = 7
 		step.Step.StartedAt = startedAt
 		endedAt := request.RequestedAt.Add(time.Second)
@@ -499,7 +499,7 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 	}
 	contract := definition.ExecutionContract()
 	request := validCancellationRequest()
-	base := validJournal()[:5]
+	base := journalBoundToContract(validJournal()[:5], contract)
 	machine := machineAt(t, domain.OperationExecute)
 	var controller workflow.CancellationController
 	_, persist, err := controller.Request(machine, request, contract, base)
@@ -508,7 +508,7 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 	}
 	requested := append(append([]domain.JournalEntry(nil), base...), *persist.JournalEntry)
 
-	failedBeforeMutation := cancellationStepEntry(pointStep.ID, 7, request.RequestedAt, false)
+	failedBeforeMutation := cancellationStepEntry(contract, pointStep.ID, 7, request.RequestedAt, false)
 	failedBeforeMutation.Step.Outcome = domain.StepFailed
 	beforePoint := append(append([]domain.JournalEntry(nil), requested...), failedBeforeMutation)
 	restored, err := workflow.RestoreCancellationController(
@@ -523,7 +523,7 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 	}
 
 	for _, outcome := range []domain.StepOutcome{domain.StepDone} {
-		entry := cancellationStepEntry(pointStep.ID, 7, request.RequestedAt, false)
+		entry := cancellationStepEntry(contract, pointStep.ID, 7, request.RequestedAt, false)
 		entry.Step.Outcome = outcome
 		atPoint := append(append([]domain.JournalEntry(nil), requested...), entry)
 		if _, err := workflow.RestoreCancellationController(
@@ -533,7 +533,7 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 		}
 	}
 
-	completedPoint := cancellationStepEntry(pointStep.ID, 6, request.RequestedAt, true)
+	completedPoint := cancellationStepEntry(contract, pointStep.ID, 6, request.RequestedAt, true)
 	afterPoint := append(append([]domain.JournalEntry(nil), base...), completedPoint)
 	lateRequest := request
 	lateRequest.Sequence = 7
@@ -554,7 +554,7 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDefinition(read) returned an error: %v", err)
 	}
-	paused := pausedCancellationJournal(true)
+	paused := pausedCancellationJournal(readDefinition.ExecutionContract(), true)
 	pausedRequest := request
 	pausedRequest.Sequence = uint64(len(paused) + 1)
 	pausedRequest.RequestedAt = paused[len(paused)-1].RecordedAt.Add(time.Second)
@@ -599,13 +599,13 @@ func TestCancellationHonorsTrustedPointOfNoReturnTriggers(t *testing.T) {
 			}
 			contract := definition.ExecutionContract()
 			request := validCancellationRequest()
-			base := validJournal()[:5]
+			base := journalBoundToContract(validJournal()[:5], contract)
 			var controller workflow.CancellationController
 			_, persist, err := controller.Request(machineAt(t, domain.OperationExecute), request, contract, base)
 			if err != nil {
 				t.Fatalf("Request() returned an error: %v", err)
 			}
-			entry := cancellationStepEntry(step.ID, 7, request.RequestedAt, test.mutationOccurred)
+			entry := cancellationStepEntry(contract, step.ID, 7, request.RequestedAt, test.mutationOccurred)
 			entry.Step.Outcome = test.outcome
 			if test.outcome == domain.StepUnknown {
 				entry.Step.EndedAt = nil
@@ -632,17 +632,18 @@ func TestCancellationHonorsTrustedPointOfNoReturnTriggers(t *testing.T) {
 		t.Fatalf("NewDefinition() returned an error: %v", err)
 	}
 	request := validCancellationRequest()
-	journal := append([]domain.JournalEntry(nil), validJournal()[:5]...)
-	failedPoint := cancellationStepEntry(point.ID, 6, request.RequestedAt.Add(-2*time.Second), false)
+	contract := definition.ExecutionContract()
+	journal := journalBoundToContract(validJournal()[:5], contract)
+	failedPoint := cancellationStepEntry(contract, point.ID, 6, request.RequestedAt.Add(-2*time.Second), false)
 	failedPoint.Step.Outcome = domain.StepFailed
 	journal = append(journal, failedPoint)
-	laterEntry := cancellationStepEntry(later.ID, 7, request.RequestedAt, false)
+	laterEntry := cancellationStepEntry(contract, later.ID, 7, request.RequestedAt, false)
 	journal = append(journal, laterEntry)
 	request.Sequence = 8
 	request.RequestedAt = laterEntry.RecordedAt.Add(time.Second)
 	var controller workflow.CancellationController
 	if _, _, err := controller.Request(
-		machineAt(t, domain.OperationExecute), request, definition.ExecutionContract(), journal,
+		machineAt(t, domain.OperationExecute), request, contract, journal,
 	); !errors.Is(err, workflow.ErrInvalidCancellation) {
 		t.Fatalf("Request() after a later step error = %v, want ErrInvalidCancellation", err)
 	}
@@ -673,12 +674,14 @@ func cancellationContract(t *testing.T, stepID string, cancelSafe bool) domain.E
 }
 
 func cancellationStepEntry(
+	contract domain.ExecutionContract,
 	stepID string,
 	sequence uint64,
 	requestedAt time.Time,
 	mutationOccurred bool,
 ) domain.JournalEntry {
 	entry := validStepEntry()
+	entry.ContractHash = contract.Digest()
 	entry.Sequence = sequence
 	entry.Step.ID = stepID
 	entry.Step.StartedAt = requestedAt.Add(-time.Second)
@@ -690,9 +693,9 @@ func cancellationStepEntry(
 	return entry
 }
 
-func pausedCancellationJournal(mutationOccurred bool) []domain.JournalEntry {
-	entries := append([]domain.JournalEntry(nil), validJournal()[:5]...)
-	pause := validPausedEntry()
+func pausedCancellationJournal(contract domain.ExecutionContract, mutationOccurred bool) []domain.JournalEntry {
+	entries := journalBoundToContract(validJournal()[:5], contract)
+	pause := journalEntryBoundToContract(validPausedEntry(), contract)
 	pause.Sequence = 6
 	pause.RecordedAt = entries[4].RecordedAt.Add(time.Second)
 	pause.Pause.PausedAt = pause.RecordedAt
@@ -700,4 +703,24 @@ func pausedCancellationJournal(mutationOccurred bool) []domain.JournalEntry {
 	pause.Pause.MutationOccurred = mutationOccurred
 
 	return append(entries, pause)
+}
+
+func journalBoundToContract(entries []domain.JournalEntry, contract domain.ExecutionContract) []domain.JournalEntry {
+	bound := make([]domain.JournalEntry, len(entries))
+	for index, entry := range entries {
+		bound[index] = journalEntryBoundToContract(entry, contract)
+	}
+
+	return bound
+}
+
+func journalEntryBoundToContract(entry domain.JournalEntry, contract domain.ExecutionContract) domain.JournalEntry {
+	entry.ContractHash = contract.Digest()
+	if entry.Cancellation != nil {
+		cancellation := *entry.Cancellation
+		cancellation.ExecutionContractHash = contract.Digest()
+		entry.Cancellation = &cancellation
+	}
+
+	return entry
 }

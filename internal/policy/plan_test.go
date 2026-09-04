@@ -37,7 +37,84 @@ func TestPlanEncodeDecodeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPlanDecodeResanitizesStoredText(t *testing.T) {
+func TestPlanDecodeRequiresCanonicalBytes(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := policy.EncodePlan(validPlan())
+	if err != nil {
+		t.Fatalf("EncodePlan() returned an error: %v", err)
+	}
+	if _, err := policy.DecodePlan(append([]byte{' '}, encoded...)); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan(whitespace) error = %v, want ErrInvalidPlan", err)
+	}
+	for name, aliased := range map[string][]byte{
+		"number": bytes.Replace(encoded, []byte(`"amountUSD":30`), []byte(`"amountUSD":3e1`), 1),
+		"time": bytes.Replace(
+			encoded, []byte(`"createdAt":"2026-09-03T11:00:00Z"`),
+			[]byte(`"createdAt":"2026-09-03T11:00:00+00:00"`), 1,
+		),
+	} {
+		if bytes.Equal(aliased, encoded) {
+			t.Fatalf("%s alias fixture did not change", name)
+		}
+		if _, err := policy.DecodePlan(aliased); !errors.Is(err, policy.ErrInvalidPlan) {
+			t.Fatalf("DecodePlan(%s alias) error = %v, want ErrInvalidPlan", name, err)
+		}
+	}
+
+	var document map[string]any
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatalf("json.Unmarshal() returned an error: %v", err)
+	}
+	reordered, err := json.Marshal(document)
+	if err != nil {
+		t.Fatalf("json.Marshal(reordered) returned an error: %v", err)
+	}
+	if bytes.Equal(encoded, reordered) {
+		t.Fatal("map encoding unexpectedly retained struct field order")
+	}
+	if _, err := policy.DecodePlan(reordered); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan(reordered) error = %v, want ErrInvalidPlan", err)
+	}
+	document["cost"].(map[string]any)["budget"].(map[string]any)["reason"] = ""
+	explicitEmpty, err := json.Marshal(document)
+	if err != nil {
+		t.Fatalf("json.Marshal() returned an error: %v", err)
+	}
+	if _, err := policy.DecodePlan(explicitEmpty); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan(explicit empty optional) error = %v, want ErrInvalidPlan", err)
+	}
+}
+
+func TestPlanSealNormalizesRequiredNilCollectionsWithoutNormalizingLoadedValues(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	plan.ApprovalClass = domain.ApprovalDestructive
+	plan.Rollback.Assets = nil
+	sealed, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+	if sealed.Rollback.Assets == nil {
+		t.Fatal("SealPlan() retained a nil required collection")
+	}
+	encoded, err := policy.EncodePlan(sealed)
+	if err != nil {
+		t.Fatalf("EncodePlan() returned an error: %v", err)
+	}
+	if _, err := policy.DecodePlan(encoded); err != nil {
+		t.Fatalf("DecodePlan() returned an error: %v", err)
+	}
+
+	tampered := sealed
+	tampered.Rollback.Assets = nil
+	if err := policy.VerifyPlanHash(tampered); !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("VerifyPlanHash(nil loaded collection) error = %v, want ErrInvalidPlan", err)
+	}
+}
+
+func TestPlanDecodeRejectsNoncanonicalStoredTextWithoutDisclosure(t *testing.T) {
 	t.Parallel()
 
 	plan := validPlan()
@@ -53,16 +130,36 @@ func TestPlanDecodeResanitizesStoredText(t *testing.T) {
 
 	encoded = bytes.Replace(
 		encoded,
-		[]byte(`"commandRedacted":"[redacted]"`),
+		[]byte(`"commandRedacted":"password=[redacted]"`),
 		[]byte(`"commandRedacted":"password=SECRET_MARKER_STORED_PLAN"`),
 		1,
 	)
-	decoded, err := policy.DecodePlan(encoded)
-	if err != nil {
-		t.Fatalf("DecodePlan() returned an error: %v", err)
+	_, err = policy.DecodePlan(encoded)
+	if !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
 	}
-	if got := decoded.Steps[0].CommandRedacted.String(); got != "password=[redacted]" {
-		t.Fatalf("decoded command = %q, want a redacted value", got)
+	if strings.Contains(err.Error(), "SECRET_MARKER") {
+		t.Fatalf("DecodePlan() disclosed hostile input: %v", err)
+	}
+}
+
+func TestPlanDecodeDoesNotDiscloseHostileScalarValues(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := policy.EncodePlan(validPlan())
+	if err != nil {
+		t.Fatalf("EncodePlan() returned an error: %v", err)
+	}
+	hostile := bytes.Replace(
+		encoded, []byte(`"createdAt":"2026-09-03T11:00:00Z"`),
+		[]byte(`"createdAt":"SECRET_MARKER_HOSTILE_TIME"`), 1,
+	)
+	_, err = policy.DecodePlan(hostile)
+	if !errors.Is(err, policy.ErrInvalidPlan) {
+		t.Fatalf("DecodePlan() error = %v, want ErrInvalidPlan", err)
+	}
+	if strings.Contains(err.Error(), "SECRET_MARKER") {
+		t.Fatalf("DecodePlan() disclosed hostile scalar: %v", err)
 	}
 }
 
@@ -74,7 +171,7 @@ func TestPlanSealAndHashVerification(t *testing.T) {
 		t.Fatalf("VerifyPlanHash() returned an error: %v", err)
 	}
 
-	const knownDigest = "9e77bca2b47189db4b0c48b0e6d7d60cf1c1291cbca67c25b14809215fc45fe3"
+	const knownDigest = "ed35b5fcad331ae9f5bb794cd1cf7075aaddfe72bda07040ddf074333d2739aa"
 	if plan.PlanHash != knownDigest {
 		t.Fatalf("sealed plan digest = %q, want known vector %q", plan.PlanHash, knownDigest)
 	}
@@ -127,6 +224,7 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 			plan.Permissions[0].Resource.Scope = plan.Resources[0].Scope
 			plan.Steps[0].Targets[0].Scope = plan.Resources[0].Scope
 			plan.Rollback.Assets[0].Resource.Scope = "projects/ctrldb-stage-123/global"
+			plan.Rollback.Assets[0].Protects[0].Scope = plan.Resources[0].Scope
 		}},
 		{name: "environment", mutate: func(plan *domain.Plan) { plan.Environment = "staging" }},
 		{name: "environment class", mutate: func(plan *domain.Plan) { plan.EnvironmentClass = domain.EnvironmentStaging }},
@@ -149,11 +247,13 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 			plan.Resources[0].Fingerprint = "generation-8"
 			plan.Permissions[0].Resource.Fingerprint = "generation-8"
 			plan.Steps[0].Targets[0].Fingerprint = "generation-8"
+			plan.Rollback.Assets[0].Protects[0].Fingerprint = "generation-8"
 		}},
 		{name: "resource scope", mutate: func(plan *domain.Plan) {
 			plan.Resources[0].Scope = "projects/ctrldb-prod-123/zones/us-central1-b"
 			plan.Permissions[0].Resource.Scope = plan.Resources[0].Scope
 			plan.Steps[0].Targets[0].Scope = plan.Resources[0].Scope
+			plan.Rollback.Assets[0].Protects[0].Scope = plan.Resources[0].Scope
 		}},
 		{name: "precondition", mutate: func(plan *domain.Plan) { plan.Preconditions[0].Detail = redact.Sanitize("ready") }},
 		{name: "precondition outcome", mutate: func(plan *domain.Plan) { plan.Preconditions[0].OK = false }},
@@ -172,6 +272,7 @@ func TestPlanHashCoversEveryPlanV1Field_TEST_U_PLAN_02(t *testing.T) {
 			plan.Permissions[0].Resource.Name = "other-instance"
 			plan.Resources[0].Name = "other-instance"
 			plan.Steps[0].Targets[0].Name = "other-instance"
+			plan.Rollback.Assets[0].Protects[0].Name = "other-instance"
 		}},
 		{name: "step", mutate: func(plan *domain.Plan) { plan.Steps[0].Executor = "compute-api" }},
 		{name: "step retry", mutate: func(plan *domain.Plan) { plan.Steps[0].Retry.MaxAttempts++ }},
@@ -830,6 +931,7 @@ func TestPlanRecoveryAssetsAreTypedFreshAndRiskBound(t *testing.T) {
 				Kind: "pbm-recovery-point", Scope: "projects/ctrldb-prod-123/global",
 				Name: "pbm-point", Fingerprint: "generation-12",
 			},
+			Protects:    append([]domain.PlanResource(nil), plan.Resources...),
 			EvidenceRef: "evidence/production/pbm-point.json",
 			VerifiedAt:  plan.CreatedAt.Add(-30 * time.Minute),
 			RestoreTo:   &restoreTo,
@@ -855,6 +957,17 @@ func TestPlanRecoveryAssetsAreTypedFreshAndRiskBound(t *testing.T) {
 		},
 		"duplicate asset": func(plan *domain.Plan) {
 			plan.Rollback.Assets = append(plan.Rollback.Assets, plan.Rollback.Assets[0])
+		},
+		"missing protected resources": func(plan *domain.Plan) {
+			plan.Rollback.Assets[0].Protects = nil
+		},
+		"forged protected resource": func(plan *domain.Plan) {
+			plan.Rollback.Assets[0].Protects[0].Fingerprint = "generation-forged"
+		},
+		"duplicate protected resource": func(plan *domain.Plan) {
+			plan.Rollback.Assets[0].Protects = append(
+				plan.Rollback.Assets[0].Protects, plan.Rollback.Assets[0].Protects[0],
+			)
 		},
 		"PBM missing restoreTo": func(plan *domain.Plan) {
 			validPBM(plan)
@@ -893,6 +1006,33 @@ func TestPlanRecoveryAssetsAreTypedFreshAndRiskBound(t *testing.T) {
 	}
 }
 
+func TestPlanPrivateRangeRequiresWholePrefixContainment(t *testing.T) {
+	t.Parallel()
+
+	build := func(prefix string) domain.Plan {
+		plan := validPlan()
+		plan.ApprovalClass = domain.ApprovalSecuritySensitive
+		plan.Exposure = domain.ExposurePrivate
+		plan.ExposureControls = validExposureControls(plan)
+		plan.ExposureControls.Profile = domain.ExposureProfileACC05
+		plan.ExposureControls.Sources = []domain.PlanExposureSource{{
+			Kind: domain.ExposureSourcePrivateRange, Value: prefix,
+		}}
+
+		return plan
+	}
+	for _, prefix := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
+		if _, err := policy.SealPlan(build(prefix)); err != nil {
+			t.Fatalf("SealPlan(%s) returned an error: %v", prefix, err)
+		}
+	}
+	for _, prefix := range []string{"10.0.0.0/7", "172.16.0.0/11", "192.168.0.0/15", "100.64.0.0/10"} {
+		if _, err := policy.SealPlan(build(prefix)); !errors.Is(err, policy.ErrInvalidPlan) {
+			t.Fatalf("SealPlan(%s) error = %v, want ErrInvalidPlan", prefix, err)
+		}
+	}
+}
+
 func TestPlanExposureControlsAreClosedScopedAndExceptional(t *testing.T) {
 	t.Parallel()
 
@@ -908,12 +1048,15 @@ func TestPlanExposureControlsAreClosedScopedAndExceptional(t *testing.T) {
 		"insufficient approval": func(plan *domain.Plan) { plan.ApprovalClass = domain.ApprovalProtected },
 		"forged target":         func(plan *domain.Plan) { plan.ExposureControls.Targets[0].Fingerprint = "forged" },
 		"wide source mismatch":  func(plan *domain.Plan) { plan.ExposureControls.Sources[0].Value = "0.0.0.0/0" },
-		"wrong port":            func(plan *domain.Plan) { plan.ExposureControls.Ports[0].Number = 22 },
-		"wrong authentication":  func(plan *domain.Plan) { plan.ExposureControls.Authentication = domain.ExposureAuthIAP },
-		"weak TLS":              func(plan *domain.Plan) { plan.ExposureControls.TLS.Trust = domain.ExposureTrustPrivate },
-		"no audit":              func(plan *domain.Plan) { plan.ExposureControls.AuditLogging = false },
-		"wrong revocation":      func(plan *domain.Plan) { plan.ExposureControls.RevocationWorkflowID = "WF-ACC-03" },
-		"failed simulation":     func(plan *domain.Plan) { plan.Preconditions[0].OK = false },
+		"ACC-08 without internet-wide source": func(plan *domain.Plan) {
+			plan.ExposureControls.Profile = domain.ExposureProfileACC08
+		},
+		"wrong port":           func(plan *domain.Plan) { plan.ExposureControls.Ports[0].Number = 22 },
+		"wrong authentication": func(plan *domain.Plan) { plan.ExposureControls.Authentication = domain.ExposureAuthIAP },
+		"weak TLS":             func(plan *domain.Plan) { plan.ExposureControls.TLS.Trust = domain.ExposureTrustPrivate },
+		"no audit":             func(plan *domain.Plan) { plan.ExposureControls.AuditLogging = false },
+		"wrong revocation":     func(plan *domain.Plan) { plan.ExposureControls.RevocationWorkflowID = "WF-ACC-03" },
+		"failed simulation":    func(plan *domain.Plan) { plan.Preconditions[0].OK = false },
 		"both lifetime fields": func(plan *domain.Plan) {
 			expiresAt := plan.CreatedAt.Add(time.Hour)
 			plan.ExposureControls.ExpiresAt = &expiresAt
@@ -997,10 +1140,11 @@ func TestPlanRecoveryAssetJSONRequiresEveryNestedMember(t *testing.T) {
 	}
 	rollback := root["rollback"].(map[string]any)
 	asset := rollback["assets"].([]any)[0].(map[string]any)
-	for _, field := range []string{"kind", "resource", "evidenceRef", "verifiedAt"} {
+	for _, field := range []string{"kind", "resource", "protects", "evidenceRef", "verifiedAt"} {
 		assertPlanFieldOmissionRejected(t, root, asset, field)
 	}
 	assertPlanFieldOmissionRejected(t, root, asset["resource"].(map[string]any), "fingerprint")
+	assertPlanFieldOmissionRejected(t, root, asset["protects"].([]any)[0].(map[string]any), "fingerprint")
 
 	plan := validPlan()
 	restoreTo := plan.CreatedAt
@@ -1010,6 +1154,7 @@ func TestPlanRecoveryAssetJSONRequiresEveryNestedMember(t *testing.T) {
 			Kind: "pbm-recovery-point", Scope: "projects/ctrldb-prod-123/global",
 			Name: "pbm-point", Fingerprint: "generation-12",
 		},
+		Protects:    append([]domain.PlanResource(nil), plan.Resources...),
 		EvidenceRef: "evidence/production/pbm-point.json",
 		VerifiedAt:  plan.CreatedAt.Add(-time.Minute), RestoreTo: &restoreTo,
 	}
@@ -1131,6 +1276,14 @@ func validPlan() domain.Plan {
 						Scope:       "projects/ctrldb-prod-123/global",
 						Name:        "example-snapshot",
 						Fingerprint: "generation-11",
+					},
+					Protects: []domain.PlanResource{
+						{
+							Kind:        "instance",
+							Scope:       "projects/ctrldb-prod-123/zones/us-central1-a",
+							Name:        "example-instance",
+							Fingerprint: "generation-7",
+						},
 					},
 					EvidenceRef: "evidence/production/example-snapshot.json",
 					VerifiedAt:  createdAt.Add(-30 * time.Minute),

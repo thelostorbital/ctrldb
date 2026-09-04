@@ -128,6 +128,13 @@ func TestExecutionGateRequiresTrustedRiskAndExactPermissions(t *testing.T) {
 				plan.PointOfNoReturnTrigger = domain.PointOfNoReturnMutationObserved
 			},
 		},
+		{
+			name: "untrusted command summary",
+			kind: policy.BlockerContract,
+			mutate: func(plan *domain.Plan) {
+				plan.Steps[0].CommandRedacted = redact.Sanitize("a different reviewed action")
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -207,7 +214,8 @@ func TestExecutionGateRequiresTrustedRecoveryAssetEvidence(t *testing.T) {
 		plan.WorkflowID, plan.Rollback.Boundary, plan.PointOfNoReturn, plan.PointOfNoReturnTrigger,
 		[]workflow.StepDefinition{{
 			ID: plan.Steps[0].ID, Executor: plan.Steps[0].Executor,
-			ExecutingIdentity: plan.Steps[0].ExecutingIdentity, Effect: domain.StepEffectMutation,
+			ExecutingIdentity: plan.Steps[0].ExecutingIdentity, CommandSummary: plan.Steps[0].CommandRedacted,
+			Effect:          domain.StepEffectMutation,
 			MinimumApproval: domain.ApprovalDestructive, TargetKinds: []string{"disk"},
 			RequiredPermissions: []string{"compute.disks.delete"}, RequiresStepUp: true,
 			RequiresRecoveryAsset: true, Idempotent: plan.Steps[0].Idempotent, Retry: plan.Steps[0].Retry,
@@ -238,6 +246,172 @@ func TestExecutionGateRequiresTrustedRecoveryAssetEvidence(t *testing.T) {
 	expectBlockedKind(t, policy.ValidatePlanForExecution(
 		withoutAsset, validExecutionEvidence(withoutAsset, checkedAt), definition.ExecutionContract(),
 	), policy.BlockerRecovery)
+}
+
+func TestExecutionGateRequiresRecoveryCoverageForEveryTrustedTarget(t *testing.T) {
+	t.Parallel()
+
+	plan, _ := ap4ExecutionPlan(t, "delete-disk", "disk", "compute.disks.delete", true)
+	second := plan.Resources[0]
+	second.Name = "second-disk"
+	second.Fingerprint = "generation-8"
+	plan.Resources = append(plan.Resources, second)
+	plan.Steps[0].Targets = append(plan.Steps[0].Targets, second)
+	permission := plan.Permissions[0]
+	permission.Resource = second
+	plan.Permissions = append(plan.Permissions, permission)
+	plan, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+	contract := executionContractForPlan(t, plan, domain.ApprovalDestructive, true, true)
+	checkedAt := plan.CreatedAt.Add(10 * time.Minute)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		plan, validExecutionEvidence(plan, checkedAt), contract,
+	), policy.BlockerContract)
+
+	plan.Rollback.Assets[0].Protects = append(plan.Rollback.Assets[0].Protects, second)
+	plan, err = policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan(covered) returned an error: %v", err)
+	}
+	if err := policy.ValidatePlanForExecution(
+		plan, validExecutionEvidence(plan, checkedAt), contract,
+	); err != nil {
+		t.Fatalf("ValidatePlanForExecution(covered) returned an error: %v", err)
+	}
+}
+
+func TestExecutionGateBindsTrustedExposureRequirement(t *testing.T) {
+	t.Parallel()
+
+	plan := validPlan()
+	plan.ApprovalClass = domain.ApprovalSecuritySensitive
+	plan.Exposure = domain.ExposureExternal
+	plan.ExposureControls = validExposureControls(plan)
+	plan, err := policy.SealPlan(plan)
+	if err != nil {
+		t.Fatalf("SealPlan() returned an error: %v", err)
+	}
+	contract := executionContractForPlan(t, plan, domain.ApprovalSecuritySensitive, false, false)
+	checkedAt := plan.CreatedAt.Add(10 * time.Minute)
+	if err := policy.ValidatePlanForExecution(plan, validExecutionEvidence(plan, checkedAt), contract); err != nil {
+		t.Fatalf("ValidatePlanForExecution() returned an error: %v", err)
+	}
+
+	withoutTrustedRequirement := plan
+	withoutTrustedRequirement.Exposure = domain.ExposureNone
+	withoutTrustedRequirement.ExposureControls = nil
+	withoutTrustedRequirement, err = policy.SealPlan(withoutTrustedRequirement)
+	if err != nil {
+		t.Fatalf("SealPlan(no exposure) returned an error: %v", err)
+	}
+	contractWithoutExposure := executionContractForPlan(
+		t, withoutTrustedRequirement, domain.ApprovalSecuritySensitive, false, false,
+	)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		plan, validExecutionEvidence(plan, checkedAt), contractWithoutExposure,
+	), policy.BlockerContract)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		withoutTrustedRequirement, validExecutionEvidence(withoutTrustedRequirement, checkedAt), contract,
+	), policy.BlockerContract)
+
+	wrongProfile := plan
+	wrongProfile.ExposureControls = cloneExposureControls(plan.ExposureControls)
+	wrongProfile.ExposureControls.Profile = domain.ExposureProfileACC07
+	wrongProfile, err = policy.SealPlan(wrongProfile)
+	if err != nil {
+		t.Fatalf("SealPlan(wrong profile) returned an error: %v", err)
+	}
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		wrongProfile, validExecutionEvidence(wrongProfile, checkedAt), contract,
+	), policy.BlockerContract)
+
+	wrongSimulation := plan
+	wrongSimulation.ExposureControls = cloneExposureControls(plan.ExposureControls)
+	wrongSimulation.Preconditions = append(wrongSimulation.Preconditions, domain.PlanPrecondition{
+		ID: "alternate-simulation", OK: true, Detail: redact.Sanitize("passed"),
+	})
+	wrongSimulation.ExposureControls.SimulationPreconditionID = "alternate-simulation"
+	wrongSimulation, err = policy.SealPlan(wrongSimulation)
+	if err != nil {
+		t.Fatalf("SealPlan(wrong simulation) returned an error: %v", err)
+	}
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		wrongSimulation, validExecutionEvidence(wrongSimulation, checkedAt), contract,
+	), policy.BlockerContract)
+
+	wrongTarget := plan
+	wrongTarget.ExposureControls = cloneExposureControls(plan.ExposureControls)
+	second := plan.Resources[0]
+	second.Name = "second-instance"
+	second.Fingerprint = "generation-8"
+	wrongTarget.Resources = append(wrongTarget.Resources, second)
+	wrongTarget.Steps[0].Targets = append(wrongTarget.Steps[0].Targets, second)
+	permission := wrongTarget.Permissions[0]
+	permission.Resource = second
+	wrongTarget.Permissions = append(wrongTarget.Permissions, permission)
+	wrongTarget.ExposureControls.Targets = []domain.PlanResource{second}
+	wrongTarget, err = policy.SealPlan(wrongTarget)
+	if err != nil {
+		t.Fatalf("SealPlan(wrong target) returned an error: %v", err)
+	}
+	wrongTargetContract := executionContractForPlan(
+		t, wrongTarget, domain.ApprovalSecuritySensitive, false, false,
+	)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		wrongTarget, validExecutionEvidence(wrongTarget, checkedAt), wrongTargetContract,
+	), policy.BlockerContract)
+}
+
+func TestExecutionGateRevalidatesExposureLifetime(t *testing.T) {
+	t.Parallel()
+
+	expiryPlan := validPlan()
+	expiryPlan.ApprovalClass = domain.ApprovalSecuritySensitive
+	expiryPlan.ExpiresAt = expiryPlan.CreatedAt.Add(4 * time.Hour)
+	expiryPlan.Exposure = domain.ExposureExternal
+	expiryPlan.ExposureControls = validExposureControls(expiryPlan)
+	expiryPlan.ExposureControls.ReviewAt = nil
+	expiresAt := expiryPlan.CreatedAt.Add(2 * time.Hour)
+	expiryPlan.ExposureControls.ExpiresAt = &expiresAt
+	expiryPlan, err := policy.SealPlan(expiryPlan)
+	if err != nil {
+		t.Fatalf("SealPlan(expiry) returned an error: %v", err)
+	}
+	expiryContract := executionContractForPlan(t, expiryPlan, domain.ApprovalSecuritySensitive, false, false)
+	justBefore := expiresAt.Add(-time.Nanosecond)
+	if err := policy.ValidatePlanForExecution(
+		expiryPlan, validExecutionEvidence(expiryPlan, justBefore), expiryContract,
+	); err != nil {
+		t.Fatalf("ValidatePlanForExecution(before expiry) returned an error: %v", err)
+	}
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		expiryPlan, validExecutionEvidence(expiryPlan, expiresAt), expiryContract,
+	), policy.BlockerExposure)
+
+	reviewPlan := validPlan()
+	reviewPlan.ApprovalClass = domain.ApprovalSecuritySensitive
+	reviewPlan.ExpiresAt = reviewPlan.CreatedAt.Add(72 * time.Hour)
+	reviewPlan.Exposure = domain.ExposureExternal
+	reviewPlan.ExposureControls = validExposureControls(reviewPlan)
+	reviewAt := reviewPlan.CreatedAt.Add(24 * time.Hour)
+	reviewPlan.ExposureControls.ReviewAt = &reviewAt
+	reviewPlan, err = policy.SealPlan(reviewPlan)
+	if err != nil {
+		t.Fatalf("SealPlan(review) returned an error: %v", err)
+	}
+	reviewContract := executionContractForPlan(t, reviewPlan, domain.ApprovalSecuritySensitive, false, false)
+	sameUTCDate := time.Date(reviewAt.Year(), reviewAt.Month(), reviewAt.Day(), 23, 59, 59, 0, time.UTC)
+	if err := policy.ValidatePlanForExecution(
+		reviewPlan, validExecutionEvidence(reviewPlan, sameUTCDate), reviewContract,
+	); err != nil {
+		t.Fatalf("ValidatePlanForExecution(on review date) returned an error: %v", err)
+	}
+	nextUTCDate := sameUTCDate.Add(time.Second)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		reviewPlan, validExecutionEvidence(reviewPlan, nextUTCDate), reviewContract,
+	), policy.BlockerExposure)
 }
 
 func TestExecutionGateRejectsMissingStaleOrMismatchedEvidence(t *testing.T) {
@@ -673,6 +847,7 @@ func validExecutionContract(t *testing.T) domain.ExecutionContract {
 				ID:                  "stop-instance",
 				Executor:            "gcloud",
 				ExecutingIdentity:   domain.IdentityOperator,
+				CommandSummary:      redact.Sanitize("gcloud compute instances stop example"),
 				Effect:              domain.StepEffectMutation,
 				MinimumApproval:     domain.ApprovalProtected,
 				TargetKinds:         []string{"instance"},
@@ -705,14 +880,24 @@ func executionContractForPlan(
 ) domain.ExecutionContract {
 	t.Helper()
 	step := plan.Steps[0]
+	var exposureRequirement *domain.ExecutionExposureRequirement
+	if plan.Exposure != domain.ExposureNone && plan.ExposureControls != nil {
+		exposureRequirement = &domain.ExecutionExposureRequirement{
+			Delta: plan.Exposure, Profile: plan.ExposureControls.Profile,
+			InternetWide:             plan.ExposureControls.InternetWide,
+			SimulationPreconditionID: plan.ExposureControls.SimulationPreconditionID,
+		}
+	}
 	definition, err := workflow.NewDefinition(
 		plan.WorkflowID, plan.Rollback.Boundary, plan.PointOfNoReturn, plan.PointOfNoReturnTrigger,
 		[]workflow.StepDefinition{{
 			ID: step.ID, Executor: step.Executor, ExecutingIdentity: step.ExecutingIdentity,
-			Effect: domain.StepEffectMutation, MinimumApproval: minimumApproval,
+			CommandSummary: step.CommandRedacted,
+			Effect:         domain.StepEffectMutation, MinimumApproval: minimumApproval,
 			TargetKinds: []string{step.Targets[0].Kind}, RequiredPermissions: []string{plan.Permissions[0].Permission},
 			RequiresStepUp: requiresStepUp, RequiresRecoveryAsset: requiresRecovery,
-			Idempotent: step.Idempotent, Retry: step.Retry, CancelSafe: step.CancelSafe,
+			ExposureRequirement: exposureRequirement,
+			Idempotent:          step.Idempotent, Retry: step.Retry, CancelSafe: step.CancelSafe,
 			TimeoutSeconds: step.TimeoutSeconds, SuccessCondition: step.SuccessCondition,
 			FailureBehavior: step.FailureBehavior,
 		}},
@@ -722,6 +907,18 @@ func executionContractForPlan(
 	}
 
 	return definition.ExecutionContract()
+}
+
+func cloneExposureControls(controls *domain.PlanExposureControls) *domain.PlanExposureControls {
+	if controls == nil {
+		return nil
+	}
+	cloned := *controls
+	cloned.Targets = append([]domain.PlanResource(nil), controls.Targets...)
+	cloned.Sources = append([]domain.PlanExposureSource(nil), controls.Sources...)
+	cloned.Ports = append([]domain.PlanExposurePort(nil), controls.Ports...)
+
+	return &cloned
 }
 
 func ap4ExecutionPlan(
@@ -739,6 +936,7 @@ func ap4ExecutionPlan(
 	plan.Steps[0].Executor = "compute-api"
 	plan.Steps[0].CommandRedacted = redact.Sanitize("execute reviewed resource operation")
 	plan.Steps[0].Targets[0] = plan.Resources[0]
+	plan.Rollback.Assets[0].Protects = []domain.PlanResource{plan.Resources[0]}
 	plan.Permissions[0].StepID = stepID
 	plan.Permissions[0].Permission = permission
 	plan.Permissions[0].Resource = plan.Resources[0]
@@ -755,6 +953,7 @@ func ap4ExecutionPlan(
 				ID:                  stepID,
 				Executor:            plan.Steps[0].Executor,
 				ExecutingIdentity:   plan.Steps[0].ExecutingIdentity,
+				CommandSummary:      plan.Steps[0].CommandRedacted,
 				Effect:              domain.StepEffectMutation,
 				MinimumApproval:     domain.ApprovalDestructive,
 				TargetKinds:         []string{kind},

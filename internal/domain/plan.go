@@ -151,12 +151,14 @@ type ExecutionStepContract struct {
 	ID                    string
 	Executor              string
 	ExecutingIdentity     ExecutionIdentity
+	CommandSummary        redact.Text
 	Effect                StepEffect
 	MinimumApproval       ApprovalClass
 	TargetKinds           []string
 	RequiredPermissions   []string
 	RequiresStepUp        bool
 	RequiresRecoveryAsset bool
+	ExposureRequirement   *ExecutionExposureRequirement
 	Idempotent            bool
 	Retry                 RetryPolicy
 	CancelSafe            bool
@@ -189,11 +191,12 @@ func NewExecutionContract(
 	seen := make(map[string]struct{}, len(steps))
 	cloned := make([]ExecutionStepContract, len(steps))
 	rollbackRequired := false
+	var exposureRequirement *ExecutionExposureRequirement
 	for index, step := range steps {
 		if !executionIdentifierPattern.MatchString(step.ID) || !executionIdentifierPattern.MatchString(step.Executor) ||
 			!step.ExecutingIdentity.Valid() || !step.Effect.Valid() || !step.MinimumApproval.Valid() ||
 			!step.Retry.Valid() || step.TimeoutSeconds <= 0 || step.TimeoutSeconds > MaxStepTimeoutSeconds ||
-			step.SuccessCondition.String() == "" || !step.FailureBehavior.Valid() {
+			step.CommandSummary.String() == "" || step.SuccessCondition.String() == "" || !step.FailureBehavior.Valid() {
 			return ExecutionContract{}, fmt.Errorf("%w: invalid step %d", ErrInvalidExecutionContract, index)
 		}
 		if step.Effect == StepEffectMutation && step.MinimumApproval == ApprovalRead {
@@ -210,6 +213,16 @@ func NewExecutionContract(
 		if step.Effect == StepEffectMutation && step.MinimumApproval == ApprovalDataDestructive &&
 			!step.RequiresRecoveryAsset {
 			return ExecutionContract{}, fmt.Errorf("%w: AP-5 mutation step requires recovery assets", ErrInvalidExecutionContract)
+		}
+		if err := validateExecutionExposureRequirement(step); err != nil {
+			return ExecutionContract{}, err
+		}
+		if step.ExposureRequirement != nil {
+			if exposureRequirement != nil && *exposureRequirement != *step.ExposureRequirement {
+				return ExecutionContract{}, fmt.Errorf("%w: inconsistent exposure requirements", ErrInvalidExecutionContract)
+			}
+			requirement := *step.ExposureRequirement
+			exposureRequirement = &requirement
 		}
 		if _, duplicate := seen[step.ID]; duplicate {
 			return ExecutionContract{}, fmt.Errorf("%w: duplicate step", ErrInvalidExecutionContract)
@@ -292,8 +305,42 @@ func (contract ExecutionContract) Steps() []ExecutionStepContract {
 func cloneExecutionStepContract(step ExecutionStepContract) ExecutionStepContract {
 	step.TargetKinds = append([]string(nil), step.TargetKinds...)
 	step.RequiredPermissions = append([]string(nil), step.RequiredPermissions...)
+	if step.ExposureRequirement != nil {
+		requirement := *step.ExposureRequirement
+		step.ExposureRequirement = &requirement
+	}
 
 	return step
+}
+
+// ExecutionExposureRequirement is the immutable, resource-independent access
+// classification required by an exposure-capable step.
+type ExecutionExposureRequirement struct {
+	Delta                    ExposureDelta
+	Profile                  ExposureProfile
+	InternetWide             bool
+	SimulationPreconditionID string
+}
+
+func validateExecutionExposureRequirement(step ExecutionStepContract) error {
+	requirement := step.ExposureRequirement
+	if requirement == nil {
+		return nil
+	}
+	if step.Effect != StepEffectMutation || step.MinimumApproval < ApprovalSecuritySensitive ||
+		!requirement.Delta.Valid() || requirement.Delta == ExposureNone || !requirement.Profile.Valid() ||
+		!executionIdentifierPattern.MatchString(requirement.SimulationPreconditionID) {
+		return fmt.Errorf("%w: invalid exposure requirement", ErrInvalidExecutionContract)
+	}
+	if requirement.InternetWide && (requirement.Delta != ExposureExternal ||
+		requirement.Profile != ExposureProfileACC08 || step.MinimumApproval != ApprovalDataDestructive) {
+		return fmt.Errorf("%w: internet-wide exposure requires external ACC-08 AP-5", ErrInvalidExecutionContract)
+	}
+	if !requirement.InternetWide && requirement.Profile == ExposureProfileACC08 {
+		return fmt.Errorf("%w: ACC-08 is reserved for internet-wide exposure", ErrInvalidExecutionContract)
+	}
+
+	return nil
 }
 
 func validateContractStrings(values []string, pattern *regexp.Regexp) error {
@@ -399,6 +446,7 @@ func (kind RecoveryAssetKind) Valid() bool {
 type PlanRecoveryAsset struct {
 	Kind        RecoveryAssetKind `json:"kind"`
 	Resource    PlanResource      `json:"resource"`
+	Protects    []PlanResource    `json:"protects"`
 	EvidenceRef string            `json:"evidenceRef"`
 	VerifiedAt  time.Time         `json:"verifiedAt"`
 	RestoreTo   *time.Time        `json:"restoreTo,omitempty"`

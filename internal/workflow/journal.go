@@ -39,7 +39,7 @@ var (
 	journalJSONScalar = &journalJSONSchema{}
 	journalJSONRoot   = journalJSONObject(map[string]*journalJSONSchema{
 		"schema": journalJSONScalar, "operationId": journalJSONScalar, "planId": journalJSONScalar,
-		"sequence": journalJSONScalar, "kind": journalJSONScalar, "recordedAt": journalJSONScalar,
+		"contractHash": journalJSONScalar, "sequence": journalJSONScalar, "kind": journalJSONScalar, "recordedAt": journalJSONScalar,
 		"operationState": journalJSONScalar,
 		"step": journalJSONObject(map[string]*journalJSONSchema{
 			"id": journalJSONScalar, "outcome": journalJSONScalar, "executingIdentity": journalJSONScalar,
@@ -89,7 +89,7 @@ func DecodeJournalEntry(encoded []byte) (domain.JournalEntry, error) {
 
 	var entry domain.JournalEntry
 	if err := decoder.Decode(&entry); err != nil {
-		return domain.JournalEntry{}, journalEntryError("decode", err.Error())
+		return domain.JournalEntry{}, journalEntryError("decode", "contains an invalid typed value")
 	}
 
 	var trailing any
@@ -102,6 +102,10 @@ func DecodeJournalEntry(encoded []byte) (domain.JournalEntry, error) {
 
 	if err := ValidateJournalEntry(entry); err != nil {
 		return domain.JournalEntry{}, err
+	}
+	canonical, err := json.Marshal(entry)
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		return domain.JournalEntry{}, journalEntryError("decode", "must use canonical JournalEntryV1 JSON")
 	}
 
 	return entry, nil
@@ -122,7 +126,7 @@ func rejectDuplicateJournalJSONKeys(encoded []byte) error {
 func consumeUniqueJournalJSONValue(decoder *json.Decoder, schema *journalJSONSchema) error {
 	token, err := decoder.Token()
 	if err != nil {
-		return journalEntryError("decode", err.Error())
+		return journalEntryError("decode", "contains malformed JSON")
 	}
 	if token == nil {
 		return journalEntryError("decode", "null is not allowed at this schema position")
@@ -144,7 +148,7 @@ func consumeUniqueJournalJSONValue(decoder *json.Decoder, schema *journalJSONSch
 		for decoder.More() {
 			keyToken, err := decoder.Token()
 			if err != nil {
-				return journalEntryError("decode", err.Error())
+				return journalEntryError("decode", "contains malformed JSON")
 			}
 			key, ok := keyToken.(string)
 			if !ok {
@@ -163,7 +167,7 @@ func consumeUniqueJournalJSONValue(decoder *json.Decoder, schema *journalJSONSch
 			}
 		}
 		if _, err := decoder.Token(); err != nil {
-			return journalEntryError("decode", err.Error())
+			return journalEntryError("decode", "contains malformed JSON")
 		}
 	case '[':
 		return journalEntryError("decode", "array is not allowed at this schema position")
@@ -183,7 +187,7 @@ func validateRequiredJournalJSON(encoded []byte, entry domain.JournalEntry) erro
 
 	var document map[string]json.RawMessage
 	if err := json.Unmarshal(encoded, &document); err != nil {
-		return journalEntryError("decode", err.Error())
+		return journalEntryError("decode", "contains malformed JSON")
 	}
 	if entry.OperationState == domain.OperationPaused && entry.Pause != nil {
 		var pause map[string]json.RawMessage
@@ -237,6 +241,9 @@ func ValidateJournalEntry(entry domain.JournalEntry) error {
 	if !journalPlanIDPattern.MatchString(entry.PlanID) {
 		return journalEntryError("planId", "must match plan-<16 lowercase hex>")
 	}
+	if !contractDigestPattern.MatchString(entry.ContractHash) {
+		return journalEntryError("contractHash", "must be a contract digest")
+	}
 	if entry.Sequence == 0 {
 		return journalEntryError("sequence", "must start at 1")
 	}
@@ -288,7 +295,7 @@ func ValidateJournalEntry(entry domain.JournalEntry) error {
 		if entry.Cancellation == nil {
 			return journalEntryError("cancellation", "is required for a cancellation request")
 		}
-		if err := validateJournalCancellation(*entry.Cancellation, entry.RecordedAt); err != nil {
+		if err := validateJournalCancellation(*entry.Cancellation, entry.RecordedAt, entry.ContractHash); err != nil {
 			return err
 		}
 	}
@@ -306,6 +313,7 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 
 	operationID := entries[0].OperationID
 	planID := entries[0].PlanID
+	contractHash := entries[0].ContractHash
 	var machine *Machine
 	var previousTime time.Time
 	attempts := make(map[string]uint32)
@@ -324,8 +332,8 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 		if entry.Sequence != uint64(index+1) {
 			return journalStreamError(index+1, "sequence must be contiguous and start at 1")
 		}
-		if entry.OperationID != operationID || entry.PlanID != planID {
-			return journalStreamError(index+1, "operationId and planId must remain constant")
+		if entry.OperationID != operationID || entry.PlanID != planID || entry.ContractHash != contractHash {
+			return journalStreamError(index+1, "operationId, planId, and contractHash must remain constant")
 		}
 		priorTime := previousTime
 		if !priorTime.IsZero() && entry.RecordedAt.Before(priorTime) {
@@ -499,7 +507,11 @@ func JournalObjectName(entry domain.JournalEntry) (string, error) {
 	return fmt.Sprintf("%020d-%s.json", entry.Sequence, entryID), nil
 }
 
-func validateJournalCancellation(request domain.JournalCancellationRequest, recordedAt time.Time) error {
+func validateJournalCancellation(
+	request domain.JournalCancellationRequest,
+	recordedAt time.Time,
+	contractHash string,
+) error {
 	if err := validateJournalTime("cancellation.requestedAt", request.RequestedAt); err != nil {
 		return err
 	}
@@ -511,6 +523,9 @@ func validateJournalCancellation(request domain.JournalCancellationRequest, reco
 	}
 	if !contractDigestPattern.MatchString(request.ExecutionContractHash) {
 		return journalEntryError("cancellation.executionContractHash", "must be a contract digest")
+	}
+	if request.ExecutionContractHash != contractHash {
+		return journalEntryError("cancellation.executionContractHash", "must match the journal contract")
 	}
 	if !request.MutationObservation.Valid() {
 		return journalEntryError("cancellation.mutationObservation", "unknown value")

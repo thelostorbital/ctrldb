@@ -102,6 +102,7 @@ type JournalEntry struct {
 	Schema         string                      `json:"schema"`
 	OperationID    string                      `json:"operationId"`
 	PlanID         string                      `json:"planId"`
+	ContractHash   string                      `json:"contractHash"`
 	Sequence       uint64                      `json:"sequence"`
 	Kind           JournalEntryKind            `json:"kind"`
 	RecordedAt     time.Time                   `json:"recordedAt"`

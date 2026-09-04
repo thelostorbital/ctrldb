@@ -22,6 +22,9 @@ func TestWorkflowDefinitionsRequireBoundedExecutionContracts_TEST_U_PLAN_04(t *t
 		{name: "missing id", mutate: func(step *workflow.StepDefinition) { step.ID = "" }},
 		{name: "missing executor", mutate: func(step *workflow.StepDefinition) { step.Executor = "" }},
 		{name: "missing identity", mutate: func(step *workflow.StepDefinition) { step.ExecutingIdentity = "" }},
+		{name: "missing command summary", mutate: func(step *workflow.StepDefinition) {
+			step.CommandSummary = redact.Sanitize("")
+		}},
 		{name: "missing effect", mutate: func(step *workflow.StepDefinition) { step.Effect = "" }},
 		{name: "mutation with read approval", mutate: func(step *workflow.StepDefinition) { step.MinimumApproval = domain.ApprovalRead }},
 		{name: "missing target kinds", mutate: func(step *workflow.StepDefinition) { step.TargetKinds = nil }},
@@ -68,6 +71,91 @@ func TestWorkflowDefinitionsRequireBoundedExecutionContracts_TEST_U_PLAN_04(t *t
 				t.Fatalf("NewDefinition() error = %v, want ErrInvalidDefinition", err)
 			}
 		})
+	}
+}
+
+func TestWorkflowDefinitionRequiresCoherentTrustedExposureRequirement(t *testing.T) {
+	t.Parallel()
+
+	validRequirement := domain.ExecutionExposureRequirement{
+		Delta: domain.ExposureExternal, Profile: domain.ExposureProfileACC06,
+		SimulationPreconditionID: "access-simulation",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*workflow.StepDefinition)
+	}{
+		{name: "read effect", mutate: func(step *workflow.StepDefinition) {
+			step.Effect = domain.StepEffectRead
+			step.MinimumApproval = domain.ApprovalSecuritySensitive
+			requirement := validRequirement
+			step.ExposureRequirement = &requirement
+		}},
+		{name: "below AP-3", mutate: func(step *workflow.StepDefinition) {
+			requirement := validRequirement
+			step.ExposureRequirement = &requirement
+		}},
+		{name: "no exposure delta", mutate: func(step *workflow.StepDefinition) {
+			step.MinimumApproval = domain.ApprovalSecuritySensitive
+			requirement := validRequirement
+			requirement.Delta = domain.ExposureNone
+			step.ExposureRequirement = &requirement
+		}},
+		{name: "invalid profile", mutate: func(step *workflow.StepDefinition) {
+			step.MinimumApproval = domain.ApprovalSecuritySensitive
+			requirement := validRequirement
+			requirement.Profile = "ACC-99"
+			step.ExposureRequirement = &requirement
+		}},
+		{name: "invalid simulation", mutate: func(step *workflow.StepDefinition) {
+			step.MinimumApproval = domain.ApprovalSecuritySensitive
+			requirement := validRequirement
+			requirement.SimulationPreconditionID = "unsafe/id"
+			step.ExposureRequirement = &requirement
+		}},
+		{name: "internet-wide below AP-5", mutate: func(step *workflow.StepDefinition) {
+			step.MinimumApproval = domain.ApprovalSecuritySensitive
+			requirement := validRequirement
+			requirement.Profile = domain.ExposureProfileACC08
+			requirement.InternetWide = true
+			step.ExposureRequirement = &requirement
+		}},
+		{name: "ACC-08 without internet-wide", mutate: func(step *workflow.StepDefinition) {
+			step.MinimumApproval = domain.ApprovalDataDestructive
+			step.RequiresRecoveryAsset = true
+			requirement := validRequirement
+			requirement.Profile = domain.ExposureProfileACC08
+			step.ExposureRequirement = &requirement
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			step := validDefinitionStep()
+			test.mutate(&step)
+			if _, err := workflow.NewDefinition(
+				"WF-ACC-06", "before-access-change", step.ID,
+				domain.PointOfNoReturnStepComplete, []workflow.StepDefinition{step},
+			); !errors.Is(err, workflow.ErrInvalidDefinition) {
+				t.Fatalf("NewDefinition() error = %v, want ErrInvalidDefinition", err)
+			}
+		})
+	}
+
+	step := validDefinitionStep()
+	step.MinimumApproval = domain.ApprovalSecuritySensitive
+	step.ExposureRequirement = &validRequirement
+	definition, err := workflow.NewDefinition(
+		"WF-ACC-06", "before-access-change", step.ID,
+		domain.PointOfNoReturnStepComplete, []workflow.StepDefinition{step},
+	)
+	if err != nil {
+		t.Fatalf("NewDefinition(valid exposure) returned an error: %v", err)
+	}
+	validRequirement.Profile = domain.ExposureProfileACC07
+	if got := definition.ExecutionContract().Steps()[0].ExposureRequirement.Profile; got != domain.ExposureProfileACC06 {
+		t.Fatalf("execution contract aliased exposure requirement: %s", got)
 	}
 }
 
@@ -144,6 +232,26 @@ func TestExecutionContractDigestBindsRollbackPointAndSteps(t *testing.T) {
 		"step": func() (workflow.Definition, error) {
 			changed := step
 			changed.TimeoutSeconds++
+			return workflow.NewDefinition(
+				"WF-VM-02", "before-old-instance-delete", changed.ID,
+				domain.PointOfNoReturnStepComplete, []workflow.StepDefinition{changed},
+			)
+		},
+		"command summary": func() (workflow.Definition, error) {
+			changed := step
+			changed.CommandSummary = redact.Sanitize("different trusted command")
+			return workflow.NewDefinition(
+				"WF-VM-02", "before-old-instance-delete", changed.ID,
+				domain.PointOfNoReturnStepComplete, []workflow.StepDefinition{changed},
+			)
+		},
+		"exposure requirement": func() (workflow.Definition, error) {
+			changed := step
+			changed.MinimumApproval = domain.ApprovalSecuritySensitive
+			changed.ExposureRequirement = &domain.ExecutionExposureRequirement{
+				Delta: domain.ExposureExternal, Profile: domain.ExposureProfileACC06,
+				SimulationPreconditionID: "access-simulation",
+			}
 			return workflow.NewDefinition(
 				"WF-VM-02", "before-old-instance-delete", changed.ID,
 				domain.PointOfNoReturnStepComplete, []workflow.StepDefinition{changed},
@@ -240,6 +348,7 @@ func validDefinitionStep() workflow.StepDefinition {
 		ID:                  "stop-instance",
 		Executor:            "compute-api",
 		ExecutingIdentity:   domain.IdentityOperator,
+		CommandSummary:      redact.Sanitize("stop the reviewed instance"),
 		Effect:              domain.StepEffectMutation,
 		MinimumApproval:     domain.ApprovalProtected,
 		TargetKinds:         []string{"instance"},

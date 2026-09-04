@@ -34,7 +34,41 @@ func TestJournalEntryEncodeDecodeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestJournalEntryDecodeResanitizesResult(t *testing.T) {
+func TestJournalEntryDecodeRequiresCanonicalBytes(t *testing.T) {
+	t.Parallel()
+
+	encoded := mustEncodeJournalEntry(t, validStepEntry())
+	if _, err := workflow.DecodeJournalEntry(append([]byte{'\n'}, encoded...)); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry(whitespace) error = %v, want ErrInvalidJournalEntry", err)
+	}
+	timeAlias := bytes.Replace(
+		encoded, []byte(`"recordedAt":"2026-09-03T12:00:03Z"`),
+		[]byte(`"recordedAt":"2026-09-03T12:00:03+00:00"`), 1,
+	)
+	if bytes.Equal(timeAlias, encoded) {
+		t.Fatal("time alias fixture did not change")
+	}
+	if _, err := workflow.DecodeJournalEntry(timeAlias); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry(time alias) error = %v, want ErrInvalidJournalEntry", err)
+	}
+
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatalf("json.Unmarshal() returned an error: %v", err)
+	}
+	reordered, err := json.Marshal(document)
+	if err != nil {
+		t.Fatalf("json.Marshal() returned an error: %v", err)
+	}
+	if bytes.Equal(encoded, reordered) {
+		t.Fatal("map encoding unexpectedly retained struct field order")
+	}
+	if _, err := workflow.DecodeJournalEntry(reordered); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry(reordered) error = %v, want ErrInvalidJournalEntry", err)
+	}
+}
+
+func TestJournalEntryDecodeRejectsNoncanonicalResultWithoutDisclosure(t *testing.T) {
 	t.Parallel()
 
 	encoded, err := workflow.EncodeJournalEntry(validStepEntry())
@@ -48,12 +82,29 @@ func TestJournalEntryDecodeResanitizesResult(t *testing.T) {
 		1,
 	)
 
-	decoded, err := workflow.DecodeJournalEntry(encoded)
-	if err != nil {
-		t.Fatalf("DecodeJournalEntry() returned an error: %v", err)
+	_, err = workflow.DecodeJournalEntry(encoded)
+	if !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry() error = %v, want ErrInvalidJournalEntry", err)
 	}
-	if got := decoded.Step.ResultSummary.String(); got != "password=[redacted]" {
-		t.Fatalf("result summary = %q, want redacted text", got)
+	if strings.Contains(err.Error(), "SECRET_MARKER") {
+		t.Fatalf("DecodeJournalEntry() disclosed hostile input: %v", err)
+	}
+}
+
+func TestJournalEntryDecodeDoesNotDiscloseHostileScalarValues(t *testing.T) {
+	t.Parallel()
+
+	encoded := mustEncodeJournalEntry(t, validStepEntry())
+	hostile := bytes.Replace(
+		encoded, []byte(`"recordedAt":"2026-09-03T12:00:03Z"`),
+		[]byte(`"recordedAt":"SECRET_MARKER_HOSTILE_TIME"`), 1,
+	)
+	_, err := workflow.DecodeJournalEntry(hostile)
+	if !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+		t.Fatalf("DecodeJournalEntry() error = %v, want ErrInvalidJournalEntry", err)
+	}
+	if strings.Contains(err.Error(), "SECRET_MARKER") {
+		t.Fatalf("DecodeJournalEntry() disclosed hostile scalar: %v", err)
 	}
 }
 
@@ -301,6 +352,7 @@ func TestJournalEntryValidationRejectsUnsafeValues(t *testing.T) {
 		{name: "schema", mutate: func(entry *domain.JournalEntry) { entry.Schema = "JournalEntryV2" }},
 		{name: "operation id", mutate: func(entry *domain.JournalEntry) { entry.OperationID = "operation-1" }},
 		{name: "plan id", mutate: func(entry *domain.JournalEntry) { entry.PlanID = "plan-production" }},
+		{name: "contract hash", mutate: func(entry *domain.JournalEntry) { entry.ContractHash = "" }},
 		{name: "sequence", mutate: func(entry *domain.JournalEntry) { entry.Sequence = 0 }},
 		{name: "kind", mutate: func(entry *domain.JournalEntry) { entry.Kind = "event" }},
 		{name: "recorded time", mutate: func(entry *domain.JournalEntry) { entry.RecordedAt = time.Time{} }},
@@ -464,6 +516,22 @@ func TestJournalValidatesCompleteHistory(t *testing.T) {
 	entries := validJournal()
 	if err := workflow.ValidateJournal(entries); err != nil {
 		t.Fatalf("ValidateJournal() returned an error: %v", err)
+	}
+}
+
+func TestJournalBindsContractHashFromTheFirstEntry(t *testing.T) {
+	t.Parallel()
+
+	entries := validJournal()
+	changed := append([]domain.JournalEntry(nil), entries...)
+	changed[0].ContractHash = strings.Repeat("b", 64)
+	if err := workflow.ValidateJournal(changed); !errors.Is(err, workflow.ErrInvalidJournalStream) {
+		t.Fatalf("ValidateJournal(first hash mismatch) error = %v, want ErrInvalidJournalStream", err)
+	}
+	changed = append([]domain.JournalEntry(nil), entries...)
+	changed[len(changed)-1].ContractHash = strings.Repeat("b", 64)
+	if err := workflow.ValidateJournal(changed); !errors.Is(err, workflow.ErrInvalidJournalStream) {
+		t.Fatalf("ValidateJournal(later hash mismatch) error = %v, want ErrInvalidJournalStream", err)
 	}
 }
 
@@ -723,6 +791,7 @@ func validTransitionEntry(sequence uint64, state domain.OperationState) domain.J
 		Schema:         domain.JournalSchemaV1,
 		OperationID:    "op-0123456789abcdef",
 		PlanID:         "plan-0123456789abcdef",
+		ContractHash:   strings.Repeat("a", 64),
 		Sequence:       sequence,
 		Kind:           domain.JournalEntryTransition,
 		RecordedAt:     time.Date(2026, 9, 3, 12, 0, int(sequence), 0, time.UTC),
@@ -738,6 +807,7 @@ func validStepEntry() domain.JournalEntry {
 		Schema:         domain.JournalSchemaV1,
 		OperationID:    "op-0123456789abcdef",
 		PlanID:         "plan-0123456789abcdef",
+		ContractHash:   strings.Repeat("a", 64),
 		Sequence:       6,
 		Kind:           domain.JournalEntryStep,
 		RecordedAt:     endedAt.Add(time.Second),
@@ -762,6 +832,7 @@ func validCancellationEntry() domain.JournalEntry {
 		Schema:         domain.JournalSchemaV1,
 		OperationID:    "op-0123456789abcdef",
 		PlanID:         "plan-0123456789abcdef",
+		ContractHash:   strings.Repeat("a", 64),
 		Sequence:       6,
 		Kind:           domain.JournalEntryCancellationRequest,
 		RecordedAt:     requestedAt,
@@ -783,6 +854,7 @@ func validPausedEntry() domain.JournalEntry {
 		Schema:         domain.JournalSchemaV1,
 		OperationID:    "op-0123456789abcdef",
 		PlanID:         "plan-0123456789abcdef",
+		ContractHash:   strings.Repeat("a", 64),
 		Sequence:       7,
 		Kind:           domain.JournalEntryTransition,
 		RecordedAt:     pausedAt,

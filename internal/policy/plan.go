@@ -19,6 +19,7 @@ import (
 	"unicode"
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
+	"github.com/thelostorbital/ctrldb/internal/redact"
 )
 
 var (
@@ -47,7 +48,12 @@ var (
 	serviceAccountPattern = regexp.MustCompile(
 		`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$`,
 	)
-	zeroPlanHash = strings.Repeat("0", sha256.Size*2)
+	zeroPlanHash    = strings.Repeat("0", sha256.Size*2)
+	rfc1918Networks = [...]netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("192.168.0.0/16"),
+	}
 )
 
 const (
@@ -69,7 +75,7 @@ var (
 		"kind": planJSONScalar, "scope": planJSONScalar, "name": planJSONScalar, "fingerprint": planJSONScalar,
 	})
 	planJSONRecoveryAsset = planJSONObject(map[string]*planJSONSchema{
-		"kind": planJSONScalar, "resource": planJSONResource, "evidenceRef": planJSONScalar,
+		"kind": planJSONScalar, "resource": planJSONResource, "protects": {element: planJSONResource}, "evidenceRef": planJSONScalar,
 		"verifiedAt": planJSONScalar, "restoreTo": planJSONScalar,
 	})
 	planJSONExposureSource = planJSONObject(map[string]*planJSONSchema{
@@ -157,6 +163,7 @@ func planJSONObject(fields map[string]*planJSONSchema) *planJSONSchema {
 // SealPlan structurally validates plan and returns a copy carrying the digest
 // of its complete reviewable contents. The input value is never modified.
 func SealPlan(plan domain.Plan) (domain.Plan, error) {
+	plan = normalizePlanCollections(plan)
 	plan.PlanHash = zeroPlanHash
 	if err := validatePlanStructure(plan); err != nil {
 		return domain.Plan{}, err
@@ -194,6 +201,7 @@ func SealPlanAt(plan domain.Plan, createdAt time.Time, planValidity time.Duratio
 // ComputePlanHash returns the digest SealPlan would assign without modifying
 // plan. Any existing PlanHash value is deliberately ignored.
 func ComputePlanHash(plan domain.Plan) (string, error) {
+	plan = normalizePlanCollections(plan)
 	plan.PlanHash = zeroPlanHash
 	if err := validatePlanStructure(plan); err != nil {
 		return "", err
@@ -245,6 +253,72 @@ func EncodePlan(plan domain.Plan) ([]byte, error) {
 	return encoded, nil
 }
 
+func normalizePlanCollections(plan domain.Plan) domain.Plan {
+	if plan.Resources == nil {
+		plan.Resources = []domain.PlanResource{}
+	}
+	if plan.Preconditions == nil {
+		plan.Preconditions = []domain.PlanPrecondition{}
+	}
+	if plan.Permissions == nil {
+		plan.Permissions = []domain.PlanPermission{}
+	}
+	if plan.Steps == nil {
+		plan.Steps = []domain.PlanStep{}
+	} else {
+		steps := make([]domain.PlanStep, len(plan.Steps))
+		copy(steps, plan.Steps)
+		plan.Steps = steps
+		for index := range plan.Steps {
+			if plan.Steps[index].Targets == nil {
+				plan.Steps[index].Targets = []domain.PlanResource{}
+			}
+		}
+	}
+	if plan.Cost.Items == nil {
+		plan.Cost.Items = []domain.PlanCostItem{}
+	}
+	if plan.Cost.Assumptions == nil {
+		plan.Cost.Assumptions = []redact.Text{}
+	}
+	if plan.Cost.Unpriced == nil {
+		plan.Cost.Unpriced = []string{}
+	}
+	if plan.Protection == nil {
+		plan.Protection = []redact.Text{}
+	}
+	if plan.Rollback.Assets == nil {
+		plan.Rollback.Assets = []domain.PlanRecoveryAsset{}
+	} else {
+		assets := make([]domain.PlanRecoveryAsset, len(plan.Rollback.Assets))
+		copy(assets, plan.Rollback.Assets)
+		plan.Rollback.Assets = assets
+		for index := range plan.Rollback.Assets {
+			if plan.Rollback.Assets[index].Protects == nil {
+				plan.Rollback.Assets[index].Protects = []domain.PlanResource{}
+			}
+		}
+	}
+	if plan.Verification == nil {
+		plan.Verification = []redact.Text{}
+	}
+	if plan.ExposureControls != nil {
+		controls := *plan.ExposureControls
+		if controls.Targets == nil {
+			controls.Targets = []domain.PlanResource{}
+		}
+		if controls.Sources == nil {
+			controls.Sources = []domain.PlanExposureSource{}
+		}
+		if controls.Ports == nil {
+			controls.Ports = []domain.PlanExposurePort{}
+		}
+		plan.ExposureControls = &controls
+	}
+
+	return plan
+}
+
 // DecodePlan rejects unknown fields and trailing values, then validates the
 // complete plan before returning it.
 func DecodePlan(encoded []byte) (domain.Plan, error) {
@@ -257,7 +331,7 @@ func DecodePlan(encoded []byte) (domain.Plan, error) {
 
 	var plan domain.Plan
 	if err := decoder.Decode(&plan); err != nil {
-		return domain.Plan{}, fmt.Errorf("%w: decode: %v", ErrInvalidPlan, err)
+		return domain.Plan{}, invalid("decode", "contains an invalid typed value")
 	}
 
 	var trailing any
@@ -270,6 +344,10 @@ func DecodePlan(encoded []byte) (domain.Plan, error) {
 
 	if err := ValidatePlan(plan); err != nil {
 		return domain.Plan{}, err
+	}
+	canonical, err := json.Marshal(plan)
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		return domain.Plan{}, invalid("decode", "must use canonical PlanV1 JSON")
 	}
 
 	return plan, nil
@@ -290,7 +368,7 @@ func rejectDuplicateJSONKeys(encoded []byte) error {
 func consumeUniqueJSONValue(decoder *json.Decoder, schema *planJSONSchema) error {
 	token, err := decoder.Token()
 	if err != nil {
-		return invalid("decode", err.Error())
+		return invalid("decode", "contains malformed JSON")
 	}
 	if token == nil {
 		return invalid("decode", "null is not allowed at this schema position")
@@ -312,7 +390,7 @@ func consumeUniqueJSONValue(decoder *json.Decoder, schema *planJSONSchema) error
 		for decoder.More() {
 			keyToken, err := decoder.Token()
 			if err != nil {
-				return invalid("decode", err.Error())
+				return invalid("decode", "contains malformed JSON")
 			}
 			key, ok := keyToken.(string)
 			if !ok {
@@ -331,7 +409,7 @@ func consumeUniqueJSONValue(decoder *json.Decoder, schema *planJSONSchema) error
 			}
 		}
 		if _, err := decoder.Token(); err != nil {
-			return invalid("decode", err.Error())
+			return invalid("decode", "contains malformed JSON")
 		}
 	case '[':
 		if schema == nil || schema.element == nil {
@@ -343,7 +421,7 @@ func consumeUniqueJSONValue(decoder *json.Decoder, schema *planJSONSchema) error
 			}
 		}
 		if _, err := decoder.Token(); err != nil {
-			return invalid("decode", err.Error())
+			return invalid("decode", "contains malformed JSON")
 		}
 	default:
 		return invalid("decode", "contains an unexpected delimiter")
@@ -355,7 +433,7 @@ func consumeUniqueJSONValue(decoder *json.Decoder, schema *planJSONSchema) error
 func validateRequiredPlanJSON(encoded []byte) error {
 	var plan map[string]json.RawMessage
 	if err := json.Unmarshal(encoded, &plan); err != nil {
-		return invalid("decode", err.Error())
+		return invalid("decode", "contains malformed JSON")
 	}
 	if err := requireJSONFields(plan, "plan",
 		"planId", "planHash", "workflowId", "projectId", "environment", "environmentClass", "principal", "createdAt",
@@ -458,10 +536,15 @@ func validateRequiredRecoveryAssetsJSON(encoded json.RawMessage) error {
 	}
 	for index, asset := range assets {
 		path := fmt.Sprintf("rollback.assets[%d]", index)
-		if err := requireJSONFields(asset, path, "kind", "resource", "evidenceRef", "verifiedAt"); err != nil {
+		if err := requireJSONFields(asset, path, "kind", "resource", "protects", "evidenceRef", "verifiedAt"); err != nil {
 			return err
 		}
 		if err := requireNestedJSONFields(asset["resource"], path+".resource",
+			"kind", "scope", "name", "fingerprint",
+		); err != nil {
+			return err
+		}
+		if err := requireJSONArrayFields(asset["protects"], path+".protects",
 			"kind", "scope", "name", "fingerprint",
 		); err != nil {
 			return err
@@ -571,6 +654,9 @@ func ValidatePlan(plan domain.Plan) error {
 }
 
 func validatePlanStructure(plan domain.Plan) error {
+	if err := validateCanonicalPlanCollections(plan); err != nil {
+		return err
+	}
 	if !planIDPattern.MatchString(plan.PlanID) {
 		return invalid("planId", "must match plan-<16 lowercase hex>")
 	}
@@ -682,6 +768,30 @@ func validatePlanStructure(plan domain.Plan) error {
 	return nil
 }
 
+func validateCanonicalPlanCollections(plan domain.Plan) error {
+	if plan.Resources == nil || plan.Preconditions == nil || plan.Permissions == nil || plan.Steps == nil ||
+		plan.Cost.Items == nil || plan.Cost.Assumptions == nil || plan.Cost.Unpriced == nil ||
+		plan.Protection == nil || plan.Rollback.Assets == nil || plan.Verification == nil {
+		return invalid("collections", "required arrays must use canonical non-null encoding")
+	}
+	for _, step := range plan.Steps {
+		if step.Targets == nil {
+			return invalid("steps.targets", "required arrays must use canonical non-null encoding")
+		}
+	}
+	for _, asset := range plan.Rollback.Assets {
+		if asset.Protects == nil {
+			return invalid("rollback.assets.protects", "required arrays must use canonical non-null encoding")
+		}
+	}
+	if plan.ExposureControls != nil && (plan.ExposureControls.Targets == nil ||
+		plan.ExposureControls.Sources == nil || plan.ExposureControls.Ports == nil) {
+		return invalid("exposureControls", "required arrays must use canonical non-null encoding")
+	}
+
+	return nil
+}
+
 func validateRecoveryAssets(plan domain.Plan) error {
 	assets := plan.Rollback.Assets
 	if len(assets) > maxRecoveryAssets {
@@ -691,6 +801,10 @@ func validateRecoveryAssets(plan domain.Plan) error {
 		return invalid("rollback.assets", "requires recovery proof for a data-destructive plan")
 	}
 	resources := make([]domain.PlanResource, len(assets))
+	planResources := make(map[string]domain.PlanResource, len(plan.Resources))
+	for _, resource := range plan.Resources {
+		planResources[planResourceKey(resource)] = resource
+	}
 	seen := make(map[string]struct{}, len(assets))
 	for index, asset := range assets {
 		path := fmt.Sprintf("rollback.assets[%d]", index)
@@ -703,6 +817,20 @@ func validateRecoveryAssets(plan domain.Plan) error {
 			return invalid(path, "duplicates a recovery asset")
 		}
 		seen[key] = struct{}{}
+		if len(asset.Protects) == 0 || len(asset.Protects) > maxExposureTargets {
+			return invalid(path+".protects", "must contain bounded protected plan resources")
+		}
+		seenProtected := make(map[string]struct{}, len(asset.Protects))
+		for _, protected := range asset.Protects {
+			protectedKey := planResourceKey(protected)
+			if planned, exists := planResources[protectedKey]; !exists || protected != planned {
+				return invalid(path+".protects", "must exactly match fingerprinted plan resources")
+			}
+			if _, duplicate := seenProtected[protectedKey]; duplicate {
+				return invalid(path+".protects", "contains a duplicate protected resource")
+			}
+			seenProtected[protectedKey] = struct{}{}
+		}
 		if !safeEvidenceReference(asset.EvidenceRef) {
 			return invalid(path+".evidenceRef", "must be a canonical non-secret object reference")
 		}
@@ -826,6 +954,9 @@ func validateExposureControls(plan domain.Plan) error {
 	if controls.InternetWide != wantsInternetWide {
 		return invalid("exposureControls.internetWide", "must exactly match a 0.0.0.0/0 source")
 	}
+	if !controls.InternetWide && controls.Profile == domain.ExposureProfileACC08 {
+		return invalid("exposureControls.profile", "ACC-08 is reserved for internet-wide exposure")
+	}
 	if err := validateExposureLifetime(plan, *controls); err != nil {
 		return err
 	}
@@ -841,7 +972,7 @@ func validExposureSource(source domain.PlanExposureSource) bool {
 			return false
 		}
 		if source.Kind == domain.ExposureSourcePrivateRange {
-			return prefix.Addr().IsPrivate()
+			return whollyWithinRFC1918(prefix)
 		}
 		return prefix.Bits() >= 24 || source.Value == "0.0.0.0/0"
 	case domain.ExposureSourceTag, domain.ExposureSourceTunnel:
@@ -853,6 +984,16 @@ func validExposureSource(source domain.PlanExposureSource) bool {
 	default:
 		return false
 	}
+}
+
+func whollyWithinRFC1918(prefix netip.Prefix) bool {
+	for _, privateNetwork := range rfc1918Networks {
+		if prefix.Bits() >= privateNetwork.Bits() && privateNetwork.Contains(prefix.Addr()) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func validExposureAuthentication(exposure domain.ExposureDelta, controls domain.PlanExposureControls) bool {

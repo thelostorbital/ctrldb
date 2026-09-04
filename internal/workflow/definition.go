@@ -24,12 +24,14 @@ type StepDefinition struct {
 	ID                    string
 	Executor              string
 	ExecutingIdentity     domain.ExecutionIdentity
+	CommandSummary        redact.Text
 	Effect                domain.StepEffect
 	MinimumApproval       domain.ApprovalClass
 	TargetKinds           []string
 	RequiredPermissions   []string
 	RequiresStepUp        bool
 	RequiresRecoveryAsset bool
+	ExposureRequirement   *domain.ExecutionExposureRequirement
 	Idempotent            bool
 	Retry                 domain.RetryPolicy
 	CancelSafe            bool
@@ -99,12 +101,14 @@ func NewDefinition(
 			ID:                    step.ID,
 			Executor:              step.Executor,
 			ExecutingIdentity:     step.ExecutingIdentity,
+			CommandSummary:        step.CommandSummary,
 			Effect:                step.Effect,
 			MinimumApproval:       step.MinimumApproval,
 			TargetKinds:           step.TargetKinds,
 			RequiredPermissions:   step.RequiredPermissions,
 			RequiresStepUp:        step.RequiresStepUp,
 			RequiresRecoveryAsset: step.RequiresRecoveryAsset,
+			ExposureRequirement:   step.ExposureRequirement,
 			Idempotent:            step.Idempotent,
 			Retry:                 step.Retry,
 			CancelSafe:            step.CancelSafe,
@@ -188,6 +192,10 @@ func cloneDefinition(definition Definition) Definition {
 func cloneStepDefinition(step StepDefinition) StepDefinition {
 	step.TargetKinds = append([]string(nil), step.TargetKinds...)
 	step.RequiredPermissions = append([]string(nil), step.RequiredPermissions...)
+	if step.ExposureRequirement != nil {
+		requirement := *step.ExposureRequirement
+		step.ExposureRequirement = &requirement
+	}
 
 	return step
 }

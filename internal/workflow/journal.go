@@ -25,9 +25,10 @@ var (
 )
 
 var (
-	operationIDPattern   = regexp.MustCompile(`^op-[0-9a-f]{16}$`)
-	journalPlanIDPattern = regexp.MustCompile(`^plan-[0-9a-f]{16}$`)
-	stepIDPattern        = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+	operationIDPattern    = regexp.MustCompile(`^op-[0-9a-f]{16}$`)
+	journalPlanIDPattern  = regexp.MustCompile(`^plan-[0-9a-f]{16}$`)
+	stepIDPattern         = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+	contractDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 type journalJSONSchema struct {
@@ -52,7 +53,8 @@ var (
 		}),
 		"cancellation": journalJSONObject(map[string]*journalJSONSchema{
 			"requestedAt": journalJSONScalar, "currentStepId": journalJSONScalar,
-			"mutationObservation": journalJSONScalar, "requiredRoute": journalJSONScalar,
+			"executionContractHash": journalJSONScalar, "mutationObservation": journalJSONScalar,
+			"requiredRoute": journalJSONScalar,
 		}),
 	})
 )
@@ -122,8 +124,14 @@ func consumeUniqueJournalJSONValue(decoder *json.Decoder, schema *journalJSONSch
 	if err != nil {
 		return journalEntryError("decode", err.Error())
 	}
+	if token == nil {
+		return journalEntryError("decode", "null is not allowed at this schema position")
+	}
 	delimiter, composite := token.(json.Delim)
 	if !composite {
+		if schema == nil || schema.fields != nil {
+			return journalEntryError("decode", "scalar has the wrong schema type")
+		}
 		return nil
 	}
 
@@ -206,7 +214,9 @@ func validateRequiredJournalJSON(encoded []byte, entry domain.JournalEntry) erro
 		if err := json.Unmarshal(document["cancellation"], &cancellation); err != nil {
 			return journalEntryError("cancellation", "must be an object")
 		}
-		for _, field := range []string{"requestedAt", "currentStepId", "mutationObservation", "requiredRoute"} {
+		for _, field := range []string{
+			"requestedAt", "currentStepId", "executionContractHash", "mutationObservation", "requiredRoute",
+		} {
 			if _, exists := cancellation[field]; !exists {
 				return journalEntryError("cancellation."+field, "is required")
 			}
@@ -498,6 +508,9 @@ func validateJournalCancellation(request domain.JournalCancellationRequest, reco
 	}
 	if !stepIDPattern.MatchString(request.CurrentStepID) {
 		return journalEntryError("cancellation.currentStepId", "must be a canonical step identifier")
+	}
+	if !contractDigestPattern.MatchString(request.ExecutionContractHash) {
+		return journalEntryError("cancellation.executionContractHash", "must be a contract digest")
 	}
 	if !request.MutationObservation.Valid() {
 		return journalEntryError("cancellation.mutationObservation", "unknown value")

@@ -38,6 +38,7 @@ const (
 	BlockerPolicy       PlanBlockerKind = "policy"
 	BlockerPrecondition PlanBlockerKind = "precondition"
 	BlockerResource     PlanBlockerKind = "resource"
+	BlockerRecovery     PlanBlockerKind = "recovery-asset"
 	BlockerPermission   PlanBlockerKind = "permission"
 	BlockerStepUp       PlanBlockerKind = "step-up"
 )
@@ -120,6 +121,7 @@ type ExecutionEvidence struct {
 	PolicyHash       domain.PlanPolicyHash
 	Preconditions    []domain.PlanPrecondition
 	Resources        []domain.PlanResource
+	RecoveryAssets   []domain.PlanRecoveryAsset
 	Permissions      []domain.PlanPermission
 	StepUp           *StepUpEvidence
 }
@@ -247,8 +249,9 @@ func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence, cont
 		evidence.Principal != plan.Principal {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerPlanBinding, ID: "execution-evidence"})
 	}
-	var contractRequiresApproval, contractRequiresStepUp bool
-	blockers, contractRequiresApproval, contractRequiresStepUp = validateExecutionContract(plan, contract, blockers)
+	var contractRequiresApproval, contractRequiresStepUp, contractRequiresRecovery bool
+	blockers, contractRequiresApproval, contractRequiresStepUp, contractRequiresRecovery =
+		validateExecutionContract(plan, contract, blockers)
 
 	requireApproval := contractRequiresApproval || plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil
 	if requireApproval {
@@ -263,9 +266,9 @@ func ValidatePlanForExecution(plan domain.Plan, evidence ExecutionEvidence, cont
 	}
 	blockers = validatePreconditionEvidence(plan, evidence, blockers)
 	blockers = validateResourceEvidence(plan, evidence, blockers)
+	blockers = validateRecoveryEvidence(plan, evidence, contractRequiresRecovery, blockers)
 	blockers = validatePermissionEvidence(plan, evidence, blockers)
-	wantStepUp := plan.EnvironmentClass == domain.EnvironmentProduction &&
-		(plan.ApprovalClass == domain.ApprovalDataDestructive || contractRequiresStepUp)
+	wantStepUp := plan.EnvironmentClass == domain.EnvironmentProduction && contractRequiresStepUp
 	if plan.StepUpRequired != wantStepUp {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerStepUp, ID: "workflow-requirement"})
 	}
@@ -282,23 +285,26 @@ func validateExecutionContract(
 	plan domain.Plan,
 	contract domain.ExecutionContract,
 	blockers []PlanBlocker,
-) ([]PlanBlocker, bool, bool) {
+) ([]PlanBlocker, bool, bool, bool) {
 	contractSteps := contract.Steps()
 	if contract.WorkflowID() != plan.WorkflowID || len(contractSteps) != len(plan.Steps) ||
 		contract.RollbackBoundary() != plan.Rollback.Boundary ||
-		contract.PointOfNoReturn() != plan.PointOfNoReturn {
-		return append(blockers, PlanBlocker{Kind: BlockerContract, ID: "workflow-or-step-set"}), true, true
+		contract.PointOfNoReturn() != plan.PointOfNoReturn ||
+		contract.PointOfNoReturnTrigger() != plan.PointOfNoReturnTrigger {
+		return append(blockers, PlanBlocker{Kind: BlockerContract, ID: "workflow-or-step-set"}), true, true, true
 	}
 
 	minimumApproval := domain.ApprovalRead
 	mutationCapable := false
 	requiresStepUp := false
+	requiresRecovery := false
 	for _, step := range contractSteps {
 		if step.MinimumApproval > minimumApproval {
 			minimumApproval = step.MinimumApproval
 		}
 		mutationCapable = mutationCapable || step.Effect == domain.StepEffectMutation
 		requiresStepUp = requiresStepUp || step.RequiresStepUp
+		requiresRecovery = requiresRecovery || step.RequiresRecoveryAsset
 	}
 
 	expectedPermissions := make(map[string]struct{})
@@ -330,6 +336,9 @@ func validateExecutionContract(
 		(mutationCapable && plan.ApprovalClass == domain.ApprovalRead) {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerContract, ID: "step-or-risk-mismatch"})
 	}
+	if requiresRecovery && len(plan.Rollback.Assets) == 0 {
+		blockers = append(blockers, PlanBlocker{Kind: BlockerRecovery, ID: "workflow-requirement"})
+	}
 	if len(plan.Permissions) != len(expectedPermissions) {
 		blockers = append(blockers, PlanBlocker{Kind: BlockerPermission, ID: "workflow-required-set"})
 	} else {
@@ -341,7 +350,45 @@ func validateExecutionContract(
 		}
 	}
 
-	return blockers, minimumApproval != domain.ApprovalRead || mutationCapable, requiresStepUp
+	return blockers, minimumApproval != domain.ApprovalRead || mutationCapable, requiresStepUp, requiresRecovery
+}
+
+func validateRecoveryEvidence(
+	plan domain.Plan,
+	evidence ExecutionEvidence,
+	required bool,
+	blockers []PlanBlocker,
+) []PlanBlocker {
+	if !required && len(plan.Rollback.Assets) == 0 {
+		if len(evidence.RecoveryAssets) != 0 {
+			return append(blockers, PlanBlocker{Kind: BlockerRecovery, ID: "unexpected"})
+		}
+		return blockers
+	}
+	if !equalRecoveryAssets(plan.Rollback.Assets, evidence.RecoveryAssets) {
+		return append(blockers, PlanBlocker{Kind: BlockerRecovery, ID: "stale-or-mismatched"})
+	}
+
+	return blockers
+}
+
+func equalRecoveryAssets(left, right []domain.PlanRecoveryAsset) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].Kind != right[index].Kind || left[index].Resource != right[index].Resource ||
+			left[index].EvidenceRef != right[index].EvidenceRef || !left[index].VerifiedAt.Equal(right[index].VerifiedAt) ||
+			!equalOptionalTime(left[index].RestoreTo, right[index].RestoreTo) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func equalOptionalTime(left, right *time.Time) bool {
+	return left == nil && right == nil || left != nil && right != nil && left.Equal(*right)
 }
 
 func planStepMatchesContract(step domain.PlanStep, expected domain.ExecutionStepContract) bool {

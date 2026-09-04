@@ -21,35 +21,38 @@ var definitionWorkflowIDPattern = regexp.MustCompile(`^WF-[A-Z0-9]+-[0-9]{2}$`)
 // StepDefinition is the resource-independent execution contract registered by
 // an implemented workflow.
 type StepDefinition struct {
-	ID                  string
-	Executor            string
-	ExecutingIdentity   domain.ExecutionIdentity
-	Effect              domain.StepEffect
-	MinimumApproval     domain.ApprovalClass
-	TargetKinds         []string
-	RequiredPermissions []string
-	RequiresStepUp      bool
-	Idempotent          bool
-	Retry               domain.RetryPolicy
-	CancelSafe          bool
-	TimeoutSeconds      int64
-	SuccessCondition    redact.Text
-	FailureBehavior     domain.FailureBehavior
+	ID                    string
+	Executor              string
+	ExecutingIdentity     domain.ExecutionIdentity
+	Effect                domain.StepEffect
+	MinimumApproval       domain.ApprovalClass
+	TargetKinds           []string
+	RequiredPermissions   []string
+	RequiresStepUp        bool
+	RequiresRecoveryAsset bool
+	Idempotent            bool
+	Retry                 domain.RetryPolicy
+	CancelSafe            bool
+	TimeoutSeconds        int64
+	SuccessCondition      redact.Text
+	FailureBehavior       domain.FailureBehavior
 }
 
 // Definition is immutable after construction. Its fields are intentionally
 // private so callers cannot weaken a validated step contract in place.
 type Definition struct {
-	workflowID       string
-	rollbackBoundary string
-	pointOfNoReturn  string
-	steps            []StepDefinition
-	contract         domain.ExecutionContract
+	workflowID             string
+	rollbackBoundary       string
+	pointOfNoReturn        string
+	pointOfNoReturnTrigger domain.PointOfNoReturnTrigger
+	steps                  []StepDefinition
+	contract               domain.ExecutionContract
 }
 
 // NewDefinition validates and defensively copies one implemented workflow.
 func NewDefinition(
 	workflowID, rollbackBoundary, pointOfNoReturn string,
+	pointOfNoReturnTrigger domain.PointOfNoReturnTrigger,
 	steps []StepDefinition,
 ) (Definition, error) {
 	if !definitionWorkflowIDPattern.MatchString(workflowID) {
@@ -93,30 +96,34 @@ func NewDefinition(
 	contractSteps := make([]domain.ExecutionStepContract, len(copyOfSteps))
 	for index, step := range copyOfSteps {
 		contractSteps[index] = domain.ExecutionStepContract{
-			ID:                  step.ID,
-			Executor:            step.Executor,
-			ExecutingIdentity:   step.ExecutingIdentity,
-			Effect:              step.Effect,
-			MinimumApproval:     step.MinimumApproval,
-			TargetKinds:         step.TargetKinds,
-			RequiredPermissions: step.RequiredPermissions,
-			RequiresStepUp:      step.RequiresStepUp,
-			Idempotent:          step.Idempotent,
-			Retry:               step.Retry,
-			CancelSafe:          step.CancelSafe,
-			TimeoutSeconds:      step.TimeoutSeconds,
-			SuccessCondition:    step.SuccessCondition,
-			FailureBehavior:     step.FailureBehavior,
+			ID:                    step.ID,
+			Executor:              step.Executor,
+			ExecutingIdentity:     step.ExecutingIdentity,
+			Effect:                step.Effect,
+			MinimumApproval:       step.MinimumApproval,
+			TargetKinds:           step.TargetKinds,
+			RequiredPermissions:   step.RequiredPermissions,
+			RequiresStepUp:        step.RequiresStepUp,
+			RequiresRecoveryAsset: step.RequiresRecoveryAsset,
+			Idempotent:            step.Idempotent,
+			Retry:                 step.Retry,
+			CancelSafe:            step.CancelSafe,
+			TimeoutSeconds:        step.TimeoutSeconds,
+			SuccessCondition:      step.SuccessCondition,
+			FailureBehavior:       step.FailureBehavior,
 		}
 	}
-	contract, err := domain.NewExecutionContract(workflowID, rollbackBoundary, pointOfNoReturn, contractSteps)
+	contract, err := domain.NewExecutionContract(
+		workflowID, rollbackBoundary, pointOfNoReturn, pointOfNoReturnTrigger, contractSteps,
+	)
 	if err != nil {
 		return Definition{}, definitionError("steps", "contain an invalid execution contract")
 	}
 
 	return Definition{
 		workflowID: workflowID, rollbackBoundary: rollbackBoundary, pointOfNoReturn: pointOfNoReturn,
-		steps: copyOfSteps, contract: contract,
+		pointOfNoReturnTrigger: pointOfNoReturnTrigger,
+		steps:                  copyOfSteps, contract: contract,
 	}, nil
 }
 

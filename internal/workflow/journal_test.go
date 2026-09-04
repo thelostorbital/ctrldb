@@ -202,6 +202,7 @@ func TestCancellationJournalEntryRequiresCompleteDurableRecord(t *testing.T) {
 	for _, mutate := range []func(*domain.JournalEntry){
 		func(entry *domain.JournalEntry) { entry.Cancellation = nil },
 		func(entry *domain.JournalEntry) { entry.Cancellation.CurrentStepID = "unsafe/id" },
+		func(entry *domain.JournalEntry) { entry.Cancellation.ExecutionContractHash = "not-a-digest" },
 		func(entry *domain.JournalEntry) { entry.Cancellation.MutationObservation = "maybe" },
 		func(entry *domain.JournalEntry) { entry.Cancellation.RequiredRoute = domain.OperationCancelled },
 		func(entry *domain.JournalEntry) {
@@ -212,6 +213,22 @@ func TestCancellationJournalEntryRequiresCompleteDurableRecord(t *testing.T) {
 		mutate(&changed)
 		if err := workflow.ValidateJournalEntry(changed); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
 			t.Fatalf("ValidateJournalEntry() error = %v, want ErrInvalidJournalEntry", err)
+		}
+	}
+	for _, field := range []string{
+		"requestedAt", "currentStepId", "executionContractHash", "mutationObservation", "requiredRoute",
+	} {
+		var document map[string]any
+		if err := json.Unmarshal(encoded, &document); err != nil {
+			t.Fatalf("json.Unmarshal() returned an error: %v", err)
+		}
+		delete(document["cancellation"].(map[string]any), field)
+		without, err := json.Marshal(document)
+		if err != nil {
+			t.Fatalf("json.Marshal() returned an error: %v", err)
+		}
+		if _, err := workflow.DecodeJournalEntry(without); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+			t.Fatalf("DecodeJournalEntry(missing %s) error = %v, want ErrInvalidJournalEntry", field, err)
 		}
 	}
 }
@@ -249,6 +266,28 @@ func TestJournalStepDecodeRequiresEveryNonOptionalField(t *testing.T) {
 	}
 	if decoded.Step.ResultSummary.String() != "" {
 		t.Fatalf("resultSummary = %q, want explicit empty value", decoded.Step.ResultSummary.String())
+	}
+}
+
+func TestJournalDecodeRejectsNullAndWrongTypesAtEveryEncodedPosition(t *testing.T) {
+	t.Parallel()
+
+	for name, entry := range map[string]domain.JournalEntry{
+		"step":         validStepEntry(),
+		"pause":        validPausedEntry(),
+		"cancellation": validCancellationEntry(),
+	} {
+		name, entry := name, entry
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			encoded := mustEncodeJournalEntry(t, entry)
+			var document any
+			if err := json.Unmarshal(encoded, &document); err != nil {
+				t.Fatalf("json.Unmarshal() returned an error: %v", err)
+			}
+			assertEveryJournalValueReplacementRejected(t, document, document, name, nil)
+			assertEveryJournalValueReplacementRejected(t, document, document, name, map[string]any{})
+		})
 	}
 }
 
@@ -728,10 +767,11 @@ func validCancellationEntry() domain.JournalEntry {
 		RecordedAt:     requestedAt,
 		OperationState: domain.OperationExecute,
 		Cancellation: &domain.JournalCancellationRequest{
-			RequestedAt:         requestedAt,
-			CurrentStepID:       "stop-instance",
-			MutationObservation: domain.MutationUnknown,
-			RequiredRoute:       domain.OperationRollback,
+			RequestedAt:           requestedAt,
+			CurrentStepID:         "stop-instance",
+			ExecutionContractHash: strings.Repeat("a", 64),
+			MutationObservation:   domain.MutationUnknown,
+			RequiredRoute:         domain.OperationRollback,
 		},
 	}
 }
@@ -754,5 +794,27 @@ func validPausedEntry() domain.JournalEntry {
 			ResumeBy:           pausedAt.Add(24 * time.Hour),
 			ReapprovalRequired: true,
 		},
+	}
+}
+
+func assertEveryJournalValueReplacementRejected(t *testing.T, root, document any, path string, replacement any) {
+	t.Helper()
+	object, ok := document.(map[string]any)
+	if !ok {
+		return
+	}
+	for key, child := range object {
+		object[key] = replacement
+		encoded, err := json.Marshal(root)
+		if err != nil {
+			t.Fatalf("json.Marshal(%s.%s) returned an error: %v", path, key, err)
+		}
+		if _, err := workflow.DecodeJournalEntry(encoded); !errors.Is(err, workflow.ErrInvalidJournalEntry) {
+			t.Fatalf("DecodeJournalEntry(%s.%s replacement) error = %v", path, key, err)
+		}
+		object[key] = child
+		if nested, nestedObject := child.(map[string]any); nestedObject {
+			assertEveryJournalValueReplacementRejected(t, root, nested, path+"."+key, replacement)
+		}
 	}
 }

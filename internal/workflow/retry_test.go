@@ -87,7 +87,8 @@ func TestRetryUsesImmutableContractStep(t *testing.T) {
 func retryContract(t *testing.T, step workflow.StepDefinition) domain.ExecutionContract {
 	t.Helper()
 	definition, err := workflow.NewDefinition(
-		"WF-VM-02", "before-old-instance-delete", step.ID, []workflow.StepDefinition{step},
+		"WF-VM-02", "before-old-instance-delete", step.ID,
+		domain.PointOfNoReturnStepComplete, []workflow.StepDefinition{step},
 	)
 	if err != nil {
 		t.Fatalf("NewDefinition() returned an error: %v", err)

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/netip"
 	"regexp"
 	"strings"
 	"time"
@@ -40,9 +41,20 @@ var (
 	resourceScopePattern = regexp.MustCompile(
 		`^projects/([a-z][a-z0-9-]{4,28}[a-z0-9])/(?:global|regions/[a-z][a-z0-9-]{0,62}|zones/[a-z][a-z0-9-]{0,62}|locations/[a-z][a-z0-9-]{0,62})$`,
 	)
-	permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
-	datePattern       = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
-	zeroPlanHash      = strings.Repeat("0", sha256.Size*2)
+	permissionPattern     = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
+	datePattern           = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
+	evidenceRefPattern    = regexp.MustCompile(`^[a-z0-9][A-Za-z0-9._/-]{0,511}$`)
+	serviceAccountPattern = regexp.MustCompile(
+		`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$`,
+	)
+	zeroPlanHash = strings.Repeat("0", sha256.Size*2)
+)
+
+const (
+	maxRecoveryAssets  = 64
+	maxExposureTargets = 64
+	maxExposureSources = 64
+	maxExposurePorts   = 16
 )
 
 type planJSONSchema struct {
@@ -56,6 +68,16 @@ var (
 	planJSONResource    = planJSONObject(map[string]*planJSONSchema{
 		"kind": planJSONScalar, "scope": planJSONScalar, "name": planJSONScalar, "fingerprint": planJSONScalar,
 	})
+	planJSONRecoveryAsset = planJSONObject(map[string]*planJSONSchema{
+		"kind": planJSONScalar, "resource": planJSONResource, "evidenceRef": planJSONScalar,
+		"verifiedAt": planJSONScalar, "restoreTo": planJSONScalar,
+	})
+	planJSONExposureSource = planJSONObject(map[string]*planJSONSchema{
+		"kind": planJSONScalar, "value": planJSONScalar,
+	})
+	planJSONExposurePort = planJSONObject(map[string]*planJSONSchema{
+		"protocol": planJSONScalar, "number": planJSONScalar,
+	})
 	planJSONRetry = planJSONObject(map[string]*planJSONSchema{
 		"maxAttempts": planJSONScalar, "initialBackoffSeconds": planJSONScalar, "maxBackoffSeconds": planJSONScalar,
 	})
@@ -65,6 +87,18 @@ var (
 		"principal": planJSONScalar, "createdAt": planJSONScalar, "approvalClass": planJSONScalar,
 		"expiresAt": planJSONScalar, "coolingOffSeconds": planJSONScalar, "stepUpRequired": planJSONScalar,
 		"exposure": planJSONScalar, "pointOfNoReturn": planJSONScalar,
+		"pointOfNoReturnTrigger": planJSONScalar,
+		"exposureControls": planJSONObject(map[string]*planJSONSchema{
+			"profile": planJSONScalar, "targets": {element: planJSONResource},
+			"sources": {element: planJSONExposureSource}, "ports": {element: planJSONExposurePort},
+			"authentication": planJSONScalar,
+			"tls": planJSONObject(map[string]*planJSONSchema{
+				"required": planJSONScalar, "hostnameVerification": planJSONScalar, "trust": planJSONScalar,
+			}),
+			"expiresAt": planJSONScalar, "reviewAt": planJSONScalar, "auditLogging": planJSONScalar,
+			"revocationWorkflowId": planJSONScalar, "simulationPreconditionId": planJSONScalar,
+			"internetWide": planJSONScalar, "permanentInternetWideAcknowledged": planJSONScalar,
+		}),
 		"identity": planJSONObject(map[string]*planJSONSchema{
 			"default": planJSONScalar, "hostControlSteps": planJSONScalar,
 			"deleteSteps": planJSONScalar, "bootstrapSteps": planJSONScalar,
@@ -110,7 +144,7 @@ var (
 		}),
 		"protection": planJSONStringArray,
 		"rollback": planJSONObject(map[string]*planJSONSchema{
-			"boundary": planJSONScalar, "assets": planJSONStringArray,
+			"boundary": planJSONScalar, "assets": {element: planJSONRecoveryAsset},
 		}),
 		"verification": planJSONStringArray,
 	})
@@ -258,8 +292,14 @@ func consumeUniqueJSONValue(decoder *json.Decoder, schema *planJSONSchema) error
 	if err != nil {
 		return invalid("decode", err.Error())
 	}
+	if token == nil {
+		return invalid("decode", "null is not allowed at this schema position")
+	}
 	delimiter, composite := token.(json.Delim)
 	if !composite {
+		if schema == nil || schema.fields != nil || schema.element != nil {
+			return invalid("decode", "scalar has the wrong schema type")
+		}
 		return nil
 	}
 
@@ -339,6 +379,11 @@ func validateRequiredPlanJSON(encoded []byte) error {
 			return err
 		}
 	}
+	if _, exists := plan["pointOfNoReturn"]; exists {
+		if _, triggerExists := plan["pointOfNoReturnTrigger"]; !triggerExists {
+			return invalid("pointOfNoReturnTrigger", "is required with pointOfNoReturn")
+		}
+	}
 	if err := requireJSONArrayFields(plan["resources"], "resources", "kind", "scope", "name", "fingerprint"); err != nil {
 		return err
 	}
@@ -390,8 +435,75 @@ func validateRequiredPlanJSON(encoded []byte) error {
 	if err := requireNestedJSONFields(plan["rollback"], "rollback", "boundary", "assets"); err != nil {
 		return err
 	}
+	var rollback map[string]json.RawMessage
+	if err := json.Unmarshal(plan["rollback"], &rollback); err != nil {
+		return invalid("rollback", "must be an object")
+	}
+	if err := validateRequiredRecoveryAssetsJSON(rollback["assets"]); err != nil {
+		return err
+	}
+	if controls, exists := plan["exposureControls"]; exists {
+		if err := validateRequiredExposureControlsJSON(controls); err != nil {
+			return err
+		}
+	}
 
 	return nil
+}
+
+func validateRequiredRecoveryAssetsJSON(encoded json.RawMessage) error {
+	var assets []map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &assets); err != nil {
+		return invalid("rollback.assets", "must be an array")
+	}
+	for index, asset := range assets {
+		path := fmt.Sprintf("rollback.assets[%d]", index)
+		if err := requireJSONFields(asset, path, "kind", "resource", "evidenceRef", "verifiedAt"); err != nil {
+			return err
+		}
+		if err := requireNestedJSONFields(asset["resource"], path+".resource",
+			"kind", "scope", "name", "fingerprint",
+		); err != nil {
+			return err
+		}
+		var kind domain.RecoveryAssetKind
+		if err := json.Unmarshal(asset["kind"], &kind); err == nil && kind == domain.RecoveryAssetPBMRecoveryPoint {
+			if _, exists := asset["restoreTo"]; !exists {
+				return invalid(path+".restoreTo", "is required for a PBM recovery point")
+			}
+		}
+	}
+
+	return nil
+}
+
+func validateRequiredExposureControlsJSON(encoded json.RawMessage) error {
+	var controls map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &controls); err != nil {
+		return invalid("exposureControls", "must be an object")
+	}
+	if err := requireJSONFields(controls, "exposureControls",
+		"profile", "targets", "sources", "ports", "authentication", "tls", "auditLogging",
+		"revocationWorkflowId", "simulationPreconditionId", "internetWide",
+		"permanentInternetWideAcknowledged",
+	); err != nil {
+		return err
+	}
+	if err := requireJSONArrayFields(controls["targets"], "exposureControls.targets",
+		"kind", "scope", "name", "fingerprint",
+	); err != nil {
+		return err
+	}
+	if err := requireJSONArrayFields(controls["sources"], "exposureControls.sources", "kind", "value"); err != nil {
+		return err
+	}
+	if err := requireJSONArrayFields(controls["ports"], "exposureControls.ports", "protocol", "number"); err != nil {
+		return err
+	}
+
+	return requireNestedJSONFields(controls["tls"], "exposureControls.tls",
+		"required", "hostnameVerification", "trust",
+	)
 }
 
 func validateRequiredCostJSON(encoded json.RawMessage) error {
@@ -508,9 +620,6 @@ func validatePlanStructure(plan domain.Plan) error {
 		return invalid("stepUpRequired", "must be false outside production")
 	}
 	if plan.EnvironmentClass == domain.EnvironmentProduction {
-		if plan.ApprovalClass == domain.ApprovalDataDestructive && !plan.StepUpRequired {
-			return invalid("stepUpRequired", "must be true for production data-destructive plans")
-		}
 		if plan.ApprovalClass < domain.ApprovalDestructive && plan.StepUpRequired {
 			return invalid("stepUpRequired", "requires a production AP-4 or stronger plan")
 		}
@@ -532,6 +641,13 @@ func validatePlanStructure(plan domain.Plan) error {
 	if err := validateSteps(plan.Steps, plan.PointOfNoReturn, plan.Resources); err != nil {
 		return err
 	}
+	if plan.PointOfNoReturn == "" {
+		if plan.PointOfNoReturnTrigger != "" {
+			return invalid("pointOfNoReturnTrigger", "must be absent without pointOfNoReturn")
+		}
+	} else if !plan.PointOfNoReturnTrigger.Valid() {
+		return invalid("pointOfNoReturnTrigger", "unknown value")
+	}
 	if err := validatePermissions(plan.Permissions, plan.ApprovalClass, plan.Steps, plan.Resources); err != nil {
 		return err
 	}
@@ -547,14 +663,257 @@ func validatePlanStructure(plan domain.Plan) error {
 	if !plan.Exposure.Valid() {
 		return invalid("exposure", "unknown value")
 	}
+	if err := validateExposureControls(plan); err != nil {
+		return err
+	}
 	if plan.ApprovalClass >= domain.ApprovalProtected && len(plan.Protection) == 0 {
 		return invalid("protection", "must describe at least one safeguard for AP-2 or stronger")
 	}
 	if plan.Rollback.Boundary == "" {
 		return invalid("rollback.boundary", "must not be empty; use none when unavailable")
 	}
+	if err := validateRecoveryAssets(plan); err != nil {
+		return err
+	}
 	if len(plan.Verification) == 0 {
 		return invalid("verification", "must contain at least one independent check")
+	}
+
+	return nil
+}
+
+func validateRecoveryAssets(plan domain.Plan) error {
+	assets := plan.Rollback.Assets
+	if len(assets) > maxRecoveryAssets {
+		return invalid("rollback.assets", "exceeds the bounded asset count")
+	}
+	if plan.ApprovalClass == domain.ApprovalDataDestructive && len(assets) == 0 {
+		return invalid("rollback.assets", "requires recovery proof for a data-destructive plan")
+	}
+	resources := make([]domain.PlanResource, len(assets))
+	seen := make(map[string]struct{}, len(assets))
+	for index, asset := range assets {
+		path := fmt.Sprintf("rollback.assets[%d]", index)
+		if !asset.Kind.Valid() {
+			return invalid(path+".kind", "unknown value")
+		}
+		resources[index] = asset.Resource
+		key := string(asset.Kind) + "\x00" + planResourceKey(asset.Resource)
+		if _, duplicate := seen[key]; duplicate {
+			return invalid(path, "duplicates a recovery asset")
+		}
+		seen[key] = struct{}{}
+		if !safeEvidenceReference(asset.EvidenceRef) {
+			return invalid(path+".evidenceRef", "must be a canonical non-secret object reference")
+		}
+		if err := validateUTCTime(path+".verifiedAt", asset.VerifiedAt); err != nil {
+			return err
+		}
+		if asset.VerifiedAt.After(plan.CreatedAt) ||
+			plan.CreatedAt.Sub(asset.VerifiedAt) > plan.ExpiresAt.Sub(plan.CreatedAt) {
+			return invalid(path+".verifiedAt", "must be current within the plan validity interval")
+		}
+		switch asset.Kind {
+		case domain.RecoveryAssetPBMRecoveryPoint:
+			if asset.Resource.Kind != "pbm-recovery-point" || asset.RestoreTo == nil {
+				return invalid(path, "PBM proof requires a recovery-point resource and restoreTo")
+			}
+			if err := validateUTCTime(path+".restoreTo", *asset.RestoreTo); err != nil {
+				return err
+			}
+			if asset.RestoreTo.Before(plan.CreatedAt) || asset.RestoreTo.After(plan.ExpiresAt) {
+				return invalid(path+".restoreTo", "must cover plan creation within plan validity")
+			}
+		case domain.RecoveryAssetSnapshot:
+			if asset.Resource.Kind != "snapshot" || asset.RestoreTo != nil {
+				return invalid(path, "snapshot proof requires a snapshot resource and no restoreTo")
+			}
+			if plan.CreatedAt.Sub(asset.VerifiedAt) > time.Hour {
+				return invalid(path+".verifiedAt", "snapshot proof must be at most one hour old")
+			}
+		}
+	}
+	if err := validateResources(resources, plan.ProjectID); err != nil && len(resources) != 0 {
+		return invalid("rollback.assets", "must contain unique fingerprinted resources in the plan project")
+	}
+
+	return nil
+}
+
+func safeEvidenceReference(reference string) bool {
+	if !evidenceRefPattern.MatchString(reference) || strings.Contains(reference, "//") {
+		return false
+	}
+	for _, segment := range strings.Split(reference, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validateExposureControls(plan domain.Plan) error {
+	controls := plan.ExposureControls
+	if plan.Exposure == domain.ExposureNone {
+		if controls != nil {
+			return invalid("exposureControls", "must be absent when exposure is none")
+		}
+		return nil
+	}
+	if plan.ApprovalClass < domain.ApprovalSecuritySensitive || controls == nil {
+		return invalid("exposureControls", "requires AP-3 approval and complete controls")
+	}
+	if !controls.Profile.Valid() || !controls.Authentication.Valid() || !controls.TLS.Trust.Valid() {
+		return invalid("exposureControls", "contains an unknown closed value")
+	}
+	if len(controls.Targets) == 0 || len(controls.Targets) > maxExposureTargets ||
+		len(controls.Sources) == 0 || len(controls.Sources) > maxExposureSources ||
+		len(controls.Ports) == 0 || len(controls.Ports) > maxExposurePorts {
+		return invalid("exposureControls", "requires bounded non-empty targets, sources, and ports")
+	}
+	planResources := make(map[string]struct{}, len(plan.Resources))
+	for _, resource := range plan.Resources {
+		planResources[planResourceKey(resource)] = struct{}{}
+	}
+	seenTargets := make(map[string]struct{}, len(controls.Targets))
+	for _, target := range controls.Targets {
+		key := planResourceKey(target)
+		if _, exists := planResources[key]; !exists {
+			return invalid("exposureControls.targets", "must exactly match fingerprinted plan resources")
+		}
+		if _, duplicate := seenTargets[key]; duplicate {
+			return invalid("exposureControls.targets", "contains a duplicate target")
+		}
+		seenTargets[key] = struct{}{}
+	}
+	wantsInternetWide := false
+	seenSources := make(map[string]struct{}, len(controls.Sources))
+	for _, source := range controls.Sources {
+		if !source.Kind.Valid() || !validExposureSource(source) {
+			return invalid("exposureControls.sources", "contains a noncanonical source")
+		}
+		key := string(source.Kind) + "\x00" + source.Value
+		if _, duplicate := seenSources[key]; duplicate {
+			return invalid("exposureControls.sources", "contains a duplicate source")
+		}
+		seenSources[key] = struct{}{}
+		wantsInternetWide = wantsInternetWide || source.Kind == domain.ExposureSourceCIDR && source.Value == "0.0.0.0/0"
+	}
+	seenPorts := make(map[domain.PlanExposurePort]struct{}, len(controls.Ports))
+	for _, port := range controls.Ports {
+		if port.Protocol != "tcp" || port.Number != 27017 {
+			return invalid("exposureControls.ports", "only tcp/27017 is supported")
+		}
+		if _, duplicate := seenPorts[port]; duplicate {
+			return invalid("exposureControls.ports", "contains a duplicate port")
+		}
+		seenPorts[port] = struct{}{}
+	}
+	if !validExposureAuthentication(plan.Exposure, *controls) {
+		return invalid("exposureControls.authentication", "does not match the exposure path")
+	}
+	if plan.Exposure == domain.ExposureExternal &&
+		(!controls.TLS.Required || !controls.TLS.HostnameVerification || controls.TLS.Trust != domain.ExposureTrustPublic) {
+		return invalid("exposureControls.tls", "external access requires public TLS with hostname verification")
+	}
+	if !controls.AuditLogging || controls.RevocationWorkflowID != "WF-ACC-04" {
+		return invalid("exposureControls", "requires audit logging and the kill-switch revocation workflow")
+	}
+	if !passedPrecondition(plan.Preconditions, controls.SimulationPreconditionID) {
+		return invalid("exposureControls.simulationPreconditionId", "must reference a passed plan precondition")
+	}
+	if controls.InternetWide != wantsInternetWide {
+		return invalid("exposureControls.internetWide", "must exactly match a 0.0.0.0/0 source")
+	}
+	if err := validateExposureLifetime(plan, *controls); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validExposureSource(source domain.PlanExposureSource) bool {
+	switch source.Kind {
+	case domain.ExposureSourceCIDR, domain.ExposureSourcePrivateRange:
+		prefix, err := netip.ParsePrefix(source.Value)
+		if err != nil || !prefix.Addr().Is4() || prefix != prefix.Masked() {
+			return false
+		}
+		if source.Kind == domain.ExposureSourcePrivateRange {
+			return prefix.Addr().IsPrivate()
+		}
+		return prefix.Bits() >= 24 || source.Value == "0.0.0.0/0"
+	case domain.ExposureSourceTag, domain.ExposureSourceTunnel:
+		return identifierPattern.MatchString(source.Value)
+	case domain.ExposureSourceServiceAccount:
+		return serviceAccountPattern.MatchString(source.Value)
+	case domain.ExposureSourceIAP:
+		return source.Value == "35.235.240.0/20"
+	default:
+		return false
+	}
+}
+
+func validExposureAuthentication(exposure domain.ExposureDelta, controls domain.PlanExposureControls) bool {
+	if exposure == domain.ExposureTunnel {
+		return controls.Authentication == domain.ExposureAuthIAP
+	}
+	if exposure == domain.ExposureExternal {
+		return controls.Authentication == domain.ExposureAuthSCRAM ||
+			controls.Authentication == domain.ExposureAuthVPN || controls.Authentication == domain.ExposureAuthOverlay
+	}
+
+	return controls.Authentication != domain.ExposureAuthIAP
+}
+
+func passedPrecondition(preconditions []domain.PlanPrecondition, identifier string) bool {
+	if !identifierPattern.MatchString(identifier) {
+		return false
+	}
+	for _, precondition := range preconditions {
+		if precondition.ID == identifier {
+			return precondition.OK
+		}
+	}
+
+	return false
+}
+
+func validateExposureLifetime(plan domain.Plan, controls domain.PlanExposureControls) error {
+	hasExpiry := controls.ExpiresAt != nil
+	hasReview := controls.ReviewAt != nil
+	if controls.InternetWide {
+		if controls.Profile != domain.ExposureProfileACC08 || plan.ApprovalClass != domain.ApprovalDataDestructive {
+			return invalid("exposureControls.internetWide", "requires ACC-08 and AP-5")
+		}
+		if controls.PermanentInternetWideAcknowledged {
+			if hasExpiry || hasReview {
+				return invalid("exposureControls", "permanent internet-wide access cannot carry a lifetime")
+			}
+			return nil
+		}
+		if !hasExpiry || hasReview {
+			return invalid("exposureControls.expiresAt", "internet-wide access requires an expiry")
+		}
+	} else if controls.PermanentInternetWideAcknowledged || hasExpiry == hasReview {
+		return invalid("exposureControls", "requires exactly one expiry or review date")
+	}
+	if hasExpiry {
+		if err := validateUTCTime("exposureControls.expiresAt", *controls.ExpiresAt); err != nil {
+			return err
+		}
+		if !controls.ExpiresAt.After(plan.CreatedAt) {
+			return invalid("exposureControls.expiresAt", "must be after plan creation")
+		}
+	}
+	if hasReview {
+		if err := validateUTCTime("exposureControls.reviewAt", *controls.ReviewAt); err != nil {
+			return err
+		}
+		if !controls.ReviewAt.After(plan.CreatedAt) {
+			return invalid("exposureControls.reviewAt", "must be after plan creation")
+		}
 	}
 
 	return nil

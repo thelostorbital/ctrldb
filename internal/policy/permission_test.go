@@ -118,6 +118,14 @@ func TestExecutionGateRequiresTrustedRiskAndExactPermissions(t *testing.T) {
 			kind: policy.BlockerContract,
 			mutate: func(plan *domain.Plan) {
 				plan.PointOfNoReturn = ""
+				plan.PointOfNoReturnTrigger = ""
+			},
+		},
+		{
+			name: "mismatched point-of-no-return trigger",
+			kind: policy.BlockerContract,
+			mutate: func(plan *domain.Plan) {
+				plan.PointOfNoReturnTrigger = domain.PointOfNoReturnMutationObserved
 			},
 		},
 	}
@@ -189,6 +197,47 @@ func TestExecutionGateDerivesProductionAP4StepUpFromTrustedContract(t *testing.T
 	); err != nil {
 		t.Fatalf("non-production trusted step-up plan returned an error: %v", err)
 	}
+}
+
+func TestExecutionGateRequiresTrustedRecoveryAssetEvidence(t *testing.T) {
+	t.Parallel()
+
+	plan, _ := ap4ExecutionPlan(t, "delete-disk", "disk", "compute.disks.delete", true)
+	definition, err := workflow.NewDefinition(
+		plan.WorkflowID, plan.Rollback.Boundary, plan.PointOfNoReturn, plan.PointOfNoReturnTrigger,
+		[]workflow.StepDefinition{{
+			ID: plan.Steps[0].ID, Executor: plan.Steps[0].Executor,
+			ExecutingIdentity: plan.Steps[0].ExecutingIdentity, Effect: domain.StepEffectMutation,
+			MinimumApproval: domain.ApprovalDestructive, TargetKinds: []string{"disk"},
+			RequiredPermissions: []string{"compute.disks.delete"}, RequiresStepUp: true,
+			RequiresRecoveryAsset: true, Idempotent: plan.Steps[0].Idempotent, Retry: plan.Steps[0].Retry,
+			CancelSafe: plan.Steps[0].CancelSafe, TimeoutSeconds: plan.Steps[0].TimeoutSeconds,
+			SuccessCondition: plan.Steps[0].SuccessCondition, FailureBehavior: plan.Steps[0].FailureBehavior,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("NewDefinition() returned an error: %v", err)
+	}
+	checkedAt := plan.CreatedAt.Add(10 * time.Minute)
+	evidence := validExecutionEvidence(plan, checkedAt)
+	if err := policy.ValidatePlanForExecution(plan, evidence, definition.ExecutionContract()); err != nil {
+		t.Fatalf("ValidatePlanForExecution() returned an error: %v", err)
+	}
+
+	evidence.RecoveryAssets[0].Resource.Fingerprint = "stale"
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		plan, evidence, definition.ExecutionContract(),
+	), policy.BlockerRecovery)
+
+	withoutAsset := plan
+	withoutAsset.Rollback.Assets = nil
+	withoutAsset, err = policy.SealPlan(withoutAsset)
+	if err != nil {
+		t.Fatalf("SealPlan(AP-4 without asset) returned an error: %v", err)
+	}
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		withoutAsset, validExecutionEvidence(withoutAsset, checkedAt), definition.ExecutionContract(),
+	), policy.BlockerRecovery)
 }
 
 func TestExecutionGateRejectsMissingStaleOrMismatchedEvidence(t *testing.T) {
@@ -361,12 +410,13 @@ func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SealPlan() returned an error: %v", err)
 	}
+	contract := executionContractForPlan(t, plan, domain.ApprovalDataDestructive, true, true)
 	checkedAt := plan.CreatedAt.Add(30 * time.Minute)
 	evidence := validExecutionEvidence(plan, checkedAt)
 	evidence.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
 	evidence.ObservedAt = checkedAt.Add(-10 * time.Minute)
 	evidence.StepUp.ServerTimeCreated = checkedAt.Add(-10*time.Minute + time.Nanosecond)
-	if err := policy.ValidatePlanForExecution(plan, evidence, validExecutionContract(t)); err != nil {
+	if err := policy.ValidatePlanForExecution(plan, evidence, contract); err != nil {
 		t.Fatalf("fresh step-up returned an error: %v", err)
 	}
 
@@ -390,8 +440,73 @@ func TestExecutionGateRequiresFreshSamePlanStepUp(t *testing.T) {
 		changed := validExecutionEvidence(plan, checkedAt)
 		changed.Approval.ServerTimeCreated = checkedAt.Add(-20 * time.Minute)
 		mutate(&changed)
-		expectBlockedKind(t, policy.ValidatePlanForExecution(plan, changed, validExecutionContract(t)), policy.BlockerStepUp)
+		expectBlockedKind(t, policy.ValidatePlanForExecution(plan, changed, contract), policy.BlockerStepUp)
 	}
+}
+
+func TestExecutionGateDerivesStepUpOnlyFromTrustedSteps(t *testing.T) {
+	t.Parallel()
+
+	dataPlan := validPlan()
+	dataPlan.ApprovalClass = domain.ApprovalDataDestructive
+	dataPlan.StepUpRequired = false
+	dataPlan, err := policy.SealPlan(dataPlan)
+	if err != nil {
+		t.Fatalf("SealPlan(data) returned an error: %v", err)
+	}
+	dataContract := executionContractForPlan(t, dataPlan, domain.ApprovalDataDestructive, true, true)
+	checkedAt := dataPlan.CreatedAt.Add(10 * time.Minute)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		dataPlan, validExecutionEvidence(dataPlan, checkedAt), dataContract,
+	), policy.BlockerStepUp)
+
+	dataPlan.StepUpRequired = true
+	dataPlan, err = policy.SealPlan(dataPlan)
+	if err != nil {
+		t.Fatalf("SealPlan(data with step-up) returned an error: %v", err)
+	}
+	dataContract = executionContractForPlan(t, dataPlan, domain.ApprovalDataDestructive, true, true)
+	if err := policy.ValidatePlanForExecution(
+		dataPlan, validExecutionEvidence(dataPlan, checkedAt), dataContract,
+	); err != nil {
+		t.Fatalf("data-destructive AP-5 gate returned an error: %v", err)
+	}
+	withoutRequirement := executionContractForPlan(t, dataPlan, domain.ApprovalDataDestructive, false, true)
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		dataPlan, validExecutionEvidence(dataPlan, checkedAt), withoutRequirement,
+	), policy.BlockerStepUp)
+
+	exposurePlan := validPlan()
+	exposurePlan.ApprovalClass = domain.ApprovalDataDestructive
+	exposurePlan.Exposure = domain.ExposureExternal
+	exposurePlan.ExposureControls = validExposureControls(exposurePlan)
+	exposurePlan.ExposureControls.Profile = domain.ExposureProfileACC08
+	exposurePlan.ExposureControls.Sources[0].Value = "0.0.0.0/0"
+	exposurePlan.ExposureControls.InternetWide = true
+	exposurePlan.ExposureControls.ReviewAt = nil
+	expiresAt := exposurePlan.CreatedAt.Add(time.Hour)
+	exposurePlan.ExposureControls.ExpiresAt = &expiresAt
+	exposurePlan.StepUpRequired = false
+	exposurePlan, err = policy.SealPlan(exposurePlan)
+	if err != nil {
+		t.Fatalf("SealPlan(internet-wide) returned an error: %v", err)
+	}
+	exposureContract := executionContractForPlan(
+		t, exposurePlan, domain.ApprovalDataDestructive, false, true,
+	)
+	if err := policy.ValidatePlanForExecution(
+		exposurePlan, validExecutionEvidence(exposurePlan, checkedAt), exposureContract,
+	); err != nil {
+		t.Fatalf("internet-wide AP-5 without step-up returned an error: %v", err)
+	}
+	exposurePlan.StepUpRequired = true
+	exposurePlan, err = policy.SealPlan(exposurePlan)
+	if err != nil {
+		t.Fatalf("SealPlan(internet-wide forged step-up) returned an error: %v", err)
+	}
+	expectBlockedKind(t, policy.ValidatePlanForExecution(
+		exposurePlan, validExecutionEvidence(exposurePlan, checkedAt), exposureContract,
+	), policy.BlockerStepUp)
 }
 
 func TestPermissionChecksRejectsAmbiguousProbeEvidence(t *testing.T) {
@@ -501,6 +616,7 @@ func validExecutionEvidence(plan domain.Plan, checkedAt time.Time) policy.Execut
 		PolicyHash:       plan.PolicyHash,
 		Preconditions:    append([]domain.PlanPrecondition(nil), plan.Preconditions...),
 		Resources:        append([]domain.PlanResource(nil), plan.Resources...),
+		RecoveryAssets:   append([]domain.PlanRecoveryAsset(nil), plan.Rollback.Assets...),
 		Permissions:      append([]domain.PlanPermission(nil), plan.Permissions...),
 	}
 	if plan.ApprovalClass != domain.ApprovalRead || plan.Intent != nil {
@@ -550,27 +666,57 @@ func validExecutionEvidence(plan domain.Plan, checkedAt time.Time) policy.Execut
 
 func validExecutionContract(t *testing.T) domain.ExecutionContract {
 	t.Helper()
-	definition, err := workflow.NewDefinition("WF-VM-02", "before-old-instance-delete", "stop-instance", []workflow.StepDefinition{
-		{
-			ID:                  "stop-instance",
-			Executor:            "gcloud",
-			ExecutingIdentity:   domain.IdentityOperator,
-			Effect:              domain.StepEffectMutation,
-			MinimumApproval:     domain.ApprovalProtected,
-			TargetKinds:         []string{"instance"},
-			RequiredPermissions: []string{"compute.instances.stop"},
-			Idempotent:          true,
-			Retry: domain.RetryPolicy{
-				MaxAttempts:           3,
-				InitialBackoffSeconds: 2,
-				MaxBackoffSeconds:     10,
+	definition, err := workflow.NewDefinition(
+		"WF-VM-02", "before-old-instance-delete", "stop-instance", domain.PointOfNoReturnStepComplete,
+		[]workflow.StepDefinition{
+			{
+				ID:                  "stop-instance",
+				Executor:            "gcloud",
+				ExecutingIdentity:   domain.IdentityOperator,
+				Effect:              domain.StepEffectMutation,
+				MinimumApproval:     domain.ApprovalProtected,
+				TargetKinds:         []string{"instance"},
+				RequiredPermissions: []string{"compute.instances.stop"},
+				Idempotent:          true,
+				Retry: domain.RetryPolicy{
+					MaxAttempts:           3,
+					InitialBackoffSeconds: 2,
+					MaxBackoffSeconds:     10,
+				},
+				CancelSafe:       false,
+				TimeoutSeconds:   300,
+				SuccessCondition: redact.Sanitize("instance is stopped"),
+				FailureBehavior:  domain.FailureRollback,
 			},
-			CancelSafe:       false,
-			TimeoutSeconds:   300,
-			SuccessCondition: redact.Sanitize("instance is stopped"),
-			FailureBehavior:  domain.FailureRollback,
 		},
-	})
+	)
+	if err != nil {
+		t.Fatalf("NewDefinition() returned an error: %v", err)
+	}
+
+	return definition.ExecutionContract()
+}
+
+func executionContractForPlan(
+	t *testing.T,
+	plan domain.Plan,
+	minimumApproval domain.ApprovalClass,
+	requiresStepUp, requiresRecovery bool,
+) domain.ExecutionContract {
+	t.Helper()
+	step := plan.Steps[0]
+	definition, err := workflow.NewDefinition(
+		plan.WorkflowID, plan.Rollback.Boundary, plan.PointOfNoReturn, plan.PointOfNoReturnTrigger,
+		[]workflow.StepDefinition{{
+			ID: step.ID, Executor: step.Executor, ExecutingIdentity: step.ExecutingIdentity,
+			Effect: domain.StepEffectMutation, MinimumApproval: minimumApproval,
+			TargetKinds: []string{step.Targets[0].Kind}, RequiredPermissions: []string{plan.Permissions[0].Permission},
+			RequiresStepUp: requiresStepUp, RequiresRecoveryAsset: requiresRecovery,
+			Idempotent: step.Idempotent, Retry: step.Retry, CancelSafe: step.CancelSafe,
+			TimeoutSeconds: step.TimeoutSeconds, SuccessCondition: step.SuccessCondition,
+			FailureBehavior: step.FailureBehavior,
+		}},
+	)
 	if err != nil {
 		t.Fatalf("NewDefinition() returned an error: %v", err)
 	}
@@ -597,28 +743,32 @@ func ap4ExecutionPlan(
 	plan.Permissions[0].Permission = permission
 	plan.Permissions[0].Resource = plan.Resources[0]
 	plan.PointOfNoReturn = stepID
+	plan.PointOfNoReturnTrigger = domain.PointOfNoReturnStepComplete
 	sealed, err := policy.SealPlan(plan)
 	if err != nil {
 		t.Fatalf("SealPlan() returned an error: %v", err)
 	}
-	definition, err := workflow.NewDefinition(plan.WorkflowID, plan.Rollback.Boundary, plan.PointOfNoReturn, []workflow.StepDefinition{
-		{
-			ID:                  stepID,
-			Executor:            plan.Steps[0].Executor,
-			ExecutingIdentity:   plan.Steps[0].ExecutingIdentity,
-			Effect:              domain.StepEffectMutation,
-			MinimumApproval:     domain.ApprovalDestructive,
-			TargetKinds:         []string{kind},
-			RequiredPermissions: []string{permission},
-			RequiresStepUp:      requiresStepUp,
-			Idempotent:          plan.Steps[0].Idempotent,
-			Retry:               plan.Steps[0].Retry,
-			CancelSafe:          plan.Steps[0].CancelSafe,
-			TimeoutSeconds:      plan.Steps[0].TimeoutSeconds,
-			SuccessCondition:    plan.Steps[0].SuccessCondition,
-			FailureBehavior:     plan.Steps[0].FailureBehavior,
+	definition, err := workflow.NewDefinition(
+		plan.WorkflowID, plan.Rollback.Boundary, plan.PointOfNoReturn, plan.PointOfNoReturnTrigger,
+		[]workflow.StepDefinition{
+			{
+				ID:                  stepID,
+				Executor:            plan.Steps[0].Executor,
+				ExecutingIdentity:   plan.Steps[0].ExecutingIdentity,
+				Effect:              domain.StepEffectMutation,
+				MinimumApproval:     domain.ApprovalDestructive,
+				TargetKinds:         []string{kind},
+				RequiredPermissions: []string{permission},
+				RequiresStepUp:      requiresStepUp,
+				Idempotent:          plan.Steps[0].Idempotent,
+				Retry:               plan.Steps[0].Retry,
+				CancelSafe:          plan.Steps[0].CancelSafe,
+				TimeoutSeconds:      plan.Steps[0].TimeoutSeconds,
+				SuccessCondition:    plan.Steps[0].SuccessCondition,
+				FailureBehavior:     plan.Steps[0].FailureBehavior,
+			},
 		},
-	})
+	)
 	if err != nil {
 		t.Fatalf("NewDefinition() returned an error: %v", err)
 	}

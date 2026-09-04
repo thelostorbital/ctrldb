@@ -304,6 +304,11 @@ func TestCancellationRestoreRejectsAmbiguousOrMismatchedEvidence(t *testing.T) {
 		t.Fatalf("mismatched restore error = %v, want ErrInvalidCancellation", err)
 	}
 	changedContract := cancellationContract(t, "stop-instance", true)
+	if _, err := workflow.RestoreCancellationController(
+		entries, request.OperationID, request.PlanID, changedContract,
+	); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("swapped execution contract restore error = %v, want ErrInvalidCancellation", err)
+	}
 	restored, err := workflow.RestoreCancellationController(entries, request.OperationID, request.PlanID, contract)
 	if err != nil {
 		t.Fatalf("RestoreCancellationController() returned an error: %v", err)
@@ -316,6 +321,11 @@ func TestCancellationRestoreRejectsAmbiguousOrMismatchedEvidence(t *testing.T) {
 		machineAt(t, domain.OperationExecute), changedContract, entriesWithBoundary,
 	); !errors.Is(err, workflow.ErrInvalidCancellation) {
 		t.Fatalf("changed execution contract error = %v, want ErrInvalidCancellation", err)
+	}
+	if _, _, err := restored.AtBoundary(
+		machineAt(t, domain.OperationPaused), contract, entriesWithBoundary,
+	); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("machine/journal state mismatch error = %v, want ErrInvalidCancellation", err)
 	}
 
 	duplicate := *decision.JournalEntry
@@ -481,6 +491,7 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 	cleanupStep.ID = "cleanup"
 	definition, err := workflow.NewDefinition(
 		"WF-VM-02", "before-irreversible-switch", pointStep.ID,
+		domain.PointOfNoReturnStepComplete,
 		[]workflow.StepDefinition{pointStep, cleanupStep},
 	)
 	if err != nil {
@@ -511,19 +522,9 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 		t.Fatalf("pre-mutation point boundary = (%#v, %v), want CANCELLED", decision, err)
 	}
 
-	for _, mutate := range []func(*domain.JournalEntry){
-		func(entry *domain.JournalEntry) { entry.Step.Outcome = domain.StepDone },
-		func(entry *domain.JournalEntry) {
-			entry.Step.Outcome = domain.StepFailed
-			entry.Step.MutationOccurred = true
-		},
-		func(entry *domain.JournalEntry) {
-			entry.Step.Outcome = domain.StepUnknown
-			entry.Step.EndedAt = nil
-		},
-	} {
+	for _, outcome := range []domain.StepOutcome{domain.StepDone} {
 		entry := cancellationStepEntry(pointStep.ID, 7, request.RequestedAt, false)
-		mutate(&entry)
+		entry.Step.Outcome = outcome
 		atPoint := append(append([]domain.JournalEntry(nil), requested...), entry)
 		if _, err := workflow.RestoreCancellationController(
 			atPoint, request.OperationID, request.PlanID, contract,
@@ -548,7 +549,7 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 	readStep.MinimumApproval = domain.ApprovalRead
 	readStep.FailureBehavior = domain.FailureFail
 	readDefinition, err := workflow.NewDefinition(
-		"WF-VM-02", "none", "", []workflow.StepDefinition{readStep},
+		"WF-VM-02", "none", "", "", []workflow.StepDefinition{readStep},
 	)
 	if err != nil {
 		t.Fatalf("NewDefinition(read) returned an error: %v", err)
@@ -561,6 +562,89 @@ func TestCancellationRefusesRollbackAtOrAfterPointOfNoReturn(t *testing.T) {
 		machineAt(t, domain.OperationPaused), pausedRequest, readDefinition.ExecutionContract(), paused,
 	); !errors.Is(err, workflow.ErrInvalidCancellation) {
 		t.Fatalf("Request() without trusted rollback boundary error = %v, want ErrInvalidCancellation", err)
+	}
+}
+
+func TestCancellationHonorsTrustedPointOfNoReturnTriggers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		trigger          domain.PointOfNoReturnTrigger
+		outcome          domain.StepOutcome
+		mutationOccurred bool
+		wantBlocked      bool
+	}{
+		{name: "step-start failed before mutation", trigger: domain.PointOfNoReturnStepStart, outcome: domain.StepFailed, wantBlocked: true},
+		{name: "step-start in flight", trigger: domain.PointOfNoReturnStepStart, outcome: domain.StepUnknown, wantBlocked: true},
+		{name: "mutation failed before mutation", trigger: domain.PointOfNoReturnMutationObserved, outcome: domain.StepFailed},
+		{name: "mutation observed", trigger: domain.PointOfNoReturnMutationObserved, outcome: domain.StepFailed, mutationOccurred: true, wantBlocked: true},
+		{name: "mutation unknown", trigger: domain.PointOfNoReturnMutationObserved, outcome: domain.StepUnknown, wantBlocked: true},
+		{name: "mutation trigger completed without mutation", trigger: domain.PointOfNoReturnMutationObserved, outcome: domain.StepDone},
+		{name: "complete trigger failed after mutation", trigger: domain.PointOfNoReturnStepComplete, outcome: domain.StepFailed, mutationOccurred: true},
+		{name: "complete trigger unknown", trigger: domain.PointOfNoReturnStepComplete, outcome: domain.StepUnknown},
+		{name: "complete trigger done", trigger: domain.PointOfNoReturnStepComplete, outcome: domain.StepDone, wantBlocked: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			step := validDefinitionStep()
+			definition, err := workflow.NewDefinition(
+				"WF-VM-02", "before-old-instance-delete", step.ID, test.trigger,
+				[]workflow.StepDefinition{step},
+			)
+			if err != nil {
+				t.Fatalf("NewDefinition() returned an error: %v", err)
+			}
+			contract := definition.ExecutionContract()
+			request := validCancellationRequest()
+			base := validJournal()[:5]
+			var controller workflow.CancellationController
+			_, persist, err := controller.Request(machineAt(t, domain.OperationExecute), request, contract, base)
+			if err != nil {
+				t.Fatalf("Request() returned an error: %v", err)
+			}
+			entry := cancellationStepEntry(step.ID, 7, request.RequestedAt, test.mutationOccurred)
+			entry.Step.Outcome = test.outcome
+			if test.outcome == domain.StepUnknown {
+				entry.Step.EndedAt = nil
+			}
+			entries := append(append(append([]domain.JournalEntry(nil), base...), *persist.JournalEntry), entry)
+			_, err = workflow.RestoreCancellationController(entries, request.OperationID, request.PlanID, contract)
+			if test.wantBlocked && !errors.Is(err, workflow.ErrInvalidCancellation) {
+				t.Fatalf("RestoreCancellationController() error = %v, want ErrInvalidCancellation", err)
+			}
+			if !test.wantBlocked && err != nil {
+				t.Fatalf("RestoreCancellationController() returned an error: %v", err)
+			}
+		})
+	}
+
+	point := validDefinitionStep()
+	later := validDefinitionStep()
+	later.ID = "cleanup"
+	definition, err := workflow.NewDefinition(
+		"WF-VM-02", "before-old-instance-delete", point.ID, domain.PointOfNoReturnMutationObserved,
+		[]workflow.StepDefinition{point, later},
+	)
+	if err != nil {
+		t.Fatalf("NewDefinition() returned an error: %v", err)
+	}
+	request := validCancellationRequest()
+	journal := append([]domain.JournalEntry(nil), validJournal()[:5]...)
+	failedPoint := cancellationStepEntry(point.ID, 6, request.RequestedAt.Add(-2*time.Second), false)
+	failedPoint.Step.Outcome = domain.StepFailed
+	journal = append(journal, failedPoint)
+	laterEntry := cancellationStepEntry(later.ID, 7, request.RequestedAt, false)
+	journal = append(journal, laterEntry)
+	request.Sequence = 8
+	request.RequestedAt = laterEntry.RecordedAt.Add(time.Second)
+	var controller workflow.CancellationController
+	if _, _, err := controller.Request(
+		machineAt(t, domain.OperationExecute), request, definition.ExecutionContract(), journal,
+	); !errors.Is(err, workflow.ErrInvalidCancellation) {
+		t.Fatalf("Request() after a later step error = %v, want ErrInvalidCancellation", err)
 	}
 }
 
@@ -579,7 +663,7 @@ func cancellationContract(t *testing.T, stepID string, cancelSafe bool) domain.E
 	step.ID = stepID
 	step.CancelSafe = cancelSafe
 	definition, err := workflow.NewDefinition(
-		"WF-VM-02", "before-old-instance-delete", "", []workflow.StepDefinition{step},
+		"WF-VM-02", "before-old-instance-delete", "", "", []workflow.StepDefinition{step},
 	)
 	if err != nil {
 		t.Fatalf("NewDefinition() returned an error: %v", err)

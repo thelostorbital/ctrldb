@@ -45,12 +45,13 @@ type CancellationController struct {
 }
 
 type cancellationBinding struct {
-	operationID string
-	planID      string
-	sequence    uint64
-	requestedAt time.Time
-	stepID      string
-	cancelSafe  bool
+	operationID  string
+	planID       string
+	contractHash string
+	sequence     uint64
+	requestedAt  time.Time
+	stepID       string
+	cancelSafe   bool
 }
 
 // CancellationRequest contains the complete data needed to construct the
@@ -130,7 +131,7 @@ func (controller CancellationController) Request(
 	}
 	binding := cancellationBinding{
 		operationID: request.OperationID, planID: request.PlanID,
-		sequence: request.Sequence, requestedAt: request.RequestedAt,
+		contractHash: contract.Digest(), sequence: request.Sequence, requestedAt: request.RequestedAt,
 	}
 	if cancellationStateIsStructurallyPreMutation(current) {
 		return routeCancellationTo(controller, machine, domain.OperationCancelled, binding)
@@ -154,7 +155,7 @@ func (controller CancellationController) Request(
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q has no safe cancellation route", ErrInvalidCancellation, current)
 	}
 
-	entry := cancellationJournalEntry(request, current, step.ID, observation)
+	entry := cancellationJournalEntry(request, current, step.ID, contract.Digest(), observation)
 	stream := append(append([]domain.JournalEntry(nil), entries...), entry)
 	if err := ValidateJournal(stream); err != nil {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: request does not extend the durable journal", ErrInvalidCancellation)
@@ -186,6 +187,11 @@ func (controller CancellationController) AtBoundary(
 	}
 	if !controller.queued {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: no durable cancellation request", ErrInvalidCancellation)
+	}
+	if len(entries) == 0 || entries[len(entries)-1].OperationState != current {
+		return controller, CancellationDecision{}, fmt.Errorf(
+			"%w: journal state does not match the current machine boundary", ErrInvalidCancellation,
+		)
 	}
 	fresh, err := RestoreCancellationController(entries, machine.operationID, machine.planID, contract)
 	if err != nil || !fresh.queued || fresh.binding != controller.binding {
@@ -279,6 +285,9 @@ func RestoreCancellationController(
 	if len(entries) == 0 || entries[0].OperationID != operationID || entries[0].PlanID != planID {
 		return CancellationController{}, fmt.Errorf("%w: journal binding mismatch", ErrInvalidCancellation)
 	}
+	if !contractDigestPattern.MatchString(contract.Digest()) {
+		return CancellationController{}, fmt.Errorf("%w: invalid execution contract", ErrInvalidCancellation)
+	}
 	if pointOfNoReturnReached(contract, entries) {
 		return CancellationController{}, fmt.Errorf("%w: point of no return has been reached", ErrInvalidCancellation)
 	}
@@ -292,18 +301,24 @@ func RestoreCancellationController(
 			}
 		}
 		if entry.Kind == domain.JournalEntryCancellationRequest {
+			if entry.Cancellation.ExecutionContractHash != contract.Digest() {
+				return CancellationController{}, fmt.Errorf(
+					"%w: cancellation request does not match the execution contract", ErrInvalidCancellation,
+				)
+			}
 			step, ok := executionContractStep(contract, entry.Cancellation.CurrentStepID)
 			if !ok {
 				return CancellationController{}, fmt.Errorf("%w: cancellation step is outside the execution contract", ErrInvalidCancellation)
 			}
 			target = entry.Cancellation.RequiredRoute
 			binding = cancellationBinding{
-				operationID: entry.OperationID,
-				planID:      entry.PlanID,
-				sequence:    entry.Sequence,
-				requestedAt: entry.Cancellation.RequestedAt,
-				stepID:      step.ID,
-				cancelSafe:  step.CancelSafe,
+				operationID:  entry.OperationID,
+				planID:       entry.PlanID,
+				contractHash: entry.Cancellation.ExecutionContractHash,
+				sequence:     entry.Sequence,
+				requestedAt:  entry.Cancellation.RequestedAt,
+				stepID:       step.ID,
+				cancelSafe:   step.CancelSafe,
 			}
 			continue
 		}
@@ -344,6 +359,9 @@ func cancellationContext(
 ) (domain.ExecutionStepContract, domain.MutationObservation, error) {
 	if err := ValidateJournal(entries); err != nil || len(entries) == 0 {
 		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: invalid durable journal", ErrInvalidCancellation)
+	}
+	if !contractDigestPattern.MatchString(contract.Digest()) {
+		return domain.ExecutionStepContract{}, "", fmt.Errorf("%w: invalid execution contract", ErrInvalidCancellation)
 	}
 	if pointOfNoReturnReached(contract, entries) {
 		return domain.ExecutionStepContract{}, "", fmt.Errorf(
@@ -410,6 +428,10 @@ func pointOfNoReturnReached(contract domain.ExecutionContract, entries []domain.
 	if pointIndex < 0 {
 		return true
 	}
+	trigger := contract.PointOfNoReturnTrigger()
+	if !trigger.Valid() {
+		return true
+	}
 	for _, entry := range entries {
 		if entry.Kind != domain.JournalEntryStep {
 			continue
@@ -418,9 +440,23 @@ func pointOfNoReturnReached(contract domain.ExecutionContract, entries []domain.
 		if !exists {
 			return true
 		}
-		if index > pointIndex || index == pointIndex &&
-			(entry.Step.Outcome == domain.StepDone || entry.Step.Outcome == domain.StepUnknown || entry.Step.MutationOccurred) {
+		if index > pointIndex {
 			return true
+		}
+		if index != pointIndex {
+			continue
+		}
+		switch trigger {
+		case domain.PointOfNoReturnStepStart:
+			return true
+		case domain.PointOfNoReturnMutationObserved:
+			if entry.Step.MutationOccurred || entry.Step.Outcome == domain.StepUnknown {
+				return true
+			}
+		case domain.PointOfNoReturnStepComplete:
+			if entry.Step.Outcome == domain.StepDone {
+				return true
+			}
 		}
 	}
 
@@ -469,6 +505,7 @@ func cancellationJournalEntry(
 	request CancellationRequest,
 	state domain.OperationState,
 	stepID string,
+	contractHash string,
 	observation domain.MutationObservation,
 ) domain.JournalEntry {
 	return domain.JournalEntry{
@@ -480,10 +517,11 @@ func cancellationJournalEntry(
 		RecordedAt:     request.RequestedAt,
 		OperationState: state,
 		Cancellation: &domain.JournalCancellationRequest{
-			RequestedAt:         request.RequestedAt,
-			CurrentStepID:       stepID,
-			MutationObservation: observation,
-			RequiredRoute:       cancellationTarget(observation != domain.MutationNotOccurred),
+			RequestedAt:           request.RequestedAt,
+			CurrentStepID:         stepID,
+			ExecutionContractHash: contractHash,
+			MutationObservation:   observation,
+			RequiredRoute:         cancellationTarget(observation != domain.MutationNotOccurred),
 		},
 	}
 }

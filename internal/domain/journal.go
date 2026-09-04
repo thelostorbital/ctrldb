@@ -114,10 +114,11 @@ type JournalEntry struct {
 // JournalCancellationRequest is the durable proof that an unsafe-boundary
 // cancellation was requested and which fail-closed route must be honored.
 type JournalCancellationRequest struct {
-	RequestedAt         time.Time           `json:"requestedAt"`
-	CurrentStepID       string              `json:"currentStepId"`
-	MutationObservation MutationObservation `json:"mutationObservation"`
-	RequiredRoute       OperationState      `json:"requiredRoute"`
+	RequestedAt           time.Time           `json:"requestedAt"`
+	CurrentStepID         string              `json:"currentStepId"`
+	ExecutionContractHash string              `json:"executionContractHash"`
+	MutationObservation   MutationObservation `json:"mutationObservation"`
+	RequiredRoute         OperationState      `json:"requiredRoute"`
 }
 
 // JournalStep records one observed attempt without persisting raw output.

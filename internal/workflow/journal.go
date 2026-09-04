@@ -353,7 +353,11 @@ func ValidateJournal(entries []domain.JournalEntry) error {
 				if entry.OperationState != domain.OperationDiscover {
 					return journalStreamError(index+1, "first transition must be DISCOVER")
 				}
-				machine = NewMachine()
+				var err error
+				machine, err = NewMachine(operationID, planID)
+				if err != nil {
+					return journalStreamError(index+1, "initial transition has an invalid machine binding")
+				}
 				continue
 			}
 			if pendingCancellation != "" && CanTransition(machine.State(), pendingCancellation) &&

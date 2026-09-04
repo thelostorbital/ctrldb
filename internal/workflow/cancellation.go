@@ -116,6 +116,9 @@ func (controller CancellationController) Request(
 		return controller, CancellationDecision{}, fmt.Errorf("%w: nil machine", ErrInvalidCancellation)
 	}
 	current := machine.State()
+	if machine.operationID != request.OperationID || machine.planID != request.PlanID {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: request does not match machine binding", ErrInvalidCancellation)
+	}
 	if controller.queued {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: cancellation request already recorded", ErrInvalidCancellation)
 	}
@@ -163,6 +166,9 @@ func (controller CancellationController) AtBoundary(
 		return controller, CancellationDecision{}, fmt.Errorf("%w: nil machine", ErrInvalidCancellation)
 	}
 	current := machine.State()
+	if !controller.binding.matchesMachine(machine) && controller.queued {
+		return controller, CancellationDecision{}, fmt.Errorf("%w: queued request does not match machine binding", ErrInvalidCancellation)
+	}
 	if !current.Valid() || current.Terminal() {
 		return controller, CancellationDecision{}, fmt.Errorf("%w: state %q cannot reach a cancellation boundary", ErrInvalidCancellation, current)
 	}
@@ -185,7 +191,7 @@ func (controller CancellationController) AtBoundary(
 func (machine *Machine) ApplyCancellation(decision CancellationDecision) error {
 	if machine == nil || decision.authorization == nil || decision.authorization.machine != machine ||
 		decision.authorization.target != decision.Target ||
-		decision.authorization.binding.operationID == "" || decision.authorization.binding.planID == "" ||
+		!decision.authorization.binding.matchesMachine(machine) ||
 		decision.authorization.binding.sequence == 0 || decision.authorization.binding.requestedAt.IsZero() ||
 		!cancellationActionMatchesTarget(decision.Action, decision.Target) {
 		return fmt.Errorf("%w: missing or mismatched authorization", ErrInvalidCancellation)
@@ -198,6 +204,10 @@ func (machine *Machine) ApplyCancellation(decision CancellationDecision) error {
 	}
 
 	return machine.transition(decision.Target, true)
+}
+
+func (binding cancellationBinding) matchesMachine(machine *Machine) bool {
+	return machine != nil && binding.operationID == machine.operationID && binding.planID == machine.planID
 }
 
 func cancellationActionMatchesTarget(action CancellationAction, target domain.OperationState) bool {

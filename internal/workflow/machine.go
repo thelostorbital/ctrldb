@@ -15,6 +15,10 @@ import (
 // transition. The current state is unchanged when this error is returned.
 var ErrInvalidTransition = errors.New("invalid operation transition")
 
+// ErrInvalidMachineBinding is returned when a machine is not bound to one
+// canonical operation and reviewed plan.
+var ErrInvalidMachineBinding = errors.New("invalid operation machine binding")
+
 var transitions = map[domain.OperationState]map[domain.OperationState]struct{}{
 	domain.OperationDiscover: {
 		domain.OperationValidate:  {},
@@ -80,22 +84,27 @@ var transitions = map[domain.OperationState]map[domain.OperationState]struct{}{
 // Machine validates durable operation-state transitions. Persistence and
 // side-effects are deliberately owned by higher-level engine components.
 type Machine struct {
-	state      domain.OperationState
-	generation uint64
+	operationID string
+	planID      string
+	state       domain.OperationState
+	generation  uint64
 }
 
 // NewMachine creates a workflow at its mandatory discovery boundary.
-func NewMachine() *Machine {
-	return &Machine{state: domain.OperationDiscover}
+func NewMachine(operationID, planID string) (*Machine, error) {
+	return RestoreMachine(operationID, planID, domain.OperationDiscover)
 }
 
 // RestoreMachine validates and restores a previously journaled state.
-func RestoreMachine(state domain.OperationState) (*Machine, error) {
+func RestoreMachine(operationID, planID string, state domain.OperationState) (*Machine, error) {
+	if !operationIDPattern.MatchString(operationID) || !journalPlanIDPattern.MatchString(planID) {
+		return nil, ErrInvalidMachineBinding
+	}
 	if !state.Valid() {
 		return nil, fmt.Errorf("%w: restore %q", domain.ErrInvalidOperationState, state)
 	}
 
-	return &Machine{state: state}, nil
+	return &Machine{operationID: operationID, planID: planID, state: state}, nil
 }
 
 // State returns the current durable operation state.

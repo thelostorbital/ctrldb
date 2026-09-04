@@ -269,6 +269,38 @@ func TestCancellationRestoreRejectsAmbiguousOrMismatchedEvidence(t *testing.T) {
 	}
 }
 
+func TestRestoredCancellationCannotRouteAnotherOperationMachine(t *testing.T) {
+	t.Parallel()
+
+	request := validCancellationRequest(domain.OperationExecute, domain.MutationUnknown)
+	var controller workflow.CancellationController
+	_, decision, err := controller.Request(machineAt(t, domain.OperationExecute), request, false)
+	if err != nil {
+		t.Fatalf("Request() returned an error: %v", err)
+	}
+	entries := append(validJournal()[:5], *decision.JournalEntry)
+	restored, err := workflow.RestoreCancellationController(entries, request.OperationID, request.PlanID)
+	if err != nil {
+		t.Fatalf("RestoreCancellationController() returned an error: %v", err)
+	}
+
+	for _, binding := range []struct {
+		operationID string
+		planID      string
+	}{
+		{operationID: "op-fedcba9876543210", planID: request.PlanID},
+		{operationID: request.OperationID, planID: "plan-fedcba9876543210"},
+	} {
+		machine, restoreErr := workflow.RestoreMachine(binding.operationID, binding.planID, domain.OperationExecute)
+		if restoreErr != nil {
+			t.Fatalf("RestoreMachine() returned an error: %v", restoreErr)
+		}
+		if _, _, routeErr := restored.AtBoundary(machine, true); !errors.Is(routeErr, workflow.ErrInvalidCancellation) {
+			t.Fatalf("AtBoundary(other binding) error = %v, want ErrInvalidCancellation", routeErr)
+		}
+	}
+}
+
 func TestCancellationJournalMustBeHonoredAtFirstCompatibleBoundary(t *testing.T) {
 	t.Parallel()
 

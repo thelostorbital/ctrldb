@@ -682,6 +682,80 @@ func TestPreMutationPolicyOwnsCapacityCapsAndConfiguredCIDR(t *testing.T) {
 	if _, err := isolation.AuthorizePreMutation(invalidPolicy, validPreMutationInput(), authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("AuthorizePreMutation(invalid trusted caps) error = %v; want ErrInvalidGuardInput", err)
 	}
+	invalidPolicy = policy
+	invalidPolicy.ProjectID = ""
+	if _, err := isolation.AuthorizePreMutation(invalidPolicy, validPreMutationInput(), authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(missing trusted project) error = %v; want ErrInvalidGuardInput", err)
+	}
+}
+
+func TestPreMutationPolicyProjectBoundaryCoversEveryResourceFamily(t *testing.T) {
+	t.Parallel()
+
+	const otherProject = "another-test-project"
+	tests := []struct {
+		name   string
+		mutate func(*isolation.PreMutationInput, *isolation.PreMutationPolicy)
+	}{
+		{name: "selected target and planned instance", mutate: func(input *isolation.PreMutationInput, _ *isolation.PreMutationPolicy) {
+			moveResourceProject(&input.Targets[0].Identity, otherProject)
+			moveResourceProject(&input.Capacity.Instances[0].Identity, otherProject)
+			refreshCapacityFingerprint(&input.Capacity)
+		}},
+		{name: "planned disk", mutate: func(input *isolation.PreMutationInput, _ *isolation.PreMutationPolicy) {
+			moveResourceProject(&input.Capacity.Disks[0].Identity, otherProject)
+			refreshCapacityFingerprint(&input.Capacity)
+		}},
+		{name: "firewall identity and network", mutate: func(input *isolation.PreMutationInput, _ *isolation.PreMutationPolicy) {
+			moveResourceProject(&input.Targets[1].Identity, otherProject)
+			moveResourceProject(&input.FirewallRules[0].Identity, otherProject)
+			moveResourceProject(&input.FirewallRules[0].Network, otherProject)
+		}},
+		{name: "expected and observed permission resources", mutate: func(input *isolation.PreMutationInput, policy *isolation.PreMutationPolicy) {
+			moveResourceProject(&input.Permissions.Expected[0].Resource, otherProject)
+			moveResourceProject(&input.Permissions.Observed[0].Resource, otherProject)
+			refreshPermissionInventory(policy, input.Permissions.Expected)
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			input := validPreMutationInput()
+			policy := validPreMutationPolicy()
+			test.mutate(&input, &policy)
+			if _, err := isolation.AuthorizePreMutation(policy, input, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+				t.Fatalf("AuthorizePreMutation(cross-project resource) error = %v; want ErrInvalidGuardInput", err)
+			}
+		})
+	}
+}
+
+func TestPreMutationProjectCannotBeWhollyRecomputedOrSwapped(t *testing.T) {
+	t.Parallel()
+
+	const otherProject = "another-test-project"
+	policy := validPreMutationPolicy()
+	moved := validPreMutationInput()
+	moveAllResourceProjects(&moved, otherProject)
+	refreshPermissionInventory(&policy, moved.Permissions.Expected)
+	if _, err := isolation.AuthorizePreMutation(policy, moved, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("AuthorizePreMutation(wholesale project move) error = %v; want ErrInvalidGuardInput", err)
+	}
+
+	originalPolicy := validPreMutationPolicy()
+	decision, err := isolation.AuthorizePreMutation(originalPolicy, validPreMutationInput(), authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	switchedPolicy := originalPolicy
+	switchedPolicy.ProjectID = otherProject
+	fresh := freshPreMutationInput()
+	moveAllResourceProjects(&fresh, otherProject)
+	refreshPermissionInventory(&switchedPolicy, fresh.Permissions.Expected)
+	if _, err := isolation.RevalidatePreMutation(decision, switchedPolicy, fresh, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(wholesale project swap) error = %v; want ErrProofMismatch", err)
+	}
 }
 
 func TestPolicyInventoryFingerprintsAreOrderIndependentAndRejectDuplicates(t *testing.T) {
@@ -736,6 +810,19 @@ func TestPreMutationUsesIndependentBoundaryTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
 	}
+	newerButBeforeAuthorization := validPreMutationInput()
+	newerButBeforeAuthorization.Freshness.ObservedAt = newerButBeforeAuthorization.Freshness.ObservedAt.Add(time.Second)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, newerButBeforeAuthorization, revalidationNow()); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(observation before authorization) error = %v; want ErrStaleProof", err)
+	}
+	equalToAuthorization := validPreMutationInput()
+	equalToAuthorization.Freshness.ObservedAt = authorizationNow()
+	if _, err := isolation.RevalidatePreMutation(decision, policy, equalToAuthorization, revalidationNow()); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(observation at authorization) error = %v; want ErrStaleProof", err)
+	}
+	if _, err := isolation.RevalidatePreMutation(decision, policy, freshPreMutationInput(), authorizationNow().Add(-time.Nanosecond)); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(regressed boundary clock) error = %v; want ErrStaleProof", err)
+	}
 	fresh := freshPreMutationInput()
 	if _, err := isolation.RevalidatePreMutation(decision, policy, fresh, fresh.Freshness.ObservedAt.Add(-time.Nanosecond)); !errors.Is(err, isolation.ErrStaleProof) {
 		t.Fatalf("RevalidatePreMutation(future rediscovery) error = %v; want ErrStaleProof", err)
@@ -789,7 +876,7 @@ func TestPreMutationDecisionRejectsStaleSwappedAndExpiredEvidence(t *testing.T) 
 		t.Fatalf("RevalidatePreMutation(extended expiry) error = %v; want ErrStaleProof", err)
 	}
 	swapped := freshPreMutationInput()
-	swapped.Targets[0].Identity.Project = "another-test-project"
+	swapped.Targets[0].Identity.Name = "ctrldb-test-run1-replacement"
 	swapped.Targets[0].Identity.CanonicalKey = mustCanonicalTargetKey(swapped.Targets[0].Identity)
 	swapped.Capacity.Instances[0].Identity = swapped.Targets[0].Identity
 	refreshCapacityFingerprint(&swapped.Capacity)
@@ -881,7 +968,7 @@ func validPreMutationInput() isolation.PreMutationInput {
 
 func freshPreMutationInput() isolation.PreMutationInput {
 	input := validPreMutationInput()
-	input.Freshness.ObservedAt = input.Freshness.ObservedAt.Add(time.Second)
+	input.Freshness.ObservedAt = input.Freshness.ObservedAt.Add(45 * time.Second)
 	return input
 }
 
@@ -908,6 +995,7 @@ func validPreMutationPolicy() isolation.PreMutationPolicy {
 		panic(err)
 	}
 	return isolation.PreMutationPolicy{
+		ProjectID:           "example-test-project",
 		RunLimits:           defaultLimits(),
 		TestCIDR:            input.TestCIDR,
 		PermissionInventory: isolation.PolicyInventoryPin{ID: "permission-inventory", Version: "v1", Fingerprint: permissions},
@@ -924,6 +1012,42 @@ func refreshCapacityFingerprint(capacity *isolation.CapacityProofInput) {
 		panic(err)
 	}
 	capacity.SnapshotFingerprint = fingerprint
+}
+
+func refreshPermissionInventory(policy *isolation.PreMutationPolicy, expected []isolation.PermissionObservation) {
+	fingerprint, err := isolation.PermissionInventoryFingerprint(expected)
+	if err != nil {
+		panic(err)
+	}
+	policy.PermissionInventory.Fingerprint = fingerprint
+}
+
+func moveResourceProject(identity *isolation.ResourceIdentity, project string) {
+	identity.Project = project
+	identity.CanonicalKey = mustCanonicalTargetKey(*identity)
+}
+
+func moveAllResourceProjects(input *isolation.PreMutationInput, project string) {
+	for index := range input.Targets {
+		moveResourceProject(&input.Targets[index].Identity, project)
+	}
+	for index := range input.Capacity.Instances {
+		moveResourceProject(&input.Capacity.Instances[index].Identity, project)
+	}
+	for index := range input.Capacity.Disks {
+		moveResourceProject(&input.Capacity.Disks[index].Identity, project)
+	}
+	for index := range input.FirewallRules {
+		moveResourceProject(&input.FirewallRules[index].Identity, project)
+		moveResourceProject(&input.FirewallRules[index].Network, project)
+	}
+	for index := range input.Permissions.Expected {
+		moveResourceProject(&input.Permissions.Expected[index].Resource, project)
+	}
+	for index := range input.Permissions.Observed {
+		moveResourceProject(&input.Permissions.Observed[index].Resource, project)
+	}
+	refreshCapacityFingerprint(&input.Capacity)
 }
 
 func testTarget(name, runID string) isolation.MutationTarget {

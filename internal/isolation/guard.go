@@ -507,10 +507,13 @@ type PolicyInventoryPin struct {
 	Fingerprint string
 }
 
-// PreMutationPolicy contains trusted resolved caps, the exact configured test
-// CIDR, and three independent complete-inventory pins. This pure type does not
-// itself prove the caller sourced those policy values authoritatively.
+// PreMutationPolicy contains the trusted project boundary, resolved caps, the
+// exact configured test CIDR, and three independent complete-inventory pins.
+// The decision fingerprint binds ProjectID alongside the immutable plan
+// identity and every resource observation. This pure type does not itself
+// prove the caller sourced those policy values authoritatively.
 type PreMutationPolicy struct {
+	ProjectID                         string
 	RunLimits                         RunLimits
 	TestCIDR                          string
 	PermissionInventory               PolicyInventoryPin
@@ -540,10 +543,10 @@ type PreMutationInput struct {
 // mutate and exposes no targets; RevalidatePreMutation must match it against a
 // newer fresh observation at the mutation boundary.
 type PreMutationDecision struct {
-	fingerprint [sha256.Size]byte
-	operation   OperationBinding
-	observedAt  time.Time
-	validUntil  time.Time
+	fingerprint  [sha256.Size]byte
+	operation    OperationBinding
+	authorizedAt time.Time
+	validUntil   time.Time
 }
 
 // MutationBoundary is the detached result for immediate provider-boundary
@@ -564,21 +567,25 @@ func AuthorizePreMutation(policy PreMutationPolicy, input PreMutationInput, now 
 		return PreMutationDecision{}, err
 	}
 	return PreMutationDecision{
-		fingerprint: fingerprint,
-		operation:   input.Operation,
-		observedAt:  input.Freshness.ObservedAt,
-		validUntil:  input.Freshness.ValidUntil,
+		fingerprint:  fingerprint,
+		operation:    input.Operation,
+		authorizedAt: now,
+		validUntil:   input.Freshness.ValidUntil,
 	}, nil
 }
 
 // RevalidatePreMutation reevaluates fresh input at the mutation boundary and
 // returns detached exact targets only when no semantic evidence changed. The
 // returned targets are for immediate provider-boundary consumption only. The
-// fresh observation must be newer and retain the original fixed expiry. The
-// caller must independently sample now at this boundary.
+// fresh observation must be strictly newer than the authorization boundary
+// and retain the original fixed expiry. The caller must independently sample
+// now at this boundary; that clock cannot move backward from authorization.
 func RevalidatePreMutation(decision PreMutationDecision, policy PreMutationPolicy, fresh PreMutationInput, now time.Time) (MutationBoundary, error) {
-	if decision.validUntil.IsZero() || !fresh.Freshness.ObservedAt.After(decision.observedAt) ||
-		!fresh.Freshness.ValidUntil.Equal(decision.validUntil) {
+	if now.IsZero() {
+		return MutationBoundary{}, guardError(ErrInvalidGuardInput, "now", "must not be zero")
+	}
+	if decision.authorizedAt.IsZero() || decision.validUntil.IsZero() || now.Before(decision.authorizedAt) ||
+		!fresh.Freshness.ObservedAt.After(decision.authorizedAt) || !fresh.Freshness.ValidUntil.Equal(decision.validUntil) {
 		return MutationBoundary{}, guardError(ErrStaleProof, "freshness", "does not satisfy immediate revalidation")
 	}
 	targets, fingerprint, err := evaluatePreMutation(policy, fresh, now)
@@ -607,6 +614,9 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	}
 	targets, err := SelectRunMutationTargets(input.RunID, input.Targets)
 	if err != nil {
+		return nil, zero, err
+	}
+	if err := validatePreMutationProject(policy.ProjectID, input, targets); err != nil {
 		return nil, zero, err
 	}
 	if err := validateCapacityProof(input.Capacity, policy.RunLimits, input.RunID, targets); err != nil {
@@ -871,6 +881,9 @@ func validateOperationBinding(binding OperationBinding) error {
 }
 
 func validatePreMutationPolicy(policy PreMutationPolicy, input PreMutationInput) error {
+	if !projectIDPattern.MatchString(policy.ProjectID) {
+		return guardError(ErrInvalidGuardInput, "policy.projectID", "must be a canonical explicit project ID")
+	}
 	if err := validateRunLimits(policy.RunLimits); err != nil {
 		return err
 	}
@@ -899,6 +912,50 @@ func validatePreMutationPolicy(policy PreMutationPolicy, input PreMutationInput)
 	}
 	if cidrs != policy.ProductionCIDRInventory.Fingerprint {
 		return guardError(ErrInvalidGuardInput, "policy.productionCIDRInventory", "does not match the supplied complete CIDR set")
+	}
+	return nil
+}
+
+func validatePreMutationProject(projectID string, input PreMutationInput, targets []MutationTarget) error {
+	requireProject := func(path string, identity ResourceIdentity) error {
+		if identity.Project != projectID {
+			return guardError(ErrInvalidGuardInput, path, "does not match the configured project")
+		}
+		return nil
+	}
+	for index, target := range targets {
+		if err := requireProject(indexedField("targets", index)+".identity.project", target.Identity); err != nil {
+			return err
+		}
+	}
+	for index, instance := range input.Capacity.Instances {
+		if err := requireProject(indexedField("capacity.instances", index)+".identity.project", instance.Identity); err != nil {
+			return err
+		}
+	}
+	for index, disk := range input.Capacity.Disks {
+		if err := requireProject(indexedField("capacity.disks", index)+".identity.project", disk.Identity); err != nil {
+			return err
+		}
+	}
+	for index, rule := range input.FirewallRules {
+		path := indexedField("firewallRules", index)
+		if err := requireProject(path+".identity.project", rule.Identity); err != nil {
+			return err
+		}
+		if err := requireProject(path+".network.project", rule.Network); err != nil {
+			return err
+		}
+	}
+	for index, observation := range input.Permissions.Expected {
+		if err := requireProject(indexedField("permissions.expected", index)+".resource.project", observation.Resource); err != nil {
+			return err
+		}
+	}
+	for index, observation := range input.Permissions.Observed {
+		if err := requireProject(indexedField("permissions.observed", index)+".resource.project", observation.Resource); err != nil {
+			return err
+		}
 	}
 	return nil
 }

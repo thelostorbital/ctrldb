@@ -792,9 +792,16 @@ func TestPreMutationRequiresExactPermissionForEachEmittedFirewallInsert(t *testi
 		name   string
 		mutate func(*isolation.PreMutationInput)
 	}{
-		{name: "missing", mutate: func(input *isolation.PreMutationInput) {
+		{name: "missing firewall create", mutate: func(input *isolation.PreMutationInput) {
 			input.Permissions.Expected = withoutFirewallCreatePermission(input.Permissions.Expected)
 			input.Permissions.Observed = withoutFirewallCreatePermission(input.Permissions.Observed)
+		}},
+		{name: "missing network update policy", mutate: func(input *isolation.PreMutationInput) {
+			input.Permissions.Expected = withoutPermission(input.Permissions.Expected, "compute.networks.updatePolicy")
+			input.Permissions.Observed = withoutPermission(input.Permissions.Observed, "compute.networks.updatePolicy")
+		}},
+		{name: "network update policy denied", mutate: func(input *isolation.PreMutationInput) {
+			mutatePermission(input, "compute.networks.updatePolicy", func(value *isolation.PermissionObservation) { value.Granted = false })
 		}},
 		{name: "denied", mutate: func(input *isolation.PreMutationInput) {
 			mutateFirewallCreatePermission(input, func(value *isolation.PermissionObservation) { value.Granted = false })
@@ -1803,9 +1810,13 @@ func refreshPermissionInventory(policy *isolation.PreMutationPolicy, expected []
 }
 
 func withoutFirewallCreatePermission(values []isolation.PermissionObservation) []isolation.PermissionObservation {
+	return withoutPermission(values, "compute.firewalls.create")
+}
+
+func withoutPermission(values []isolation.PermissionObservation, permission string) []isolation.PermissionObservation {
 	filtered := make([]isolation.PermissionObservation, 0, len(values))
 	for _, value := range values {
-		if value.Permission != "compute.firewalls.create" {
+		if value.Permission != permission {
 			filtered = append(filtered, value)
 		}
 	}
@@ -1813,13 +1824,17 @@ func withoutFirewallCreatePermission(values []isolation.PermissionObservation) [
 }
 
 func mutateFirewallCreatePermission(input *isolation.PreMutationInput, mutate func(*isolation.PermissionObservation)) {
+	mutatePermission(input, "compute.firewalls.create", mutate)
+}
+
+func mutatePermission(input *isolation.PreMutationInput, permission string, mutate func(*isolation.PermissionObservation)) {
 	for index := range input.Permissions.Expected {
-		if input.Permissions.Expected[index].Permission == "compute.firewalls.create" {
+		if input.Permissions.Expected[index].Permission == permission {
 			mutate(&input.Permissions.Expected[index])
 		}
 	}
 	for index := range input.Permissions.Observed {
-		if input.Permissions.Observed[index].Permission == "compute.firewalls.create" {
+		if input.Permissions.Observed[index].Permission == permission {
 			mutate(&input.Permissions.Observed[index])
 		}
 	}

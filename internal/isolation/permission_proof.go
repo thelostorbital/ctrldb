@@ -23,7 +23,10 @@ var (
 	permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*){2,}$`)
 )
 
-const computeFirewallCreatePermission = "compute.firewalls.create"
+var computeFirewallInsertPermissions = [...]string{
+	"compute.firewalls.create",
+	"compute.networks.updatePolicy",
+}
 
 // PermissionObservation is one exact testIamPermissions-style observation.
 // Expected and observed slices use the same tuple shape so callers, rather
@@ -152,11 +155,7 @@ func validateEmittedIntentPermissions(projectID string, proof PermissionProofInp
 	if err != nil {
 		return err
 	}
-	required := permissionObservationKey{
-		identityKind: principal.Kind, identitySubject: principal.Subject,
-		resource: resource.CanonicalKey, permission: computeFirewallCreatePermission,
-	}
-	hasGranted := func(values []PermissionObservation) bool {
+	hasGranted := func(values []PermissionObservation, required permissionObservationKey) bool {
 		for _, observation := range values {
 			if newPermissionObservationKey(observation) == required && observation.Resource == resource && observation.Granted {
 				return true
@@ -164,8 +163,14 @@ func validateEmittedIntentPermissions(projectID string, proof PermissionProofInp
 		}
 		return false
 	}
-	if !hasGranted(proof.Expected) || !hasGranted(proof.Observed) {
-		return guardError(ErrPermissionProof, "permissions", "does not grant the exact emitted firewall-create action on the configured project")
+	for _, permission := range computeFirewallInsertPermissions {
+		required := permissionObservationKey{
+			identityKind: principal.Kind, identitySubject: principal.Subject,
+			resource: resource.CanonicalKey, permission: permission,
+		}
+		if !hasGranted(proof.Expected, required) || !hasGranted(proof.Observed, required) {
+			return guardError(ErrPermissionProof, "permissions", "does not grant every permission required by the emitted firewall-insert action on the configured project")
+		}
 	}
 	return nil
 }

@@ -251,6 +251,7 @@ func validPermissionExpectations() []isolation.PermissionObservation {
 		{Identity: operatorPrincipal(), Resource: permissionResource("ctrldb-test-run1-vm"), Permission: "compute.instances.get", Granted: true},
 		{Identity: operatorPrincipal(), Resource: permissionResource("production-instance"), Permission: "compute.instances.update", Granted: false},
 		{Identity: operatorPrincipal(), Resource: project, Permission: "compute.firewalls.create", Granted: true},
+		{Identity: operatorPrincipal(), Resource: project, Permission: "compute.networks.updatePolicy", Granted: true},
 	}
 }
 

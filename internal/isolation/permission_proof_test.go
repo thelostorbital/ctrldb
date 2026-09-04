@@ -224,7 +224,7 @@ func TestPermissionProofRequiresNamedVersionedCompleteInventory(t *testing.T) {
 			input.Observed = input.Observed[:1]
 		}},
 		{name: "wrong mutation principal", mutate: func(_ *isolation.PolicyInventoryPin, _ *isolation.PermissionProofInput, principal *isolation.Principal) {
-			*principal = harnessPrincipal()
+			*principal = isolation.Principal{Kind: isolation.PrincipalKindServiceAccount, Subject: "alternate-operator@example-test-project.iam.gserviceaccount.com"}
 		}},
 	}
 	for _, test := range tests {

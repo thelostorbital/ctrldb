@@ -346,7 +346,7 @@ func TestMaxLengthRunIDProducesValidComputeNamesAndTags(t *testing.T) {
 		}
 	}
 
-	tag, err := isolation.RunNodeTag(runID)
+	tag, err := isolation.RunNodeTag(validLifetimeFingerprint(runID))
 	if err != nil {
 		t.Fatalf("RunNodeTag() unexpected error: %v", err)
 	}
@@ -493,71 +493,75 @@ func TestValidateHarnessLocksRequiresExactCompleteSetAndRunOwnership(t *testing.
 	t.Parallel()
 
 	locks, expected := validLockProof()
-	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", harnessPrincipal()); err != nil {
+	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", operatorPrincipal()); err != nil {
 		t.Fatalf("ValidateHarnessLocks() unexpected error: %v", err)
 	}
 	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", isolation.Principal{}); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(empty holder) error = %v; want ErrInvalidGuardInput", err)
 	}
+	principalSet := isolation.Principal{Kind: "principalSet", Subject: "principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/attribute.repository/example/repo"}
+	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", principalSet); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateHarnessLocks(principalSet runtime actor) error = %v; want ErrInvalidGuardInput", err)
+	}
 	activeProduction := append([]isolation.EnvironmentLock(nil), locks...)
 	activeProduction[0].Active = true
-	activeProduction[0].Holder = operatorPrincipal()
-	if err := isolation.ValidateHarnessLocks(activeProduction, expected, "run1", harnessPrincipal()); err != nil {
+	activeProduction[0].Holder = destructivePrincipal()
+	if err := isolation.ValidateHarnessLocks(activeProduction, expected, "run1", operatorPrincipal()); err != nil {
 		t.Fatalf("ValidateHarnessLocks(active production lock held by operator) unexpected error: %v", err)
 	}
 	inactiveWithHolder := append([]isolation.EnvironmentLock(nil), locks...)
 	inactiveWithHolder[0].Holder = operatorPrincipal()
-	if err := isolation.ValidateHarnessLocks(inactiveWithHolder, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(inactiveWithHolder, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(inactive with holder) error = %v; want ErrInvalidGuardInput", err)
 	}
 	invalidActive := append([]isolation.EnvironmentLock(nil), locks...)
 	invalidActive[0].Active = true
-	if err := isolation.ValidateHarnessLocks(invalidActive, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(invalidActive, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(active without holder) error = %v; want ErrInvalidGuardInput", err)
 	}
 	aliasHolder := append([]isolation.EnvironmentLock(nil), activeProduction...)
 	aliasHolder[0].Holder.Subject = "user:" + aliasHolder[0].Holder.Subject
-	if err := isolation.ValidateHarnessLocks(aliasHolder, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(aliasHolder, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(alias holder) error = %v; want ErrInvalidGuardInput", err)
 	}
 	duplicate := append(append([]isolation.EnvironmentLock(nil), locks...), locks[0])
-	if err := isolation.ValidateHarnessLocks(duplicate, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(duplicate, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(duplicate) error = %v; want ErrInvalidGuardInput", err)
 	}
-	if err := isolation.ValidateHarnessLocks(locks[:1], expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
+	if err := isolation.ValidateHarnessLocks(locks[:1], expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
 		t.Fatalf("ValidateHarnessLocks(missing run lock) error = %v; want ErrRunLockNotHeld", err)
 	}
 	lost := append([]isolation.EnvironmentLock(nil), locks...)
 	lost[1].Holder = isolation.Principal{Kind: isolation.PrincipalKindServiceAccount, Subject: "other-runner@example-test-project.iam.gserviceaccount.com"}
-	if err := isolation.ValidateHarnessLocks(lost, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
+	if err := isolation.ValidateHarnessLocks(lost, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
 		t.Fatalf("ValidateHarnessLocks(lock loss) error = %v; want ErrRunLockNotHeld", err)
 	}
 	absentRunLock := append([]isolation.EnvironmentLock(nil), locks...)
 	absentRunLock[1].Active = false
 	absentRunLock[1].Holder = isolation.Principal{}
-	if err := isolation.ValidateHarnessLocks(absentRunLock, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
+	if err := isolation.ValidateHarnessLocks(absentRunLock, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
 		t.Fatalf("ValidateHarnessLocks(absent run lock) error = %v; want ErrRunLockNotHeld", err)
 	}
 	missingProduction := []isolation.EnvironmentLock{locks[1]}
-	if err := isolation.ValidateHarnessLocks(missingProduction, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(missingProduction, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(missing environment) error = %v; want ErrInvalidGuardInput", err)
 	}
 	unexpected := append(append([]isolation.EnvironmentLock(nil), locks...), isolation.EnvironmentLock{
 		Environment: "staging", Class: domain.EnvironmentStaging,
 	})
-	if err := isolation.ValidateHarnessLocks(unexpected, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(unexpected, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(unexpected environment) error = %v; want ErrInvalidGuardInput", err)
 	}
 	heldProduction := append([]isolation.EnvironmentLock(nil), locks...)
 	heldProduction[0].Active = true
-	heldProduction[0].Holder = harnessPrincipal()
-	if err := isolation.ValidateHarnessLocks(heldProduction, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrNonDisposableLock) {
+	heldProduction[0].Holder = operatorPrincipal()
+	if err := isolation.ValidateHarnessLocks(heldProduction, expected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrNonDisposableLock) {
 		t.Fatalf("ValidateHarnessLocks(non-disposable holder) error = %v; want ErrNonDisposableLock", err)
 	}
 	ambiguousExpected := append(append([]isolation.EnvironmentIdentity(nil), expected...), isolation.EnvironmentIdentity{
 		Environment: "production", Class: domain.EnvironmentStaging,
 	})
-	if err := isolation.ValidateHarnessLocks(locks, ambiguousExpected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(locks, ambiguousExpected, "run1", operatorPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(ambiguous expectation) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
@@ -609,10 +613,10 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 		{name: "network policy proof", mutate: func(value *isolation.PreMutationInput) { value.TestCIDR = "10.80.1.0/24" }, kind: isolation.ErrInvalidGuardInput},
 		{name: "lock proof", mutate: func(value *isolation.PreMutationInput) {
 			value.Locks[0].Active = true
-			value.Locks[0].Holder = value.HarnessPrincipal
+			value.Locks[0].Holder = value.MutationPrincipal
 		}, kind: isolation.ErrNonDisposableLock},
 		{name: "permission proof", mutate: func(value *isolation.PreMutationInput) { value.Permissions.Observed = nil }, kind: isolation.ErrPermissionProof},
-		{name: "mutation principal proof", mutate: func(value *isolation.PreMutationInput) { value.MutationPrincipal = value.HarnessPrincipal }, kind: isolation.ErrPermissionProof},
+		{name: "mutation principal proof", mutate: func(value *isolation.PreMutationInput) { value.MutationPrincipal = destructivePrincipal() }, kind: isolation.ErrPermissionProof},
 		{name: "firewall proof", mutate: func(value *isolation.PreMutationInput) { value.FirewallRules = value.FirewallRules[:1] }, kind: isolation.ErrUnsafeFirewall},
 		{name: "disabled firewall proof", mutate: func(value *isolation.PreMutationInput) { value.FirewallRules[0].Enabled = false }, kind: isolation.ErrUnsafeFirewall},
 		{name: "freshness proof", mutate: func(value *isolation.PreMutationInput) { value.Freshness.ValidUntil = value.Freshness.ObservedAt }, kind: isolation.ErrStaleProof},
@@ -694,7 +698,7 @@ func TestPreMutationAcceptsOnlyCompleteTypedCreateIntents(t *testing.T) {
 			t.Parallel()
 			input := validPreMutationInput()
 			test.mutate(&input)
-			if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), input, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) && !errors.Is(err, isolation.ErrPermissionProof) {
+			if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), input, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) && !errors.Is(err, isolation.ErrPermissionProof) && !errors.Is(err, isolation.ErrUnsafeFirewall) {
 				t.Fatalf("AuthorizePreMutation() error = %v; want a fail-closed intent or principal error", err)
 			}
 		})
@@ -720,6 +724,109 @@ func TestPreMutationIntentAndDesiredStateAreFingerprintBound(t *testing.T) {
 	changedState.MutationIntents[0].Create.Firewall.Priority = 900
 	if _, err := isolation.RevalidatePreMutation(decision, policy, changedState, revalidationNow()); err == nil {
 		t.Fatal("RevalidatePreMutation() accepted changed firewall desired state")
+	}
+}
+
+func TestPreMutationFirewallRetryEmitsOnlyAbsentRulesAndReportsConvergence(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	partial := validPreMutationInput()
+	present := cloneFirewallRule(partial.FirewallRules[0])
+	partial.FirewallObservations[0] = isolation.FirewallObservation{
+		Identity: partial.FirewallRules[0].Identity, State: isolation.FirewallObservationPresent, PresentRule: &present,
+	}
+	partial.Targets = partial.Targets[1:]
+	partial.MutationIntents = validMutationIntents(partial)
+	decision, err := isolation.AuthorizePreMutation(policy, partial, authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation(partial retry) unexpected error: %v", err)
+	}
+	fresh := partial
+	fresh.Freshness.ObservedAt = fresh.Freshness.ObservedAt.Add(45 * time.Second)
+	boundary, err := isolation.RevalidatePreMutation(decision, policy, fresh, revalidationNow())
+	if err != nil {
+		t.Fatalf("RevalidatePreMutation(partial retry) unexpected error: %v", err)
+	}
+	if boundary.Disposition() != isolation.MutationDispositionReady || len(boundary.Intents()) != 1 ||
+		boundary.Intents()[0].Target().Identity != partial.FirewallRules[1].Identity {
+		t.Fatal("partial retry did not emit exactly the absent firewall insert")
+	}
+
+	converged := validPreMutationInput()
+	converged.FirewallObservations = presentFirewallObservations(converged.FirewallRules)
+	converged.Targets = nil
+	converged.MutationIntents = nil
+	decision, err = isolation.AuthorizePreMutation(policy, converged, authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation(converged) unexpected error: %v", err)
+	}
+	freshConverged := converged
+	freshConverged.Freshness.ObservedAt = freshConverged.Freshness.ObservedAt.Add(45 * time.Second)
+	boundary, err = isolation.RevalidatePreMutation(decision, policy, freshConverged, revalidationNow())
+	if err != nil {
+		t.Fatalf("RevalidatePreMutation(converged) unexpected error: %v", err)
+	}
+	if boundary.Disposition() != isolation.MutationDispositionConverged || len(boundary.Intents()) != 0 {
+		t.Fatal("fully present retry did not return an explicit no-mutation converged boundary")
+	}
+}
+
+func TestPreMutationFirewallObservationDriftCannotReuseAuthorization(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	authorized := validPreMutationInput()
+	decision, err := isolation.AuthorizePreMutation(policy, authorized, authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+
+	fresh := freshPreMutationInput()
+	present := cloneFirewallRule(fresh.FirewallRules[0])
+	fresh.FirewallObservations[0] = isolation.FirewallObservation{
+		Identity: fresh.FirewallRules[0].Identity, State: isolation.FirewallObservationPresent, PresentRule: &present,
+	}
+	fresh.Targets = fresh.Targets[1:]
+	fresh.MutationIntents = validMutationIntents(fresh)
+	if _, err := isolation.RevalidatePreMutation(decision, policy, fresh, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("RevalidatePreMutation(observation drift) error = %v; want ErrProofMismatch", err)
+	}
+
+	disappeared := freshPreMutationInput()
+	disappeared.FirewallObservations = disappeared.FirewallObservations[:1]
+	if _, err := isolation.RevalidatePreMutation(decision, policy, disappeared, revalidationNow()); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+		t.Fatalf("RevalidatePreMutation(disappeared observation) error = %v; want ErrUnsafeFirewall", err)
+	}
+}
+
+func TestPreMutationCanonicalizesFirewallCollectionsAndDetachesObservations(t *testing.T) {
+	t.Parallel()
+
+	policy := validPreMutationPolicy()
+	authorized := validPreMutationInput()
+	decision, err := isolation.AuthorizePreMutation(policy, authorized, authorizationNow())
+	if err != nil {
+		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
+	}
+	fresh := freshPreMutationInput()
+	for index := range fresh.FirewallRules {
+		fresh.FirewallRules[index].Denied = []isolation.FirewallTrafficRule{}
+		fresh.FirewallRules[index].DestinationCIDRs = []string{}
+		fresh.FirewallRules[index].SourceServiceAccounts = []string{}
+		fresh.FirewallRules[index].TargetServiceAccounts = []string{}
+		fresh.FirewallRules[index].ResourceManagerTags = map[string]string{}
+	}
+	fresh.MutationIntents = validMutationIntents(fresh)
+	boundary, err := isolation.RevalidatePreMutation(decision, policy, fresh, revalidationNow())
+	if err != nil {
+		t.Fatalf("RevalidatePreMutation(nil/empty equivalent collections) unexpected error: %v", err)
+	}
+	for _, intent := range boundary.Intents() {
+		firewall, _ := intent.FirewallCreateState()
+		if firewall.Denied != nil || firewall.DestinationCIDRs != nil || firewall.ResourceManagerTags != nil {
+			t.Fatal("MutationBoundary did not return canonical empty firewall collections")
+		}
 	}
 }
 
@@ -772,7 +879,7 @@ func TestMutationBoundarySealsAndDetachesProviderRequests(t *testing.T) {
 			firewall.SourceTags[0] = "changed"
 		}
 		firewall.TargetTags[0] = "changed"
-		firewall.ResourceManagerTags["tagKeys/123"] = "tagValues/456"
+		firewall.ResourceManagerTags = map[string]string{"tagKeys/123": "tagValues/456"}
 	}
 	fresh.MutationIntents[0].Target.Labels[config.LabelPurpose] = "changed"
 	for _, intent := range fresh.MutationIntents {
@@ -785,7 +892,7 @@ func TestMutationBoundarySealsAndDetachesProviderRequests(t *testing.T) {
 				intent.Create.Firewall.SourceTags[0] = "changed"
 			}
 			intent.Create.Firewall.TargetTags[0] = "changed"
-			intent.Create.Firewall.ResourceManagerTags["tagKeys/123"] = "tagValues/456"
+			intent.Create.Firewall.ResourceManagerTags = map[string]string{"tagKeys/123": "tagValues/456"}
 		}
 	}
 	for _, intent := range boundary.Intents() {
@@ -816,12 +923,6 @@ func TestPreMutationPolicyPinsConfiguredTestPrincipals(t *testing.T) {
 		name   string
 		mutate func(*isolation.PreMutationPolicy)
 	}{
-		{name: "missing harness principal", mutate: func(value *isolation.PreMutationPolicy) {
-			value.TestHarnessPrincipal = isolation.Principal{}
-		}},
-		{name: "non-canonical harness principal", mutate: func(value *isolation.PreMutationPolicy) {
-			value.TestHarnessPrincipal.Subject = "Test-Runner@example-test-project.iam.gserviceaccount.com"
-		}},
 		{name: "user operator", mutate: func(value *isolation.PreMutationPolicy) {
 			value.TestOperatorPrincipal = isolation.Principal{Kind: isolation.PrincipalKindUser, Subject: "operator@example.test"}
 		}},
@@ -880,37 +981,49 @@ func TestPreMutationPolicyPinsConfiguredTestPrincipals(t *testing.T) {
 	}
 	changedPolicy := validPreMutationPolicy()
 	changedPolicy.TestOperatorPrincipal = alternate
+	fresh.Locks[1].Holder = alternate
 	refreshPermissionInventory(&changedPolicy, fresh.Permissions.Expected)
 	if _, err := isolation.RevalidatePreMutation(decision, changedPolicy, fresh, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(changed configured principal) error = %v; want ErrProofMismatch", err)
 	}
 }
 
-func TestPreMutationPolicyPinsTheHarnessPrincipal(t *testing.T) {
+func TestPreMutationPolicyPinsOperatorAsRuntimeAndLockPrincipal(t *testing.T) {
 	t.Parallel()
 
 	alternate := isolation.Principal{
 		Kind: isolation.PrincipalKindServiceAccount, Subject: "alternate-runner@example-test-project.iam.gserviceaccount.com",
 	}
 	input := validPreMutationInput()
-	input.HarnessPrincipal = alternate
+	input.MutationPrincipal = alternate
 	input.Locks[1].Holder = alternate
-	if _, err := isolation.AuthorizePreMutation(validPreMutationPolicy(), input, authorizationNow()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
-		t.Fatalf("AuthorizePreMutation(self-consistent alternate harness) error = %v; want ErrInvalidGuardInput", err)
+	for index := range input.Permissions.Expected {
+		input.Permissions.Expected[index].Identity = alternate
+		input.Permissions.Observed[index].Identity = alternate
+	}
+	policy := validPreMutationPolicy()
+	refreshPermissionInventory(&policy, input.Permissions.Expected)
+	if _, err := isolation.AuthorizePreMutation(policy, input, authorizationNow()); !errors.Is(err, isolation.ErrPermissionProof) {
+		t.Fatalf("AuthorizePreMutation(self-consistent alternate runtime principal) error = %v; want ErrPermissionProof", err)
 	}
 
-	policy := validPreMutationPolicy()
+	policy = validPreMutationPolicy()
 	decision, err := isolation.AuthorizePreMutation(policy, validPreMutationInput(), authorizationNow())
 	if err != nil {
 		t.Fatalf("AuthorizePreMutation() unexpected error: %v", err)
 	}
 	fresh := freshPreMutationInput()
-	fresh.HarnessPrincipal = alternate
+	fresh.MutationPrincipal = alternate
 	fresh.Locks[1].Holder = alternate
+	for index := range fresh.Permissions.Expected {
+		fresh.Permissions.Expected[index].Identity = alternate
+		fresh.Permissions.Observed[index].Identity = alternate
+	}
 	changedPolicy := policy
-	changedPolicy.TestHarnessPrincipal = alternate
+	changedPolicy.TestOperatorPrincipal = alternate
+	refreshPermissionInventory(&changedPolicy, fresh.Permissions.Expected)
 	if _, err := isolation.RevalidatePreMutation(decision, changedPolicy, fresh, revalidationNow()); !errors.Is(err, isolation.ErrProofMismatch) {
-		t.Fatalf("RevalidatePreMutation(self-consistent alternate harness) error = %v; want ErrProofMismatch", err)
+		t.Fatalf("RevalidatePreMutation(self-consistent alternate runtime principal) error = %v; want ErrProofMismatch", err)
 	}
 }
 
@@ -1452,7 +1565,6 @@ func validPreMutationInput() isolation.PreMutationInput {
 		ProductionCIDRs:                   []string{"10.80.0.0/16"},
 		ExpectedNonDisposableEnvironments: expectedEnvironments,
 		Locks:                             locks,
-		HarnessPrincipal:                  harnessPrincipal(),
 		MutationPrincipal:                 operatorPrincipal(),
 		Permissions:                       permissions,
 		FirewallRules:                     validFirewallRules(),
@@ -1462,6 +1574,7 @@ func validPreMutationInput() isolation.PreMutationInput {
 			ValidUntil: observedAt.Add(4 * time.Minute),
 		},
 	}
+	input.FirewallObservations = absentFirewallObservations(input.FirewallRules)
 	refreshCapacityFingerprint(&input.Capacity)
 	input.MutationIntents = validMutationIntents(input)
 	return input
@@ -1499,7 +1612,6 @@ func validPreMutationPolicy() isolation.PreMutationPolicy {
 		ProjectID:                "example-test-project",
 		RunLimits:                defaultLimits(),
 		TestCIDR:                 input.TestCIDR,
-		TestHarnessPrincipal:     harnessPrincipal(),
 		TestOperatorPrincipal:    operatorPrincipal(),
 		TestDestructivePrincipal: destructivePrincipal(),
 		PermissionInventory:      isolation.PolicyInventoryPin{ID: "permission-inventory", Version: "v1", Fingerprint: permissions},
@@ -1539,16 +1651,18 @@ func refreshRunLifetimeFingerprint(input *isolation.PreMutationInput) {
 		}
 		input.FirewallRules[index].Description = description
 	}
-	for index := range input.MutationIntents {
-		if input.MutationIntents[index].Create.Firewall != nil {
-			input.MutationIntents[index].Create.Firewall.LifetimeContractFingerprint = fingerprint
-			description, descriptionErr := isolation.RunFirewallDescription(fingerprint)
-			if descriptionErr != nil {
-				panic(descriptionErr)
-			}
-			input.MutationIntents[index].Create.Firewall.Description = description
+	nodeTag, tagErr := isolation.RunNodeTag(fingerprint)
+	if tagErr != nil {
+		panic(tagErr)
+	}
+	for index := range input.FirewallRules {
+		input.FirewallRules[index].TargetTags = []string{nodeTag}
+		if input.FirewallRules[index].Purpose == isolation.FirewallPurposeInternalMongo {
+			input.FirewallRules[index].SourceTags = []string{nodeTag}
 		}
 	}
+	input.FirewallObservations = absentFirewallObservations(input.FirewallRules)
+	input.MutationIntents = validMutationIntents(*input)
 }
 
 func validMutationIntents(input isolation.PreMutationInput) []isolation.MutationIntent {
@@ -1606,6 +1720,13 @@ func moveAllResourceProjects(input *isolation.PreMutationInput, project string) 
 		moveResourceProject(&input.FirewallRules[index].Identity, project)
 		moveResourceProject(&input.FirewallRules[index].Network, project)
 	}
+	for index := range input.FirewallObservations {
+		moveResourceProject(&input.FirewallObservations[index].Identity, project)
+		if input.FirewallObservations[index].PresentRule != nil {
+			moveResourceProject(&input.FirewallObservations[index].PresentRule.Identity, project)
+			moveResourceProject(&input.FirewallObservations[index].PresentRule.Network, project)
+		}
+	}
 	for index := range input.Permissions.Expected {
 		moveResourceProject(&input.Permissions.Expected[index].Resource, project)
 	}
@@ -1657,15 +1778,9 @@ func validLockProof() ([]isolation.EnvironmentLock, []isolation.EnvironmentIdent
 	expected := []isolation.EnvironmentIdentity{{Environment: "production", Class: domain.EnvironmentProduction}}
 	locks := []isolation.EnvironmentLock{
 		{Environment: "production", Class: domain.EnvironmentProduction},
-		{Environment: config.TestEnvironmentLabel, Class: domain.EnvironmentDisposable, RunID: "run1", Active: true, Holder: harnessPrincipal()},
+		{Environment: config.TestEnvironmentLabel, Class: domain.EnvironmentDisposable, RunID: "run1", Active: true, Holder: operatorPrincipal()},
 	}
 	return locks, expected
-}
-
-func harnessPrincipal() isolation.Principal {
-	return isolation.Principal{
-		Kind: isolation.PrincipalKindServiceAccount, Subject: "test-runner@example-test-project.iam.gserviceaccount.com",
-	}
 }
 
 func operatorPrincipal() isolation.Principal {

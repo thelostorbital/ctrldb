@@ -588,7 +588,6 @@ type PreMutationPolicy struct {
 	ProjectID                         string
 	RunLimits                         RunLimits
 	TestCIDR                          string
-	TestHarnessPrincipal              Principal
 	TestOperatorPrincipal             Principal
 	TestDestructivePrincipal          Principal
 	PermissionInventory               PolicyInventoryPin
@@ -607,11 +606,11 @@ type PreMutationInput struct {
 	ProductionCIDRs                   []string
 	ExpectedNonDisposableEnvironments []EnvironmentIdentity
 	Locks                             []EnvironmentLock
-	HarnessPrincipal                  Principal
 	MutationPrincipal                 Principal
 	MutationIntents                   []MutationIntent
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
+	FirewallObservations              []FirewallObservation
 	// RunLifetime is the currently discovered immutable lifetime-record
 	// generation. The enclosing Freshness revision must cover this observation.
 	RunLifetime RunLifetimeContract
@@ -634,10 +633,20 @@ type PreMutationDecision struct {
 // It must not infer provider defaults or synthesize unrepresented resources.
 // Repeated pure validation is not atomic consumption.
 type MutationBoundary struct {
-	operation OperationBinding
-	principal Principal
-	intents   []AuthorizedMutationIntent
+	operation   OperationBinding
+	principal   Principal
+	intents     []AuthorizedMutationIntent
+	disposition MutationDisposition
 }
+
+// MutationDisposition distinguishes executable work from a fully converged
+// retry. A converged boundary contains no provider intents.
+type MutationDisposition string
+
+const (
+	MutationDispositionReady     MutationDisposition = "ready"
+	MutationDispositionConverged MutationDisposition = "converged"
+)
 
 // Operation returns the exact durable operation attempt bound to this result.
 func (boundary MutationBoundary) Operation() OperationBinding { return boundary.operation }
@@ -651,6 +660,9 @@ func (boundary MutationBoundary) Principal() Principal { return boundary.princip
 func (boundary MutationBoundary) Intents() []AuthorizedMutationIntent {
 	return cloneAuthorizedMutationIntents(boundary.intents)
 }
+
+// Disposition reports whether exact provider work remains after revalidation.
+func (boundary MutationBoundary) Disposition() MutationDisposition { return boundary.disposition }
 
 // AuthorizePreMutation evaluates every local isolation proof and returns an
 // opaque, bounded comparison token. It performs no I/O and grants no mutation
@@ -690,18 +702,20 @@ func RevalidatePreMutation(decision PreMutationDecision, policy PreMutationPolic
 	if fingerprint != decision.fingerprint || fresh.Operation != decision.operation {
 		return MutationBoundary{}, guardError(ErrProofMismatch, "evidence", "changed since authorization")
 	}
+	disposition := MutationDispositionReady
+	if len(intents) == 0 {
+		disposition = MutationDispositionConverged
+	}
 	return MutationBoundary{
-		operation: fresh.Operation,
-		principal: fresh.MutationPrincipal,
-		intents:   authorizeMutationIntents(intents),
+		operation:   fresh.Operation,
+		principal:   fresh.MutationPrincipal,
+		intents:     authorizeMutationIntents(intents),
+		disposition: disposition,
 	}, nil
 }
 
 func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now time.Time) ([]MutationIntent, [sha256.Size]byte, error) {
 	var zero [sha256.Size]byte
-	if len(input.Targets) == 0 {
-		return nil, zero, guardError(ErrInvalidGuardInput, "targets", "must not be empty")
-	}
 	if err := validateOperationBinding(input.Operation); err != nil {
 		return nil, zero, err
 	}
@@ -724,13 +738,13 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	if err := ValidateNetworkCIDR(input.TestCIDR, input.ProductionCIDRs); err != nil {
 		return nil, zero, err
 	}
-	if err := ValidateHarnessLocks(input.Locks, input.ExpectedNonDisposableEnvironments, input.RunID, input.HarnessPrincipal); err != nil {
+	if err := ValidateHarnessLocks(input.Locks, input.ExpectedNonDisposableEnvironments, input.RunID, input.MutationPrincipal); err != nil {
 		return nil, zero, err
 	}
 	if err := ValidatePermissionProof(policy.PermissionInventory, input.Permissions, input.MutationPrincipal); err != nil {
 		return nil, zero, err
 	}
-	if err := ValidateFirewallRules(input.FirewallRules, input.ProductionCIDRs, targets, FirewallValidationContext{
+	if err := ValidateFirewallRules(input.FirewallRules, input.FirewallObservations, input.ProductionCIDRs, targets, FirewallValidationContext{
 		RunID: input.RunID, Plan: input.Capacity.Plan, Operation: input.Operation,
 		PlannedLifetime: input.Capacity.Lifetime, RunLimits: policy.RunLimits,
 		RunLifetime: input.RunLifetime, Now: now,
@@ -900,6 +914,8 @@ func equalMutationTarget(first, second MutationTarget) bool {
 }
 
 func equalFirewallRule(first, second FirewallRule) bool {
+	first = normalizeFirewallRule(first)
+	second = normalizeFirewallRule(second)
 	return first.Identity == second.Identity && first.Description == second.Description && first.Network == second.Network &&
 		first.RunID == second.RunID && first.Purpose == second.Purpose && first.Enabled == second.Enabled &&
 		first.Priority == second.Priority && first.Direction == second.Direction &&
@@ -1085,12 +1101,6 @@ func validatePreMutationPolicy(policy PreMutationPolicy, input PreMutationInput)
 	if err := validateRunLimits(policy.RunLimits); err != nil {
 		return err
 	}
-	if !validPrincipal(policy.TestHarnessPrincipal) {
-		return guardError(ErrInvalidGuardInput, "policy.testHarnessPrincipal", "must identify one canonical configured principal")
-	}
-	if input.HarnessPrincipal != policy.TestHarnessPrincipal {
-		return guardError(ErrInvalidGuardInput, "harnessPrincipal", "does not match the configured test harness principal")
-	}
 	for _, principal := range []struct {
 		path  string
 		value Principal
@@ -1104,6 +1114,9 @@ func validatePreMutationPolicy(policy PreMutationPolicy, input PreMutationInput)
 	}
 	if policy.TestOperatorPrincipal == policy.TestDestructivePrincipal {
 		return guardError(ErrInvalidGuardInput, "policy.testPrincipals", "must identify distinct operator and destructive service accounts")
+	}
+	if input.MutationPrincipal != policy.TestOperatorPrincipal {
+		return guardError(ErrPermissionProof, "mutationPrincipal", "does not match the configured test operator")
 	}
 	if policy.TestCIDR != input.TestCIDR {
 		return guardError(ErrInvalidGuardInput, "testCIDR", "does not match the configured test-isolation network")
@@ -1163,6 +1176,20 @@ func validatePreMutationProject(projectID string, input PreMutationInput, target
 		}
 		if err := requireProject(path+".network.project", rule.Network); err != nil {
 			return err
+		}
+	}
+	for index, observation := range input.FirewallObservations {
+		path := indexedField("firewallObservations", index)
+		if err := requireProject(path+".identity.project", observation.Identity); err != nil {
+			return err
+		}
+		if observation.PresentRule != nil {
+			if err := requireProject(path+".presentRule.identity.project", observation.PresentRule.Identity); err != nil {
+				return err
+			}
+			if err := requireProject(path+".presentRule.network.project", observation.PresentRule.Network); err != nil {
+				return err
+			}
 		}
 	}
 	for index, observation := range input.Permissions.Expected {
@@ -1254,11 +1281,11 @@ type preMutationPayload struct {
 	ProductionCIDRs                   []string
 	ExpectedNonDisposableEnvironments []EnvironmentIdentity
 	Locks                             []EnvironmentLock
-	HarnessPrincipal                  Principal
 	MutationPrincipal                 Principal
 	MutationIntents                   []MutationIntent
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
+	FirewallObservations              []FirewallObservation
 	RunLifetime                       RunLifetimeContract
 	EvidenceRevision                  string
 }
@@ -1279,16 +1306,16 @@ func preMutationFingerprint(
 		ProductionCIDRs:                   append([]string(nil), input.ProductionCIDRs...),
 		ExpectedNonDisposableEnvironments: append([]EnvironmentIdentity(nil), input.ExpectedNonDisposableEnvironments...),
 		Locks:                             append([]EnvironmentLock(nil), input.Locks...),
-		HarnessPrincipal:                  input.HarnessPrincipal,
 		MutationPrincipal:                 input.MutationPrincipal,
 		MutationIntents:                   cloneMutationIntents(intents),
 		Permissions: PermissionProofInput{
 			Expected: append([]PermissionObservation(nil), input.Permissions.Expected...),
 			Observed: append([]PermissionObservation(nil), input.Permissions.Observed...),
 		},
-		FirewallRules:    cloneFirewallRules(input.FirewallRules),
-		RunLifetime:      input.RunLifetime,
-		EvidenceRevision: input.Freshness.Revision,
+		FirewallRules:        cloneFirewallRules(input.FirewallRules),
+		FirewallObservations: cloneFirewallObservations(input.FirewallObservations),
+		RunLifetime:          input.RunLifetime,
+		EvidenceRevision:     input.Freshness.Revision,
 	}
 	sort.Strings(payload.ProductionCIDRs)
 	sort.Slice(payload.Capacity.Instances, func(i, j int) bool {
@@ -1321,6 +1348,9 @@ func preMutationFingerprint(
 	sort.Slice(payload.FirewallRules, func(i, j int) bool {
 		return payload.FirewallRules[i].Purpose < payload.FirewallRules[j].Purpose
 	})
+	sort.Slice(payload.FirewallObservations, func(i, j int) bool {
+		return payload.FirewallObservations[i].Identity.CanonicalKey < payload.FirewallObservations[j].Identity.CanonicalKey
+	})
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return [sha256.Size]byte{}, guardError(ErrInvalidGuardInput, "evidence", "could not be fingerprinted")
@@ -1350,25 +1380,71 @@ func sortPermissionObservations(values []PermissionObservation) {
 func cloneFirewallRules(rules []FirewallRule) []FirewallRule {
 	cloned := make([]FirewallRule, len(rules))
 	for index, rule := range rules {
-		rule.Allowed = cloneFirewallTrafficRules(rule.Allowed)
-		rule.Denied = cloneFirewallTrafficRules(rule.Denied)
-		rule.DestinationCIDRs = append([]string(nil), rule.DestinationCIDRs...)
-		rule.SourceCIDRs = append([]string(nil), rule.SourceCIDRs...)
-		rule.SourceTags = append([]string(nil), rule.SourceTags...)
-		rule.SourceServiceAccounts = append([]string(nil), rule.SourceServiceAccounts...)
-		rule.TargetTags = append([]string(nil), rule.TargetTags...)
-		rule.TargetServiceAccounts = append([]string(nil), rule.TargetServiceAccounts...)
-		rule.ResourceManagerTags = maps.Clone(rule.ResourceManagerTags)
-		cloned[index] = rule
+		cloned[index] = normalizeFirewallRule(rule)
 	}
 	return cloned
 }
 
 func cloneFirewallTrafficRules(rules []FirewallTrafficRule) []FirewallTrafficRule {
+	if len(rules) == 0 {
+		return nil
+	}
 	cloned := make([]FirewallTrafficRule, len(rules))
 	for index, rule := range rules {
-		rule.Ports = append([]uint16(nil), rule.Ports...)
+		if len(rule.Ports) == 0 {
+			rule.Ports = nil
+		} else {
+			rule.Ports = append([]uint16(nil), rule.Ports...)
+			slices.Sort(rule.Ports)
+		}
 		cloned[index] = rule
+	}
+	sort.Slice(cloned, func(i, j int) bool {
+		if cloned[i].IPProtocol != cloned[j].IPProtocol {
+			return cloned[i].IPProtocol < cloned[j].IPProtocol
+		}
+		return slices.Compare(cloned[i].Ports, cloned[j].Ports) < 0
+	})
+	return cloned
+}
+
+func normalizeFirewallRule(rule FirewallRule) FirewallRule {
+	rule.Allowed = cloneFirewallTrafficRules(rule.Allowed)
+	rule.Denied = cloneFirewallTrafficRules(rule.Denied)
+	rule.DestinationCIDRs = normalizeStrings(rule.DestinationCIDRs)
+	rule.SourceCIDRs = normalizeStrings(rule.SourceCIDRs)
+	rule.SourceTags = normalizeStrings(rule.SourceTags)
+	rule.SourceServiceAccounts = normalizeStrings(rule.SourceServiceAccounts)
+	rule.TargetTags = normalizeStrings(rule.TargetTags)
+	rule.TargetServiceAccounts = normalizeStrings(rule.TargetServiceAccounts)
+	if len(rule.ResourceManagerTags) == 0 {
+		rule.ResourceManagerTags = nil
+	} else {
+		rule.ResourceManagerTags = maps.Clone(rule.ResourceManagerTags)
+	}
+	return rule
+}
+
+func normalizeStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	canonical := append([]string(nil), values...)
+	slices.Sort(canonical)
+	return canonical
+}
+
+func cloneFirewallObservations(observations []FirewallObservation) []FirewallObservation {
+	if len(observations) == 0 {
+		return nil
+	}
+	cloned := make([]FirewallObservation, len(observations))
+	for index, observation := range observations {
+		if observation.PresentRule != nil {
+			rule := normalizeFirewallRule(*observation.PresentRule)
+			observation.PresentRule = &rule
+		}
+		cloned[index] = observation
 	}
 	return cloned
 }

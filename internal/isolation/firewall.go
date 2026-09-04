@@ -21,7 +21,7 @@ const (
 	TestHarnessRevocationWorkflowID = "WF-TEST-01"
 	iapSSHFirewallRuleSuffix        = "iap-ssh"
 	mongoFirewallRuleSuffix         = "internal"
-	testNodeTagSuffix               = "node"
+	testNodeTagPrefix               = "ctrldb-test-n-"
 	firewallDescriptionPrefix       = "ctrldb:test-isolation:lifetime-sha256="
 	firewallDescriptionSuffix       = ";revoke=" + TestHarnessRevocationWorkflowID
 )
@@ -98,6 +98,24 @@ type FirewallRule struct {
 	LogConfig                   FirewallLogConfig
 	ResourceManagerTags         map[string]string
 	LifetimeContractFingerprint string
+}
+
+// FirewallObservationState is the exhaustive discovered state of one desired
+// run-scoped firewall rule.
+type FirewallObservationState string
+
+const (
+	FirewallObservationAbsent  FirewallObservationState = "absent"
+	FirewallObservationPresent FirewallObservationState = "present"
+)
+
+// FirewallObservation binds one desired identity to either confirmed absence
+// or the complete normalized provider state observed at the proof boundary.
+// PresentRule must be nil for absence and complete for presence.
+type FirewallObservation struct {
+	Identity    ResourceIdentity
+	State       FirewallObservationState
+	PresentRule *FirewallRule
 }
 
 // RunLifetimeContract is the single durable lifetime record for one
@@ -226,11 +244,11 @@ func validateRunLifetimeContract(
 	return fingerprint, nil
 }
 
-// ValidateFirewallRules requires exactly one IAP SSH rule and exactly one
-// internal MongoDB rule, binds both rule identities to the exact selected
-// mutation targets, and rejects any source range overlapping a CIDR discovered
-// for production.
-func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, targets []MutationTarget, context FirewallValidationContext) error {
+// ValidateFirewallRules requires exactly one IAP SSH rule and one internal
+// MongoDB rule, plus one exhaustive provider observation for each identity.
+// Only confirmed-absent rules may be selected as insert targets; exact-present
+// rules are converged, while any different or ambiguous state fails closed.
+func ValidateFirewallRules(rules []FirewallRule, observations []FirewallObservation, productionCIDRs []string, targets []MutationTarget, context FirewallValidationContext) error {
 	lifetimeFingerprint, err := validateRunLifetimeContract(
 		context.RunLifetime,
 		context.RunID,
@@ -246,6 +264,9 @@ func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, targe
 	if len(rules) != 2 {
 		return guardError(ErrUnsafeFirewall, "firewallRules", "must contain both required purpose proofs")
 	}
+	if len(observations) != len(rules) {
+		return guardError(ErrUnsafeFirewall, "firewallObservations", "must contain one exhaustive observation per required rule")
+	}
 	selected, err := SelectRunMutationTargets(context.RunID, targets)
 	if err != nil {
 		return err
@@ -256,10 +277,11 @@ func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, targe
 			targetKeys[target.Identity.CanonicalKey] = struct{}{}
 		}
 	}
-	if len(targetKeys) != len(rules) {
-		return guardError(ErrUnsafeFirewall, "targets", "must contain exactly the two proved firewall mutations")
+	if len(targetKeys) != len(selected) {
+		return guardError(ErrUnsafeFirewall, "targets", "contains an unproved non-firewall mutation")
 	}
 	seen := make(map[FirewallPurpose]struct{}, len(rules))
+	rulesByKey := make(map[string]FirewallRule, len(rules))
 	for index, rule := range rules {
 		path := indexedField("firewallRules", index)
 		if _, exists := seen[rule.Purpose]; exists {
@@ -269,15 +291,60 @@ func ValidateFirewallRules(rules []FirewallRule, productionCIDRs []string, targe
 		if err := validateFirewallRule(rule, productionCIDRs, context.RunID, lifetimeFingerprint); err != nil {
 			return guardError(err, path, "failed its purpose proof")
 		}
-		if _, exists := targetKeys[rule.Identity.CanonicalKey]; !exists {
-			return guardError(ErrUnsafeFirewall, path, "is not one of the selected exact mutation targets")
+		if _, exists := rulesByKey[rule.Identity.CanonicalKey]; exists {
+			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier firewall identity")
 		}
+		rulesByKey[rule.Identity.CanonicalKey] = normalizeFirewallRule(rule)
 	}
 	if _, ok := seen[FirewallPurposeIAPSSH]; !ok {
 		return guardError(ErrUnsafeFirewall, "firewallRules", "is missing the IAP SSH purpose")
 	}
 	if _, ok := seen[FirewallPurposeInternalMongo]; !ok {
 		return guardError(ErrUnsafeFirewall, "firewallRules", "is missing the internal MongoDB purpose")
+	}
+
+	absent := make(map[string]struct{}, len(rules))
+	observed := make(map[string]struct{}, len(observations))
+	for index, observation := range observations {
+		path := indexedField("firewallObservations", index)
+		if err := validateResourceIdentity(observation.Identity); err != nil {
+			return guardError(err, path+".identity", "must identify one desired firewall")
+		}
+		desired, exists := rulesByKey[observation.Identity.CanonicalKey]
+		if !exists || observation.Identity != desired.Identity {
+			return guardError(ErrUnsafeFirewall, path, "does not identify a required firewall")
+		}
+		if _, duplicate := observed[observation.Identity.CanonicalKey]; duplicate {
+			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier firewall observation")
+		}
+		observed[observation.Identity.CanonicalKey] = struct{}{}
+		switch observation.State {
+		case FirewallObservationAbsent:
+			if observation.PresentRule != nil {
+				return guardError(ErrInvalidGuardInput, path, "is ambiguous between absent and present")
+			}
+			absent[observation.Identity.CanonicalKey] = struct{}{}
+		case FirewallObservationPresent:
+			if observation.PresentRule == nil {
+				return guardError(ErrInvalidGuardInput, path, "must include complete present provider state")
+			}
+			if err := validateFirewallRule(*observation.PresentRule, productionCIDRs, context.RunID, lifetimeFingerprint); err != nil {
+				return guardError(err, path+".presentRule", "is not a safe complete provider state")
+			}
+			if !equalFirewallRule(*observation.PresentRule, desired) {
+				return guardError(ErrProofMismatch, path+".presentRule", "differs from the desired normalized provider state")
+			}
+		default:
+			return guardError(ErrInvalidGuardInput, path+".state", "must be absent or present")
+		}
+	}
+	if len(observed) != len(rulesByKey) || len(targetKeys) != len(absent) {
+		return guardError(ErrUnsafeFirewall, "firewallObservations", "does not exhaustively match desired rules and insert targets")
+	}
+	for key := range absent {
+		if _, exists := targetKeys[key]; !exists {
+			return guardError(ErrUnsafeFirewall, "targets", "must select every and only confirmed-absent firewall")
+		}
 	}
 	return nil
 }
@@ -301,6 +368,7 @@ func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string, context F
 }
 
 func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID string, lifetimeFingerprint string) error {
+	rule = normalizeFirewallRule(rule)
 	if err := ValidateRunID(runID); err != nil {
 		return err
 	}
@@ -371,7 +439,7 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 	switch rule.Purpose {
 	case FirewallPurposeIAPSSH:
 		expectedName, _ := RunFirewallRuleName(runID, FirewallPurposeIAPSSH)
-		expectedTag, _ := RunNodeTag(runID)
+		expectedTag, _ := RunNodeTag(lifetimeFingerprint)
 		if rule.Identity.Name != expectedName || rule.Allowed[0].Ports[0] != FirewallPortSSH || len(rule.SourceTags) != 0 ||
 			len(rule.SourceCIDRs) != 1 || rule.SourceCIDRs[0] != IAPTCPSourceCIDR ||
 			!slices.Equal(rule.TargetTags, []string{expectedTag}) || rule.LifetimeContractFingerprint != lifetimeFingerprint {
@@ -379,7 +447,7 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 		}
 	case FirewallPurposeInternalMongo:
 		expectedName, _ := RunFirewallRuleName(runID, FirewallPurposeInternalMongo)
-		expectedTag, _ := RunNodeTag(runID)
+		expectedTag, _ := RunNodeTag(lifetimeFingerprint)
 		if rule.Identity.Name != expectedName || rule.Allowed[0].Ports[0] != FirewallPortMongo || len(rule.SourceCIDRs) != 0 ||
 			rule.LifetimeContractFingerprint != lifetimeFingerprint {
 			return guardError(ErrUnsafeFirewall, "shape", "does not match the internal MongoDB purpose")
@@ -414,13 +482,16 @@ func RunFirewallRuleName(runID string, purpose FirewallPurpose) (string, error) 
 	}
 }
 
-// RunNodeTag derives the only node tag admitted for one run.
-func RunNodeTag(runID string) (string, error) {
-	prefix, err := RunResourcePrefix(runID)
-	if err != nil {
-		return "", err
+// RunNodeTag derives the only node tag admitted for one immutable run lifetime.
+// Future complete VM intents must consume this exact tag; M-0 intentionally
+// does not infer or authorize any VM request.
+func RunNodeTag(lifetimeFingerprint string) (string, error) {
+	if !isSHA256Fingerprint(lifetimeFingerprint) {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.fingerprint", "must be a SHA-256 fingerprint")
 	}
-	return prefix + testNodeTagSuffix, nil
+	// The fixed prefix plus 49 hex characters is exactly the provider's 63-byte
+	// maximum and retains 196 bits of the immutable lifetime identity.
+	return testNodeTagPrefix + lifetimeFingerprint[:49], nil
 }
 
 // ValidateFirewallTags is retained as the shared tag-shape primitive. Full

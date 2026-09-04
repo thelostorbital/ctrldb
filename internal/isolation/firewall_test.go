@@ -17,7 +17,7 @@ func TestTESTISO04FirewallPurposeShapesAreExact(t *testing.T) {
 	t.Parallel()
 
 	rules := validFirewallRules()
-	if err := isolation.ValidateFirewallRules(rules, []string{"10.80.0.0/16"}, firewallTargets("run1"), validFirewallValidationContext("run1")); err != nil {
+	if err := isolation.ValidateFirewallRules(rules, absentFirewallObservations(rules), []string{"10.80.0.0/16"}, firewallTargets("run1"), validFirewallValidationContext("run1")); err != nil {
 		t.Fatalf("ValidateFirewallRules() unexpected error: %v", err)
 	}
 
@@ -92,7 +92,7 @@ func TestTESTISO04InternalMongoDBRuleRequiresMatchingTestTags(t *testing.T) {
 	t.Parallel()
 
 	valid := validFirewallRules()[1]
-	run2Tag, _ := isolation.RunNodeTag("run2")
+	run2Tag, _ := isolation.RunNodeTag(validLifetimeFingerprint("run2"))
 	tests := []struct {
 		name   string
 		mutate func(*isolation.FirewallRule)
@@ -126,7 +126,7 @@ func TestFirewallRuleIdentityMustBeAnExactSelectedMutationTarget(t *testing.T) {
 
 	rules := validFirewallRules()
 	targets := firewallTargets("run1")
-	if err := isolation.ValidateFirewallRules(rules, []string{"10.80.0.0/16"}, targets[:1], validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+	if err := isolation.ValidateFirewallRules(rules, absentFirewallObservations(rules), []string{"10.80.0.0/16"}, targets[:1], validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
 		t.Fatalf("ValidateFirewallRules(missing exact target) error = %v; want ErrUnsafeFirewall", err)
 	}
 
@@ -135,7 +135,8 @@ func TestFirewallRuleIdentityMustBeAnExactSelectedMutationTarget(t *testing.T) {
 	crossProject.Identity.CanonicalKey = mustCanonicalTargetKey(crossProject.Identity)
 	crossProject.Network.Project = "another-test-project"
 	crossProject.Network.CanonicalKey = mustCanonicalTargetKey(crossProject.Network)
-	if err := isolation.ValidateFirewallRules([]isolation.FirewallRule{crossProject, rules[1]}, []string{"10.80.0.0/16"}, targets, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+	changedRules := []isolation.FirewallRule{crossProject, rules[1]}
+	if err := isolation.ValidateFirewallRules(changedRules, absentFirewallObservations(changedRules), []string{"10.80.0.0/16"}, targets, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) {
 		t.Fatalf("ValidateFirewallRules(cross-project identity) error = %v; want ErrUnsafeFirewall", err)
 	}
 }
@@ -172,8 +173,76 @@ func TestFirewallRulesRequireExactRunLifetimeFingerprint(t *testing.T) {
 	}
 	updatedContext := validFirewallValidationContext("run1")
 	updatedContext.RunLifetime = updatedContract
-	if err := isolation.ValidateFirewallRules(reusedRunRules, []string{"10.80.0.0/16"}, firewallTargets("run1"), updatedContext); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+	if err := isolation.ValidateFirewallRules(reusedRunRules, absentFirewallObservations(reusedRunRules), []string{"10.80.0.0/16"}, firewallTargets("run1"), updatedContext); !errors.Is(err, isolation.ErrUnsafeFirewall) {
 		t.Fatalf("ValidateFirewallRules(stale internal rule after reused run) error = %v; want ErrUnsafeFirewall", err)
+	}
+}
+
+func TestFirewallObservationsAreExhaustiveAndFailClosed(t *testing.T) {
+	t.Parallel()
+
+	rules := validFirewallRules()
+	targets := firewallTargets("run1")
+	validPresent := presentFirewallObservations(rules)
+	unknown := validPresent[1]
+	unknown.Identity = testResourceIdentity("ctrldb-test-run1-unknown", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global")
+	tests := []struct {
+		name         string
+		observations []isolation.FirewallObservation
+		targets      []isolation.MutationTarget
+		kind         error
+	}{
+		{name: "missing observation", observations: validPresent[:1], targets: nil, kind: isolation.ErrUnsafeFirewall},
+		{name: "duplicate observation", observations: []isolation.FirewallObservation{validPresent[0], validPresent[0]}, targets: nil, kind: isolation.ErrInvalidGuardInput},
+		{name: "unknown identity", observations: []isolation.FirewallObservation{validPresent[0], unknown}, targets: nil, kind: isolation.ErrUnsafeFirewall},
+		{name: "unknown state", observations: []isolation.FirewallObservation{validPresent[0], {Identity: rules[1].Identity, State: "unknown"}}, targets: nil, kind: isolation.ErrInvalidGuardInput},
+		{name: "present without state", observations: []isolation.FirewallObservation{validPresent[0], {Identity: rules[1].Identity, State: isolation.FirewallObservationPresent}}, targets: nil, kind: isolation.ErrInvalidGuardInput},
+		{name: "ambiguous absent", observations: []isolation.FirewallObservation{{Identity: rules[0].Identity, State: isolation.FirewallObservationAbsent, PresentRule: &rules[0]}, validPresent[1]}, targets: targets[:1], kind: isolation.ErrInvalidGuardInput},
+		{name: "missing absent target", observations: absentFirewallObservations(rules), targets: targets[:1], kind: isolation.ErrUnsafeFirewall},
+		{name: "present selected for insert", observations: validPresent, targets: targets, kind: isolation.ErrUnsafeFirewall},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := isolation.ValidateFirewallRules(rules, test.observations, []string{"10.80.0.0/16"}, test.targets, validFirewallValidationContext("run1")); !errors.Is(err, test.kind) {
+				t.Fatalf("ValidateFirewallRules() error = %v; want %v", err, test.kind)
+			}
+		})
+	}
+
+	drifted := presentFirewallObservations(rules)
+	drifted[0].PresentRule.Priority--
+	if err := isolation.ValidateFirewallRules(rules, drifted, []string{"10.80.0.0/16"}, nil, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrUnsafeFirewall) && !errors.Is(err, isolation.ErrProofMismatch) {
+		t.Fatalf("ValidateFirewallRules(drifted present rule) error = %v; want fail-closed firewall/proof error", err)
+	}
+}
+
+func TestRunNodeTagBindsImmutableLifetimeGeneration(t *testing.T) {
+	t.Parallel()
+
+	first := validRunLifetimeContract("run1")
+	firstFingerprint, _ := isolation.RunLifetimeContractFingerprint(first)
+	firstTag, err := isolation.RunNodeTag(firstFingerprint)
+	if err != nil {
+		t.Fatalf("RunNodeTag() unexpected error: %v", err)
+	}
+	if len(firstTag) != 63 || isolation.ValidateFirewallTags([]string{firstTag}, []string{firstTag}) != nil {
+		t.Fatal("RunNodeTag() did not produce a provider-valid bounded tag")
+	}
+	stableTag, _ := isolation.RunNodeTag(firstFingerprint)
+	if stableTag != firstTag {
+		t.Fatal("RunNodeTag() changed for the same immutable lifetime")
+	}
+	reused := first
+	reused.RecordGeneration++
+	reusedFingerprint, _ := isolation.RunLifetimeContractFingerprint(reused)
+	reusedTag, _ := isolation.RunNodeTag(reusedFingerprint)
+	if reusedTag == firstTag {
+		t.Fatal("RunNodeTag() reused a tag after immutable lifetime generation changed")
+	}
+	if _, err := isolation.RunNodeTag(""); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("RunNodeTag(invalid fingerprint) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
 
@@ -258,7 +327,7 @@ func TestFirewallRulesDeriveDisjointOwnershipForConcurrentRuns(t *testing.T) {
 		run1[1].Identity.Name == run2[1].Identity.Name {
 		t.Fatal("concurrent runs share MongoDB firewall ownership or tags")
 	}
-	if err := isolation.ValidateFirewallRules(run2, []string{"10.80.0.0/16"}, firewallTargets("run2"), validFirewallValidationContext("run2")); err != nil {
+	if err := isolation.ValidateFirewallRules(run2, absentFirewallObservations(run2), []string{"10.80.0.0/16"}, firewallTargets("run2"), validFirewallValidationContext("run2")); err != nil {
 		t.Fatalf("ValidateFirewallRules(second run) unexpected error: %v", err)
 	}
 }
@@ -274,7 +343,8 @@ func TestTESTISO08FirewallProofRejectsProductionCIDROverlapAndMalformedDiscovery
 	if err := isolation.ValidateFirewallRule(validFirewallRules()[0], []string{"not-a-cidr"}, validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateFirewallRule(malformed discovery) error = %v; want ErrInvalidGuardInput", err)
 	}
-	if err := isolation.ValidateFirewallRules([]isolation.FirewallRule{validFirewallRules()[0], validFirewallRules()[0]}, []string{"10.80.0.0/16"}, firewallTargets("run1"), validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	duplicate := []isolation.FirewallRule{validFirewallRules()[0], validFirewallRules()[0]}
+	if err := isolation.ValidateFirewallRules(duplicate, absentFirewallObservations(duplicate), []string{"10.80.0.0/16"}, firewallTargets("run1"), validFirewallValidationContext("run1")); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateFirewallRules(duplicate purpose) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
@@ -299,7 +369,7 @@ func validFirewallRules() []isolation.FirewallRule {
 func firewallRulesForRun(runID string) []isolation.FirewallRule {
 	iapName, _ := isolation.RunFirewallRuleName(runID, isolation.FirewallPurposeIAPSSH)
 	mongoName, _ := isolation.RunFirewallRuleName(runID, isolation.FirewallPurposeInternalMongo)
-	nodeTag, _ := isolation.RunNodeTag(runID)
+	nodeTag, _ := isolation.RunNodeTag(validLifetimeFingerprint(runID))
 	network := testResourceIdentity(isolation.TestVPCName, isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
 	description, _ := isolation.RunFirewallDescription(validLifetimeFingerprint(runID))
 	return []isolation.FirewallRule{
@@ -360,6 +430,23 @@ func firewallTargets(runID string) []isolation.MutationTarget {
 		testTargetWithIdentity(rules[0].Identity, runID),
 		testTargetWithIdentity(rules[1].Identity, runID),
 	}
+}
+
+func absentFirewallObservations(rules []isolation.FirewallRule) []isolation.FirewallObservation {
+	observations := make([]isolation.FirewallObservation, len(rules))
+	for index, rule := range rules {
+		observations[index] = isolation.FirewallObservation{Identity: rule.Identity, State: isolation.FirewallObservationAbsent}
+	}
+	return observations
+}
+
+func presentFirewallObservations(rules []isolation.FirewallRule) []isolation.FirewallObservation {
+	observations := make([]isolation.FirewallObservation, len(rules))
+	for index, rule := range rules {
+		present := cloneFirewallRule(rule)
+		observations[index] = isolation.FirewallObservation{Identity: rule.Identity, State: isolation.FirewallObservationPresent, PresentRule: &present}
+	}
+	return observations
 }
 
 func cloneFirewallRule(rule isolation.FirewallRule) isolation.FirewallRule {

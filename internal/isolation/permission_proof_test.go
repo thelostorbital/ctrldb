@@ -36,13 +36,13 @@ func TestTESTISO09PermissionProofRejectsAmbiguousOrIncompleteEvidence(t *testing
 		{name: "duplicate expected", expected: append(expected, expected[0]), observed: expected},
 		{name: "duplicate observed", expected: expected, observed: append(expected, expected[0])},
 		{name: "unexpected observation", expected: expected, observed: append(expected, isolation.PermissionObservation{
-			Identity: "test-operator", Resource: "production-member", Permission: "compute.instances.update", Granted: false,
+			Identity: operatorPrincipal(), Resource: permissionResource("production-member"), Permission: "compute.instances.update", Granted: false,
 		})},
 		{name: "decision mismatch", expected: expected, observed: []isolation.PermissionObservation{
 			expected[0], {Identity: expected[1].Identity, Resource: expected[1].Resource, Permission: expected[1].Permission, Granted: true},
 		}},
 		{name: "malformed expected tuple", expected: []isolation.PermissionObservation{{
-			Identity: "test-operator", Resource: "production-member", Permission: "not a permission",
+			Identity: operatorPrincipal(), Resource: permissionResource("production-member"), Permission: "not a permission",
 		}}, observed: expected},
 	}
 	for _, test := range tests {
@@ -73,7 +73,7 @@ func TestTESTISO09PermissionProofRejectsForbiddenServiceWrites(t *testing.T) {
 		t.Run(permission, func(t *testing.T) {
 			t.Parallel()
 			observation := isolation.PermissionObservation{
-				Identity: "test-operator", Resource: "production-resource", Permission: permission, Granted: true,
+				Identity: operatorPrincipal(), Resource: permissionResource("production-resource"), Permission: permission, Granted: true,
 			}
 			if err := isolation.ValidatePermissionProof(permissionProofInput(
 				[]isolation.PermissionObservation{observation}, []isolation.PermissionObservation{observation},
@@ -84,9 +84,9 @@ func TestTESTISO09PermissionProofRejectsForbiddenServiceWrites(t *testing.T) {
 	}
 
 	reads := []isolation.PermissionObservation{
-		{Identity: "test-operator", Resource: "production-policy", Permission: "monitoring.alertPolicies.get", Granted: true},
-		{Identity: "test-operator", Resource: "production-job", Permission: "cloudscheduler.jobs.list", Granted: true},
-		{Identity: "test-operator", Resource: "production-service", Permission: "run.services.get", Granted: true},
+		{Identity: operatorPrincipal(), Resource: permissionResource("production-policy"), Permission: "monitoring.alertPolicies.get", Granted: true},
+		{Identity: operatorPrincipal(), Resource: permissionResource("production-job"), Permission: "cloudscheduler.jobs.list", Granted: true},
+		{Identity: operatorPrincipal(), Resource: permissionResource("production-service"), Permission: "run.services.get", Granted: true},
 	}
 	if err := isolation.ValidatePermissionProof(permissionProofInput(reads, reads)); err != nil {
 		t.Fatalf("ValidatePermissionProof(reads) unexpected error: %v", err)
@@ -99,13 +99,60 @@ func TestPermissionProofErrorsDoNotExposeObservedValues(t *testing.T) {
 	const marker = "sensitive-production-resource"
 	expected := validPermissionExpectations()
 	observed := append([]isolation.PermissionObservation(nil), expected...)
-	observed[0].Resource = marker
+	observed[0].Resource = permissionResource(marker)
 	err := isolation.ValidatePermissionProof(permissionProofInput(expected, observed))
 	if !errors.Is(err, isolation.ErrPermissionProof) {
 		t.Fatalf("ValidatePermissionProof() error = %v; want ErrPermissionProof", err)
 	}
 	if strings.Contains(err.Error(), marker) {
 		t.Fatal("permission proof error exposed an observed resource")
+	}
+}
+
+func TestPermissionProofRejectsAmbiguousPrincipalAndResourceIdentity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*isolation.PermissionObservation)
+	}{
+		{name: "bare principal", mutate: func(value *isolation.PermissionObservation) {
+			value.Identity = isolation.Principal{Subject: "operator@example.test"}
+		}},
+		{name: "principal alias", mutate: func(value *isolation.PermissionObservation) {
+			value.Identity.Subject = "user:" + value.Identity.Subject
+		}},
+		{name: "principal whitespace", mutate: func(value *isolation.PermissionObservation) {
+			value.Identity.Subject += " "
+		}},
+		{name: "principal control", mutate: func(value *isolation.PermissionObservation) {
+			value.Identity.Subject += "\n"
+		}},
+		{name: "bare resource", mutate: func(value *isolation.PermissionObservation) {
+			value.Resource = isolation.ResourceIdentity{Name: "production-instance"}
+		}},
+		{name: "missing project", mutate: func(value *isolation.PermissionObservation) {
+			value.Resource.Project = ""
+		}},
+		{name: "cross-project key mismatch", mutate: func(value *isolation.PermissionObservation) {
+			value.Resource.Project = "other-test-project"
+		}},
+		{name: "resource control", mutate: func(value *isolation.PermissionObservation) {
+			value.Resource.Name += "\n"
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			observation := validPermissionExpectations()[0]
+			test.mutate(&observation)
+			if err := isolation.ValidatePermissionProof(permissionProofInput(
+				[]isolation.PermissionObservation{observation}, []isolation.PermissionObservation{observation},
+			)); !errors.Is(err, isolation.ErrPermissionProof) {
+				t.Fatalf("ValidatePermissionProof() error = %v; want ErrPermissionProof", err)
+			}
+		})
 	}
 }
 
@@ -140,9 +187,13 @@ func TestPermissionProofRequiresNamedVersionedCompleteInventory(t *testing.T) {
 
 func validPermissionExpectations() []isolation.PermissionObservation {
 	return []isolation.PermissionObservation{
-		{Identity: "test-operator", Resource: "test-instance", Permission: "compute.instances.get", Granted: true},
-		{Identity: "test-operator", Resource: "production-instance", Permission: "compute.instances.update", Granted: false},
+		{Identity: operatorPrincipal(), Resource: permissionResource("ctrldb-test-run1-vm"), Permission: "compute.instances.get", Granted: true},
+		{Identity: operatorPrincipal(), Resource: permissionResource("production-instance"), Permission: "compute.instances.update", Granted: false},
 	}
+}
+
+func permissionResource(name string) isolation.ResourceIdentity {
+	return testResourceIdentity(name, isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "asia-south1-a")
 }
 
 func validPermissionProofInput() isolation.PermissionProofInput {

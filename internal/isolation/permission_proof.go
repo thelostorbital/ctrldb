@@ -32,8 +32,8 @@ var (
 // Expected and observed slices use the same tuple shape so callers, rather
 // than this package, remain authoritative for the permission inventory.
 type PermissionObservation struct {
-	Identity   string
-	Resource   string
+	Identity   Principal
+	Resource   ResourceIdentity
 	Permission string
 	Granted    bool
 }
@@ -140,8 +140,11 @@ func PermissionInventoryFingerprint(expected []PermissionObservation) (string, e
 	sort.Slice(canonical, func(i, j int) bool {
 		first := newPermissionObservationKey(canonical[i])
 		second := newPermissionObservationKey(canonical[j])
-		if first.identity != second.identity {
-			return first.identity < second.identity
+		if first.identityKind != second.identityKind {
+			return first.identityKind < second.identityKind
+		}
+		if first.identitySubject != second.identitySubject {
+			return first.identitySubject < second.identitySubject
 		}
 		if first.resource != second.resource {
 			return first.resource < second.resource
@@ -160,11 +163,11 @@ func PermissionInventoryFingerprint(expected []PermissionObservation) (string, e
 }
 
 func validatePermissionObservation(path string, item PermissionObservation) error {
-	if strings.TrimSpace(item.Identity) == "" || strings.TrimSpace(item.Resource) == "" {
-		return guardError(ErrPermissionProof, path, "must identify an identity and resource")
+	if !validPrincipal(item.Identity) {
+		return guardError(ErrPermissionProof, path, "must contain a canonical principal")
 	}
-	if item.Identity != strings.TrimSpace(item.Identity) || item.Resource != strings.TrimSpace(item.Resource) {
-		return guardError(ErrPermissionProof, path, "contains non-canonical identity or resource text")
+	if err := validateResourceIdentity(item.Resource); err != nil {
+		return guardError(ErrPermissionProof, path, "must contain a canonical explicit resource identity")
 	}
 	if !permissionPattern.MatchString(item.Permission) {
 		return guardError(ErrPermissionProof, path, "contains a malformed permission")
@@ -173,13 +176,17 @@ func validatePermissionObservation(path string, item PermissionObservation) erro
 }
 
 type permissionObservationKey struct {
-	identity   string
-	resource   string
-	permission string
+	identityKind    PrincipalKind
+	identitySubject string
+	resource        string
+	permission      string
 }
 
 func newPermissionObservationKey(item PermissionObservation) permissionObservationKey {
-	return permissionObservationKey{identity: item.Identity, resource: item.Resource, permission: item.Permission}
+	return permissionObservationKey{
+		identityKind: item.Identity.Kind, identitySubject: item.Identity.Subject,
+		resource: item.Resource.CanonicalKey, permission: item.Permission,
+	}
 }
 
 func isForbiddenServiceWrite(permission string) bool {

@@ -207,12 +207,12 @@ func TestRunMutationTargetsBindCompleteCrossProjectIdentity(t *testing.T) {
 	first := testTarget("ctrldb-test-run1-vm", "run1")
 	second := testTarget("ctrldb-test-run1-vm", "run1")
 	second.Identity.Project = "another-test-project"
-	second.Identity.FullName = mustCanonicalTargetName(second.Identity)
+	second.Identity.CanonicalKey = mustCanonicalTargetKey(second.Identity)
 	selected, err := isolation.SelectRunMutationTargets("run1", []isolation.MutationTarget{second, first})
 	if err != nil {
 		t.Fatalf("SelectRunMutationTargets(cross-project names) unexpected error: %v", err)
 	}
-	if selected[0].Identity.FullName == selected[1].Identity.FullName {
+	if selected[0].Identity.CanonicalKey == selected[1].Identity.CanonicalKey {
 		t.Fatal("cross-project targets collapsed to one identity")
 	}
 
@@ -223,7 +223,12 @@ func TestRunMutationTargetsBindCompleteCrossProjectIdentity(t *testing.T) {
 		{name: "missing project", mutate: func(target *isolation.MutationTarget) { target.Identity.Project = "" }},
 		{name: "ambient location", mutate: func(target *isolation.MutationTarget) { target.Identity.Location = "" }},
 		{name: "scope mismatch", mutate: func(target *isolation.MutationTarget) { target.Identity.Scope = isolation.ResourceScopeGlobal }},
-		{name: "swapped full name", mutate: func(target *isolation.MutationTarget) { target.Identity.FullName = second.Identity.FullName }},
+		{name: "malformed region", mutate: func(target *isolation.MutationTarget) {
+			target.Identity.Scope = isolation.ResourceScopeRegion
+			target.Identity.Location = "asia-south"
+		}},
+		{name: "malformed zone", mutate: func(target *isolation.MutationTarget) { target.Identity.Location = "asia-south1" }},
+		{name: "swapped canonical key", mutate: func(target *isolation.MutationTarget) { target.Identity.CanonicalKey = second.Identity.CanonicalKey }},
 	}
 	for _, test := range tests {
 		test := test
@@ -370,48 +375,71 @@ func TestValidateHarnessLocksRequiresExactCompleteSetAndRunOwnership(t *testing.
 	t.Parallel()
 
 	locks, expected := validLockProof()
-	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", "test-runner"); err != nil {
+	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", harnessPrincipal()); err != nil {
 		t.Fatalf("ValidateHarnessLocks() unexpected error: %v", err)
 	}
-	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", ""); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(locks, expected, "run1", isolation.Principal{}); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(empty holder) error = %v; want ErrInvalidGuardInput", err)
 	}
-	badHolder := append([]isolation.EnvironmentLock(nil), locks...)
-	badHolder[0].Holder = " operator "
-	if err := isolation.ValidateHarnessLocks(badHolder, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
-		t.Fatalf("ValidateHarnessLocks(noncanonical holder) error = %v; want ErrInvalidGuardInput", err)
+	activeProduction := append([]isolation.EnvironmentLock(nil), locks...)
+	activeProduction[0].Active = true
+	activeProduction[0].Holder = operatorPrincipal()
+	if err := isolation.ValidateHarnessLocks(activeProduction, expected, "run1", harnessPrincipal()); err != nil {
+		t.Fatalf("ValidateHarnessLocks(active production lock held by operator) unexpected error: %v", err)
+	}
+	inactiveWithHolder := append([]isolation.EnvironmentLock(nil), locks...)
+	inactiveWithHolder[0].Holder = operatorPrincipal()
+	if err := isolation.ValidateHarnessLocks(inactiveWithHolder, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateHarnessLocks(inactive with holder) error = %v; want ErrInvalidGuardInput", err)
+	}
+	invalidActive := append([]isolation.EnvironmentLock(nil), locks...)
+	invalidActive[0].Active = true
+	if err := isolation.ValidateHarnessLocks(invalidActive, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateHarnessLocks(active without holder) error = %v; want ErrInvalidGuardInput", err)
+	}
+	aliasHolder := append([]isolation.EnvironmentLock(nil), activeProduction...)
+	aliasHolder[0].Holder.Subject = "user:" + aliasHolder[0].Holder.Subject
+	if err := isolation.ValidateHarnessLocks(aliasHolder, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("ValidateHarnessLocks(alias holder) error = %v; want ErrInvalidGuardInput", err)
 	}
 	duplicate := append(append([]isolation.EnvironmentLock(nil), locks...), locks[0])
-	if err := isolation.ValidateHarnessLocks(duplicate, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(duplicate, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(duplicate) error = %v; want ErrInvalidGuardInput", err)
 	}
-	if err := isolation.ValidateHarnessLocks(locks[:1], expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrRunLockNotHeld) {
+	if err := isolation.ValidateHarnessLocks(locks[:1], expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
 		t.Fatalf("ValidateHarnessLocks(missing run lock) error = %v; want ErrRunLockNotHeld", err)
 	}
 	lost := append([]isolation.EnvironmentLock(nil), locks...)
-	lost[1].Holder = "other-runner"
-	if err := isolation.ValidateHarnessLocks(lost, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrRunLockNotHeld) {
+	lost[1].Holder = isolation.Principal{Kind: isolation.PrincipalKindServiceAccount, Subject: "other-runner@example-test-project.iam.gserviceaccount.com"}
+	if err := isolation.ValidateHarnessLocks(lost, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
 		t.Fatalf("ValidateHarnessLocks(lock loss) error = %v; want ErrRunLockNotHeld", err)
 	}
+	absentRunLock := append([]isolation.EnvironmentLock(nil), locks...)
+	absentRunLock[1].Active = false
+	absentRunLock[1].Holder = isolation.Principal{}
+	if err := isolation.ValidateHarnessLocks(absentRunLock, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrRunLockNotHeld) {
+		t.Fatalf("ValidateHarnessLocks(absent run lock) error = %v; want ErrRunLockNotHeld", err)
+	}
 	missingProduction := []isolation.EnvironmentLock{locks[1]}
-	if err := isolation.ValidateHarnessLocks(missingProduction, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(missingProduction, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(missing environment) error = %v; want ErrInvalidGuardInput", err)
 	}
 	unexpected := append(append([]isolation.EnvironmentLock(nil), locks...), isolation.EnvironmentLock{
-		Environment: "staging", Class: domain.EnvironmentStaging, Holder: "operator",
+		Environment: "staging", Class: domain.EnvironmentStaging,
 	})
-	if err := isolation.ValidateHarnessLocks(unexpected, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(unexpected, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(unexpected environment) error = %v; want ErrInvalidGuardInput", err)
 	}
 	heldProduction := append([]isolation.EnvironmentLock(nil), locks...)
-	heldProduction[0].Holder = "test-runner"
-	if err := isolation.ValidateHarnessLocks(heldProduction, expected, "run1", "test-runner"); !errors.Is(err, isolation.ErrNonDisposableLock) {
+	heldProduction[0].Active = true
+	heldProduction[0].Holder = harnessPrincipal()
+	if err := isolation.ValidateHarnessLocks(heldProduction, expected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrNonDisposableLock) {
 		t.Fatalf("ValidateHarnessLocks(non-disposable holder) error = %v; want ErrNonDisposableLock", err)
 	}
 	ambiguousExpected := append(append([]isolation.EnvironmentIdentity(nil), expected...), isolation.EnvironmentIdentity{
 		Environment: "production", Class: domain.EnvironmentStaging,
 	})
-	if err := isolation.ValidateHarnessLocks(locks, ambiguousExpected, "run1", "test-runner"); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+	if err := isolation.ValidateHarnessLocks(locks, ambiguousExpected, "run1", harnessPrincipal()); !errors.Is(err, isolation.ErrInvalidGuardInput) {
 		t.Fatalf("ValidateHarnessLocks(ambiguous expectation) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
@@ -439,9 +467,12 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 		kind   error
 	}{
 		{name: "selector proof", mutate: func(value *isolation.PreMutationInput) { value.RunID = "different" }, kind: isolation.ErrUnsafeTarget},
-		{name: "capacity proof", mutate: func(value *isolation.PreMutationInput) { value.Capacity.Request.Instances = 3 }, kind: isolation.ErrCapacityExceeded},
+		{name: "capacity proof", mutate: func(value *isolation.PreMutationInput) { value.Capacity.Instances[0].Machine.VCPUs = 8 }, kind: isolation.ErrCapacityExceeded},
 		{name: "network proof", mutate: func(value *isolation.PreMutationInput) { value.TestCIDR = "10.80.1.0/24" }, kind: isolation.ErrNetworkOverlap},
-		{name: "lock proof", mutate: func(value *isolation.PreMutationInput) { value.Locks[0].Holder = value.HarnessHolder }, kind: isolation.ErrNonDisposableLock},
+		{name: "lock proof", mutate: func(value *isolation.PreMutationInput) {
+			value.Locks[0].Active = true
+			value.Locks[0].Holder = value.HarnessPrincipal
+		}, kind: isolation.ErrNonDisposableLock},
 		{name: "permission proof", mutate: func(value *isolation.PreMutationInput) { value.Permissions.Observed = nil }, kind: isolation.ErrPermissionProof},
 		{name: "firewall proof", mutate: func(value *isolation.PreMutationInput) { value.FirewallRules = value.FirewallRules[:1] }, kind: isolation.ErrUnsafeFirewall},
 		{name: "freshness proof", mutate: func(value *isolation.PreMutationInput) { value.Freshness.ValidUntil = value.Freshness.ObservedAt }, kind: isolation.ErrStaleProof},
@@ -459,15 +490,48 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 	}
 }
 
-func TestPreMutationCapacityClaimMatchesExactInstanceTargets(t *testing.T) {
+func TestPreMutationCapacityProofUsesTheFullPlannedInventory(t *testing.T) {
 	t.Parallel()
 
-	for _, instances := range []int{0, 2} {
-		input := validPreMutationInput()
-		input.Capacity.Request.Instances = instances
-		if _, err := isolation.AuthorizePreMutation(input); !errors.Is(err, isolation.ErrInvalidGuardInput) {
-			t.Errorf("AuthorizePreMutation(instances=%d) error = %v; want ErrInvalidGuardInput", instances, err)
-		}
+	tests := []struct {
+		name   string
+		mutate func(*isolation.PreMutationInput)
+		kind   error
+	}{
+		{name: "empty instances", mutate: func(input *isolation.PreMutationInput) { input.Capacity.Instances = nil }, kind: isolation.ErrInvalidGuardInput},
+		{name: "duplicate instance", mutate: func(input *isolation.PreMutationInput) {
+			input.Capacity.Instances = append(input.Capacity.Instances, input.Capacity.Instances[0])
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "zero shape", mutate: func(input *isolation.PreMutationInput) { input.Capacity.Instances[0].Machine.VCPUs = 0 }, kind: isolation.ErrInvalidGuardInput},
+		{name: "cross-run instance", mutate: func(input *isolation.PreMutationInput) { input.Capacity.Instances[0].RunID = "run-42" }, kind: isolation.ErrInvalidGuardInput},
+		{name: "oversized shape", mutate: func(input *isolation.PreMutationInput) { input.Capacity.Instances[0].Machine.MemoryMB = 32 * 1024 }, kind: isolation.ErrCapacityExceeded},
+		{name: "duplicate disk", mutate: func(input *isolation.PreMutationInput) {
+			input.Capacity.Disks = append(input.Capacity.Disks, input.Capacity.Disks[0])
+		}, kind: isolation.ErrInvalidGuardInput},
+		{name: "zero disk size", mutate: func(input *isolation.PreMutationInput) { input.Capacity.Disks[0].SizeGiB = 0 }, kind: isolation.ErrInvalidGuardInput},
+		{name: "cross-run disk", mutate: func(input *isolation.PreMutationInput) { input.Capacity.Disks[0].RunID = "run-42" }, kind: isolation.ErrInvalidGuardInput},
+		{name: "target absent from plan", mutate: func(input *isolation.PreMutationInput) {
+			input.Targets[0] = testTarget("ctrldb-test-run1-other", "run1")
+		}, kind: isolation.ErrInvalidGuardInput},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			input := validPreMutationInput()
+			test.mutate(&input)
+			if _, err := isolation.AuthorizePreMutation(input); !errors.Is(err, test.kind) {
+				t.Fatalf("AuthorizePreMutation() error = %v; want %v", err, test.kind)
+			}
+		})
+	}
+
+	input := validPreMutationInput()
+	input.Targets = []isolation.MutationTarget{testTargetWithIdentity(testResourceIdentity(
+		"ctrldb-test-run1-firewall", isolation.ResourceKind("firewalls"), isolation.ResourceScopeGlobal, "global",
+	), "run1")}
+	if _, err := isolation.AuthorizePreMutation(input); err != nil {
+		t.Fatalf("AuthorizePreMutation(firewall-only mutation with planned instance capacity) unexpected error: %v", err)
 	}
 }
 
@@ -486,9 +550,15 @@ func TestPreMutationDecisionRejectsStaleSwappedAndExpiredEvidence(t *testing.T) 
 	if _, err := isolation.RevalidatePreMutation(decision, expired); !errors.Is(err, isolation.ErrStaleProof) {
 		t.Fatalf("RevalidatePreMutation(expired) error = %v; want ErrStaleProof", err)
 	}
+	extended := freshPreMutationInput()
+	extended.Freshness.ValidUntil = extended.Freshness.ValidUntil.Add(time.Second)
+	if _, err := isolation.RevalidatePreMutation(decision, extended); !errors.Is(err, isolation.ErrStaleProof) {
+		t.Fatalf("RevalidatePreMutation(extended expiry) error = %v; want ErrStaleProof", err)
+	}
 	swapped := freshPreMutationInput()
 	swapped.Targets[0].Identity.Project = "another-test-project"
-	swapped.Targets[0].Identity.FullName = mustCanonicalTargetName(swapped.Targets[0].Identity)
+	swapped.Targets[0].Identity.CanonicalKey = mustCanonicalTargetKey(swapped.Targets[0].Identity)
+	swapped.Capacity.Instances[0].Identity = swapped.Targets[0].Identity
 	if _, err := isolation.RevalidatePreMutation(decision, swapped); !errors.Is(err, isolation.ErrProofMismatch) {
 		t.Fatalf("RevalidatePreMutation(swapped target) error = %v; want ErrProofMismatch", err)
 	}
@@ -533,22 +603,23 @@ func validPreMutationInput() isolation.PreMutationInput {
 	permissions := validPermissionProofInput()
 	locks, expectedEnvironments := validLockProof()
 	observedAt := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	instance := testResourceIdentity("ctrldb-test-run1-vm", isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "asia-south1-a")
+	disk := testResourceIdentity("ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeZone, "asia-south1-a")
 	return isolation.PreMutationInput{
 		RunID:   "run1",
-		Targets: []isolation.MutationTarget{testTarget("ctrldb-test-run1-vm", "run1")},
+		Targets: []isolation.MutationTarget{testTargetWithIdentity(instance, "run1")},
 		Capacity: isolation.CapacityProofInput{
 			PlanFingerprint: strings.Repeat("a", 64),
 			Limits:          defaultLimits(),
-			Request: isolation.RunRequest{
-				Machine: isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024}, DiskGiB: 100,
-				Instances: 1, Lifetime: time.Hour, EstimatedCostMicros: 1_000_000,
-			},
+			Instances:       []isolation.PlannedInstance{{Identity: instance, RunID: "run1", Machine: isolation.MachineShape{VCPUs: 2, MemoryMB: 8 * 1024}}},
+			Disks:           []isolation.PlannedDisk{{Identity: disk, RunID: "run1", SizeGiB: 100}},
+			Lifetime:        time.Hour, EstimatedCostMicros: 1_000_000,
 		},
 		TestCIDR:                          "10.20.0.0/24",
 		ProductionCIDRs:                   []string{"10.80.0.0/16"},
 		ExpectedNonDisposableEnvironments: expectedEnvironments,
 		Locks:                             locks,
-		HarnessHolder:                     "test-runner",
+		HarnessPrincipal:                  harnessPrincipal(),
 		Permissions:                       permissions,
 		FirewallRules:                     validFirewallRules(),
 		Freshness: isolation.EvidenceFreshness{
@@ -566,12 +637,19 @@ func freshPreMutationInput() isolation.PreMutationInput {
 }
 
 func testTarget(name, runID string) isolation.MutationTarget {
-	identity := isolation.MutationTargetIdentity{
+	return testTargetWithIdentity(testResourceIdentity(name, isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "asia-south1-a"), runID)
+}
+
+func testResourceIdentity(name string, kind isolation.ResourceKind, scope isolation.ResourceScope, location string) isolation.ResourceIdentity {
+	identity := isolation.ResourceIdentity{
 		Project: "example-test-project", Service: isolation.ComputeServiceName,
-		Kind: isolation.ComputeInstanceKind, Scope: isolation.ResourceScopeZone,
-		Location: "asia-south1-a", Name: name,
+		Kind: kind, Scope: scope, Location: location, Name: name,
 	}
-	identity.FullName = mustCanonicalTargetName(identity)
+	identity.CanonicalKey = mustCanonicalTargetKey(identity)
+	return identity
+}
+
+func testTargetWithIdentity(identity isolation.ResourceIdentity, runID string) isolation.MutationTarget {
 	return isolation.MutationTarget{
 		Identity: identity,
 		Labels: map[string]string{
@@ -583,12 +661,12 @@ func testTarget(name, runID string) isolation.MutationTarget {
 
 func targetWithName(target isolation.MutationTarget, name string) isolation.MutationTarget {
 	target.Identity.Name = name
-	target.Identity.FullName = mustCanonicalTargetName(target.Identity)
+	target.Identity.CanonicalKey = mustCanonicalTargetKey(target.Identity)
 	return target
 }
 
-func mustCanonicalTargetName(identity isolation.MutationTargetIdentity) string {
-	name, err := isolation.CanonicalMutationTargetName(identity)
+func mustCanonicalTargetKey(identity isolation.ResourceIdentity) string {
+	name, err := isolation.CanonicalTargetKey(identity)
 	if err != nil {
 		panic(err)
 	}
@@ -598,8 +676,18 @@ func mustCanonicalTargetName(identity isolation.MutationTargetIdentity) string {
 func validLockProof() ([]isolation.EnvironmentLock, []isolation.EnvironmentIdentity) {
 	expected := []isolation.EnvironmentIdentity{{Environment: "production", Class: domain.EnvironmentProduction}}
 	locks := []isolation.EnvironmentLock{
-		{Environment: "production", Class: domain.EnvironmentProduction, Holder: "operator"},
-		{Environment: config.TestEnvironmentLabel, Class: domain.EnvironmentDisposable, RunID: "run1", Holder: "test-runner"},
+		{Environment: "production", Class: domain.EnvironmentProduction},
+		{Environment: config.TestEnvironmentLabel, Class: domain.EnvironmentDisposable, RunID: "run1", Active: true, Holder: harnessPrincipal()},
 	}
 	return locks, expected
+}
+
+func harnessPrincipal() isolation.Principal {
+	return isolation.Principal{
+		Kind: isolation.PrincipalKindServiceAccount, Subject: "test-runner@example-test-project.iam.gserviceaccount.com",
+	}
+}
+
+func operatorPrincipal() isolation.Principal {
+	return isolation.Principal{Kind: isolation.PrincipalKindUser, Subject: "operator@example.test"}
 }

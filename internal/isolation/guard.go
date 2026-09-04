@@ -49,12 +49,15 @@ var (
 var runIDPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 var (
-	projectIDPattern        = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
-	servicePattern          = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$`)
-	resourceKindPattern     = regexp.MustCompile(`^[a-z][A-Za-z0-9]{0,62}$`)
-	resourceLocationPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	resourceNamePattern     = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	environmentNamePattern  = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	projectIDPattern             = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
+	servicePattern               = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$`)
+	resourceKindPattern          = regexp.MustCompile(`^[a-z][A-Za-z0-9]{0,62}$`)
+	regionPattern                = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+[0-9]$`)
+	zonePattern                  = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+[0-9]-[a-z]$`)
+	resourceNamePattern          = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$`)
+	environmentNamePattern       = regexp.MustCompile(`^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	userSubjectPattern           = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	serviceAccountSubjectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$`)
 )
 
 const (
@@ -191,30 +194,33 @@ const (
 	ResourceScopeZone   ResourceScope   = "zone"
 	ComputeServiceName  ProviderService = "compute.googleapis.com"
 	ComputeInstanceKind ResourceKind    = "instances"
+	ComputeDiskKind     ResourceKind    = "disks"
 )
 
-// MutationTargetIdentity is the complete local identity a future provider
-// adapter must consume without consulting ambient defaults. FullName is the
-// canonical //service/projects/project/scope/kind/name representation.
-type MutationTargetIdentity struct {
-	Project  string
-	Service  ProviderService
-	Kind     ResourceKind
-	Scope    ResourceScope
-	Location string
-	Name     string
-	FullName string
+// ResourceIdentity is the complete explicit identity a future provider adapter
+// must consume without consulting ambient defaults. CanonicalKey is an
+// internal comparison key, not a provider resource-name grammar.
+type ResourceIdentity struct {
+	Project      string
+	Service      ProviderService
+	Kind         ResourceKind
+	Scope        ResourceScope
+	Location     string
+	Name         string
+	CanonicalKey string
 }
 
 // MutationTarget binds full provider identity to the labels observed for that
 // exact resource.
 type MutationTarget struct {
-	Identity MutationTargetIdentity
+	Identity ResourceIdentity
 	Labels   map[string]string
 }
 
-// CanonicalMutationTargetName derives the complete, explicit identity string.
-func CanonicalMutationTargetName(identity MutationTargetIdentity) (string, error) {
+// CanonicalTargetKey derives a synthetic internal comparison key from every
+// explicit identity field. Adapters must consume the fields themselves and
+// must not send this key to a provider API.
+func CanonicalTargetKey(identity ResourceIdentity) (string, error) {
 	if !projectIDPattern.MatchString(identity.Project) {
 		return "", guardError(ErrInvalidGuardInput, "target.identity.project", "must be a canonical explicit project ID")
 	}
@@ -224,9 +230,6 @@ func CanonicalMutationTargetName(identity MutationTargetIdentity) (string, error
 	if !resourceKindPattern.MatchString(string(identity.Kind)) {
 		return "", guardError(ErrInvalidGuardInput, "target.identity.kind", "must be a canonical resource kind")
 	}
-	if !resourceLocationPattern.MatchString(identity.Location) {
-		return "", guardError(ErrInvalidGuardInput, "target.identity.location", "must be a canonical explicit location")
-	}
 	var scopePath string
 	switch identity.Scope {
 	case ResourceScopeGlobal:
@@ -235,13 +238,13 @@ func CanonicalMutationTargetName(identity MutationTargetIdentity) (string, error
 		}
 		scopePath = "global"
 	case ResourceScopeRegion:
-		if identity.Location == "global" {
-			return "", guardError(ErrInvalidGuardInput, "target.identity.location", "must identify a region")
+		if !regionPattern.MatchString(identity.Location) {
+			return "", guardError(ErrInvalidGuardInput, "target.identity.location", "must identify a canonical region")
 		}
 		scopePath = "regions/" + identity.Location
 	case ResourceScopeZone:
-		if identity.Location == "global" {
-			return "", guardError(ErrInvalidGuardInput, "target.identity.location", "must identify a zone")
+		if !zonePattern.MatchString(identity.Location) {
+			return "", guardError(ErrInvalidGuardInput, "target.identity.location", "must identify a canonical zone")
 		}
 		scopePath = "zones/" + identity.Location
 	default:
@@ -250,7 +253,7 @@ func CanonicalMutationTargetName(identity MutationTargetIdentity) (string, error
 	if !resourceNamePattern.MatchString(identity.Name) {
 		return "", guardError(ErrInvalidGuardInput, "target.identity.name", "must be a canonical resource name")
 	}
-	return "//" + string(identity.Service) + "/projects/" + identity.Project + "/" + scopePath + "/" + string(identity.Kind) + "/" + identity.Name, nil
+	return "ctrldb-target-key:v1|" + identity.Project + "|" + string(identity.Service) + "|" + scopePath + "|" + string(identity.Kind) + "|" + identity.Name, nil
 }
 
 // SelectRunMutationTargets validates and returns a detached, deterministically
@@ -271,13 +274,13 @@ func SelectRunMutationTargets(runID string, resources []MutationTarget) ([]Mutat
 		if !strings.HasPrefix(resource.Identity.Name, prefix) || len(resource.Identity.Name) == len(prefix) || resource.Labels[LabelRunID] != runID {
 			return nil, guardError(ErrUnsafeTarget, path, "does not have exact run-scoped disposable identity")
 		}
-		if _, exists := seen[resource.Identity.FullName]; exists {
+		if _, exists := seen[resource.Identity.CanonicalKey]; exists {
 			return nil, guardError(ErrInvalidGuardInput, path, "duplicates an earlier target")
 		}
-		seen[resource.Identity.FullName] = struct{}{}
+		seen[resource.Identity.CanonicalKey] = struct{}{}
 		selected = append(selected, cloneMutationTarget(resource))
 	}
-	sort.SliceStable(selected, func(i, j int) bool { return selected[i].Identity.FullName < selected[j].Identity.FullName })
+	sort.SliceStable(selected, func(i, j int) bool { return selected[i].Identity.CanonicalKey < selected[j].Identity.CanonicalKey })
 	return selected, nil
 }
 
@@ -294,10 +297,10 @@ func ValidateCleanupTargets(resources []MutationTarget) error {
 		if !config.IsTestResource(config.GeneratedResource{Name: resource.Identity.Name, Labels: resource.Labels}) {
 			return guardError(ErrUnsafeTarget, path, "does not have exact disposable identity")
 		}
-		if _, exists := seen[resource.Identity.FullName]; exists {
+		if _, exists := seen[resource.Identity.CanonicalKey]; exists {
 			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier target")
 		}
-		seen[resource.Identity.FullName] = struct{}{}
+		seen[resource.Identity.CanonicalKey] = struct{}{}
 	}
 	return nil
 }
@@ -337,7 +340,7 @@ func SelectExpiredTargets(candidates []ExpirableTarget, now time.Time, maxLifeti
 		}
 	}
 	sort.SliceStable(selected, func(i, j int) bool {
-		return selected[i].Target.Identity.FullName < selected[j].Target.Identity.FullName
+		return selected[i].Target.Identity.CanonicalKey < selected[j].Target.Identity.CanonicalKey
 	})
 	return selected, nil
 }
@@ -391,29 +394,67 @@ func prefixesOverlap(first, second netip.Prefix) bool {
 	return first.Contains(second.Addr()) || second.Contains(first.Addr())
 }
 
+// PrincipalKind is a closed namespace for lock and permission principals.
+type PrincipalKind string
+
+const (
+	PrincipalKindUser           PrincipalKind = "user"
+	PrincipalKindServiceAccount PrincipalKind = "service-account"
+)
+
+// Principal is a structural canonical identity. Subject never includes a
+// user:/serviceAccount: prefix, preventing alias forms from comparing equal.
+type Principal struct {
+	Kind    PrincipalKind
+	Subject string
+}
+
 // EnvironmentIdentity is one caller-declared non-disposable environment whose
-// active lock must be represented exactly in the observation set.
+// present or absent lock state must be represented exactly in the observation
+// set.
 type EnvironmentIdentity struct {
 	Environment string
 	Class       domain.EnvironmentClass
 }
 
-// EnvironmentLock is active lock state after expiry has been evaluated by the
-// control-bucket adapter. RunID is mandatory only for the disposable run lock.
+// EnvironmentLock is an explicit present/absent observation after expiry
+// evaluation. RunID is mandatory only for the disposable run lock. Inactive
+// observations carry the zero Principal.
 type EnvironmentLock struct {
 	Environment string
 	Class       domain.EnvironmentClass
 	RunID       string
-	Holder      string
+	Active      bool
+	Holder      Principal
 }
 
-// CapacityProofInput is a local proof supplied from an inspectable plan and
-// provider-resolved machine data. This package validates and fingerprints the
-// claim; it does not independently discover machine, disk, or pricing truth.
+// PlannedInstance is one complete plan-wide instance capacity observation.
+// RunID closes prefix ambiguity independently of the resource name.
+type PlannedInstance struct {
+	Identity ResourceIdentity
+	RunID    string
+	Machine  MachineShape
+}
+
+// PlannedDisk is one complete plan-wide disk capacity observation. RunID
+// closes prefix ambiguity independently of the resource name.
+type PlannedDisk struct {
+	Identity ResourceIdentity
+	RunID    string
+	SizeGiB  int64
+}
+
+// CapacityProofInput is the full run-capacity inventory supplied from an
+// inspectable plan and provider-resolved machine data. EstimatedCostMicros is
+// a plan-derived upward-rounded claim per D-146. This package derives counts
+// and maxima, validates and fingerprints them, but performs no provider reads.
 type CapacityProofInput struct {
-	PlanFingerprint string
-	Limits          RunLimits
-	Request         RunRequest
+	PlanFingerprint     string
+	Limits              RunLimits
+	Instances           []PlannedInstance
+	Disks               []PlannedDisk
+	Lifetime            time.Duration
+	EstimatedCostMicros int64
 }
 
 // EvidenceFreshness binds a content revision to a short observation window.
@@ -436,7 +477,7 @@ type PreMutationInput struct {
 	ProductionCIDRs                   []string
 	ExpectedNonDisposableEnvironments []EnvironmentIdentity
 	Locks                             []EnvironmentLock
-	HarnessHolder                     string
+	HarnessPrincipal                  Principal
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
 	Freshness                         EvidenceFreshness
@@ -468,10 +509,11 @@ func AuthorizePreMutation(input PreMutationInput) (PreMutationDecision, error) {
 
 // RevalidatePreMutation reevaluates fresh input at the mutation boundary and
 // returns detached exact targets only when no semantic evidence changed. The
-// fresh observation must be newer and cannot extend the original expiry.
+// returned targets are for immediate provider-boundary consumption only. The
+// fresh observation must be newer and retain the original fixed expiry.
 func RevalidatePreMutation(decision PreMutationDecision, fresh PreMutationInput) ([]MutationTarget, error) {
 	if decision.validUntil.IsZero() || !fresh.Freshness.ObservedAt.After(decision.observedAt) ||
-		!fresh.Freshness.CheckedAt.Before(decision.validUntil) {
+		!fresh.Freshness.ValidUntil.Equal(decision.validUntil) || !fresh.Freshness.CheckedAt.Before(decision.validUntil) {
 		return nil, guardError(ErrStaleProof, "freshness", "does not satisfy immediate revalidation")
 	}
 	targets, fingerprint, err := evaluatePreMutation(fresh)
@@ -499,25 +541,13 @@ func evaluatePreMutation(input PreMutationInput) ([]MutationTarget, [sha256.Size
 	if err != nil {
 		return nil, zero, err
 	}
-	if !isSHA256Fingerprint(input.Capacity.PlanFingerprint) {
-		return nil, zero, guardError(ErrInvalidGuardInput, "capacity.planFingerprint", "must be a SHA-256 fingerprint")
-	}
-	if err := ValidateRunRequest(input.Capacity.Limits, input.Capacity.Request); err != nil {
+	if err := validateCapacityProof(input.Capacity, input.RunID, targets); err != nil {
 		return nil, zero, err
-	}
-	instanceTargets := 0
-	for _, target := range targets {
-		if target.Identity.Service == ComputeServiceName && target.Identity.Kind == ComputeInstanceKind {
-			instanceTargets++
-		}
-	}
-	if input.Capacity.Request.Instances != instanceTargets {
-		return nil, zero, guardError(ErrInvalidGuardInput, "capacity.request.instances", "does not match the exact instance target set")
 	}
 	if err := ValidateNetworkCIDR(input.TestCIDR, input.ProductionCIDRs); err != nil {
 		return nil, zero, err
 	}
-	if err := ValidateHarnessLocks(input.Locks, input.ExpectedNonDisposableEnvironments, input.RunID, input.HarnessHolder); err != nil {
+	if err := ValidateHarnessLocks(input.Locks, input.ExpectedNonDisposableEnvironments, input.RunID, input.HarnessPrincipal); err != nil {
 		return nil, zero, err
 	}
 	if err := ValidatePermissionProof(input.Permissions); err != nil {
@@ -533,15 +563,91 @@ func evaluatePreMutation(input PreMutationInput) ([]MutationTarget, [sha256.Size
 	return targets, fingerprint, nil
 }
 
-// ValidateHarnessLocks proves an exact lock observation set: one run-specific
-// disposable lock held by the harness plus one lock for every caller-declared
-// non-disposable environment, with no missing or unexpected observations.
-func ValidateHarnessLocks(locks []EnvironmentLock, expected []EnvironmentIdentity, runID, harnessHolder string) error {
+func validateCapacityProof(capacity CapacityProofInput, runID string, targets []MutationTarget) error {
+	if !isSHA256Fingerprint(capacity.PlanFingerprint) {
+		return guardError(ErrInvalidGuardInput, "capacity.planFingerprint", "must be a SHA-256 fingerprint")
+	}
+	if len(capacity.Instances) == 0 {
+		return guardError(ErrInvalidGuardInput, "capacity.instances", "must contain the full planned instance inventory")
+	}
+	prefix, err := RunResourcePrefix(runID)
+	if err != nil {
+		return err
+	}
+	instanceKeys := make(map[string]struct{}, len(capacity.Instances))
+	maximumMachine := MachineShape{}
+	for index, instance := range capacity.Instances {
+		path := indexedField("capacity.instances", index)
+		if err := validateResourceIdentity(instance.Identity); err != nil {
+			return guardError(err, path, "has invalid identity")
+		}
+		if instance.Identity.Service != ComputeServiceName || instance.Identity.Kind != ComputeInstanceKind ||
+			!strings.HasPrefix(instance.Identity.Name, prefix) || len(instance.Identity.Name) == len(prefix) || instance.RunID != runID {
+			return guardError(ErrInvalidGuardInput, path, "must identify a run-scoped Compute instance")
+		}
+		if instance.Machine.VCPUs <= 0 || instance.Machine.MemoryMB <= 0 {
+			return guardError(ErrInvalidGuardInput, path, "must have a positive resolved machine shape")
+		}
+		if _, exists := instanceKeys[instance.Identity.CanonicalKey]; exists {
+			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier planned instance")
+		}
+		instanceKeys[instance.Identity.CanonicalKey] = struct{}{}
+		maximumMachine.VCPUs = max(maximumMachine.VCPUs, instance.Machine.VCPUs)
+		maximumMachine.MemoryMB = max(maximumMachine.MemoryMB, instance.Machine.MemoryMB)
+	}
+
+	diskKeys := make(map[string]struct{}, len(capacity.Disks))
+	var maximumDiskGiB int64
+	for index, disk := range capacity.Disks {
+		path := indexedField("capacity.disks", index)
+		if err := validateResourceIdentity(disk.Identity); err != nil {
+			return guardError(err, path, "has invalid identity")
+		}
+		if disk.Identity.Service != ComputeServiceName || disk.Identity.Kind != ComputeDiskKind ||
+			!strings.HasPrefix(disk.Identity.Name, prefix) || len(disk.Identity.Name) == len(prefix) || disk.RunID != runID || disk.SizeGiB <= 0 {
+			return guardError(ErrInvalidGuardInput, path, "must identify a positive run-scoped Compute disk")
+		}
+		if _, exists := diskKeys[disk.Identity.CanonicalKey]; exists {
+			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier planned disk")
+		}
+		diskKeys[disk.Identity.CanonicalKey] = struct{}{}
+		maximumDiskGiB = max(maximumDiskGiB, disk.SizeGiB)
+	}
+
+	for index, target := range targets {
+		path := indexedField("targets", index)
+		switch {
+		case target.Identity.Service == ComputeServiceName && target.Identity.Kind == ComputeInstanceKind:
+			if _, exists := instanceKeys[target.Identity.CanonicalKey]; !exists {
+				return guardError(ErrInvalidGuardInput, path, "is absent from the planned instance inventory")
+			}
+		case target.Identity.Service == ComputeServiceName && target.Identity.Kind == ComputeDiskKind:
+			if _, exists := diskKeys[target.Identity.CanonicalKey]; !exists {
+				return guardError(ErrInvalidGuardInput, path, "is absent from the planned disk inventory")
+			}
+		}
+	}
+
+	request := RunRequest{
+		Machine:             maximumMachine,
+		DiskGiB:             maximumDiskGiB,
+		Instances:           len(capacity.Instances),
+		Lifetime:            capacity.Lifetime,
+		EstimatedCostMicros: capacity.EstimatedCostMicros,
+	}
+	return ValidateRunRequest(capacity.Limits, request)
+}
+
+// ValidateHarnessLocks proves an exact lock observation set: one active,
+// run-specific disposable lock held by the harness plus one present-or-absent
+// observation for every caller-declared non-disposable environment, with no
+// missing or unexpected observations.
+func ValidateHarnessLocks(locks []EnvironmentLock, expected []EnvironmentIdentity, runID string, harnessPrincipal Principal) error {
 	if err := ValidateRunID(runID); err != nil {
 		return err
 	}
-	if !isCanonicalOpaqueID(harnessHolder) {
-		return guardError(ErrInvalidGuardInput, "harnessHolder", "must be a canonical nonempty holder")
+	if !validPrincipal(harnessPrincipal) {
+		return guardError(ErrInvalidGuardInput, "harnessPrincipal", "must be a canonical principal")
 	}
 	if len(expected) == 0 {
 		return guardError(ErrInvalidGuardInput, "expectedEnvironments", "must not be empty")
@@ -567,8 +673,15 @@ func ValidateHarnessLocks(locks []EnvironmentLock, expected []EnvironmentIdentit
 	runLockSeen := false
 	for index, lock := range locks {
 		path := indexedField("locks", index)
-		if !environmentNamePattern.MatchString(lock.Environment) || !lock.Class.Valid() || !isCanonicalOpaqueID(lock.Holder) {
-			return guardError(ErrInvalidGuardInput, path, "must have canonical environment, class, and holder")
+		if !environmentNamePattern.MatchString(lock.Environment) || !lock.Class.Valid() {
+			return guardError(ErrInvalidGuardInput, path, "must have canonical environment and class")
+		}
+		if lock.Active {
+			if !validPrincipal(lock.Holder) {
+				return guardError(ErrInvalidGuardInput, path, "active observations require one canonical holder")
+			}
+		} else if lock.Holder != (Principal{}) {
+			return guardError(ErrInvalidGuardInput, path, "inactive observations must not carry a holder")
 		}
 		key := environmentLockKey{environment: lock.Environment, class: lock.Class, runID: lock.RunID}
 		if _, exists := seenLocks[key]; exists {
@@ -583,7 +696,7 @@ func ValidateHarnessLocks(locks []EnvironmentLock, expected []EnvironmentIdentit
 			if lock.Environment != config.TestEnvironmentLabel || lock.RunID != runID {
 				return guardError(ErrInvalidGuardInput, path, "is an unexpected disposable lock")
 			}
-			if lock.Holder != harnessHolder {
+			if !lock.Active || lock.Holder != harnessPrincipal {
 				return guardError(ErrRunLockNotHeld, path, "is not held by the harness")
 			}
 			runLockSeen = true
@@ -592,7 +705,7 @@ func ValidateHarnessLocks(locks []EnvironmentLock, expected []EnvironmentIdentit
 		if lock.RunID != "" {
 			return guardError(ErrInvalidGuardInput, path, "non-disposable locks must not carry a run ID")
 		}
-		if lock.Holder == harnessHolder {
+		if lock.Active && lock.Holder == harnessPrincipal {
 			return guardError(ErrNonDisposableLock, path, "is held by the test harness")
 		}
 		identity := EnvironmentIdentity{Environment: lock.Environment, Class: lock.Class}
@@ -650,7 +763,7 @@ type preMutationPayload struct {
 	ProductionCIDRs                   []string
 	ExpectedNonDisposableEnvironments []EnvironmentIdentity
 	Locks                             []EnvironmentLock
-	HarnessHolder                     string
+	HarnessPrincipal                  Principal
 	Permissions                       PermissionProofInput
 	FirewallRules                     []FirewallRule
 	EvidenceRevision                  string
@@ -660,12 +773,12 @@ func preMutationFingerprint(input PreMutationInput, targets []MutationTarget) ([
 	payload := preMutationPayload{
 		RunID:                             input.RunID,
 		Targets:                           append([]MutationTarget(nil), targets...),
-		Capacity:                          input.Capacity,
+		Capacity:                          cloneCapacityProof(input.Capacity),
 		TestCIDR:                          input.TestCIDR,
 		ProductionCIDRs:                   append([]string(nil), input.ProductionCIDRs...),
 		ExpectedNonDisposableEnvironments: append([]EnvironmentIdentity(nil), input.ExpectedNonDisposableEnvironments...),
 		Locks:                             append([]EnvironmentLock(nil), input.Locks...),
-		HarnessHolder:                     input.HarnessHolder,
+		HarnessPrincipal:                  input.HarnessPrincipal,
 		Permissions: PermissionProofInput{
 			Inventory: input.Permissions.Inventory,
 			Expected:  append([]PermissionObservation(nil), input.Permissions.Expected...),
@@ -675,6 +788,12 @@ func preMutationFingerprint(input PreMutationInput, targets []MutationTarget) ([
 		EvidenceRevision: input.Freshness.Revision,
 	}
 	sort.Strings(payload.ProductionCIDRs)
+	sort.Slice(payload.Capacity.Instances, func(i, j int) bool {
+		return payload.Capacity.Instances[i].Identity.CanonicalKey < payload.Capacity.Instances[j].Identity.CanonicalKey
+	})
+	sort.Slice(payload.Capacity.Disks, func(i, j int) bool {
+		return payload.Capacity.Disks[i].Identity.CanonicalKey < payload.Capacity.Disks[j].Identity.CanonicalKey
+	})
 	sort.Slice(payload.ExpectedNonDisposableEnvironments, func(i, j int) bool {
 		if payload.ExpectedNonDisposableEnvironments[i].Environment != payload.ExpectedNonDisposableEnvironments[j].Environment {
 			return payload.ExpectedNonDisposableEnvironments[i].Environment < payload.ExpectedNonDisposableEnvironments[j].Environment
@@ -706,8 +825,11 @@ func preMutationFingerprint(input PreMutationInput, targets []MutationTarget) ([
 func sortPermissionObservations(values []PermissionObservation) {
 	sort.Slice(values, func(i, j int) bool {
 		first, second := newPermissionObservationKey(values[i]), newPermissionObservationKey(values[j])
-		if first.identity != second.identity {
-			return first.identity < second.identity
+		if first.identityKind != second.identityKind {
+			return first.identityKind < second.identityKind
+		}
+		if first.identitySubject != second.identitySubject {
+			return first.identitySubject < second.identitySubject
 		}
 		if first.resource != second.resource {
 			return first.resource < second.resource
@@ -731,16 +853,24 @@ func cloneFirewallRules(rules []FirewallRule) []FirewallRule {
 	return cloned
 }
 
-func isCanonicalOpaqueID(value string) bool {
-	if len(value) == 0 || len(value) > 256 || value != strings.TrimSpace(value) {
+func cloneCapacityProof(capacity CapacityProofInput) CapacityProofInput {
+	capacity.Instances = append([]PlannedInstance(nil), capacity.Instances...)
+	capacity.Disks = append([]PlannedDisk(nil), capacity.Disks...)
+	return capacity
+}
+
+func validPrincipal(principal Principal) bool {
+	if principal.Subject != strings.ToLower(principal.Subject) || principal.Subject != strings.TrimSpace(principal.Subject) {
 		return false
 	}
-	for _, character := range value {
-		if character < 0x21 || character > 0x7e {
-			return false
-		}
+	switch principal.Kind {
+	case PrincipalKindUser:
+		return userSubjectPattern.MatchString(principal.Subject)
+	case PrincipalKindServiceAccount:
+		return serviceAccountSubjectPattern.MatchString(principal.Subject)
+	default:
+		return false
 	}
-	return true
 }
 
 func cloneExpirableTarget(target ExpirableTarget) ExpirableTarget {
@@ -749,16 +879,23 @@ func cloneExpirableTarget(target ExpirableTarget) ExpirableTarget {
 }
 
 func validateMutationTarget(target MutationTarget) error {
-	wantFullName, err := CanonicalMutationTargetName(target.Identity)
-	if err != nil {
+	if err := validateResourceIdentity(target.Identity); err != nil {
 		return err
-	}
-	if target.Identity.FullName != wantFullName {
-		return guardError(ErrInvalidGuardInput, "target.identity.fullName", "does not match the explicit identity fields")
 	}
 	resource := config.GeneratedResource{Name: target.Identity.Name, Labels: target.Labels}
 	if !config.IsTestResource(resource) {
 		return guardError(ErrUnsafeTarget, "target.labels", "do not have exact disposable identity")
+	}
+	return nil
+}
+
+func validateResourceIdentity(identity ResourceIdentity) error {
+	wantKey, err := CanonicalTargetKey(identity)
+	if err != nil {
+		return err
+	}
+	if identity.CanonicalKey != wantKey {
+		return guardError(ErrInvalidGuardInput, "target.identity.canonicalKey", "does not match the explicit identity fields")
 	}
 	return nil
 }

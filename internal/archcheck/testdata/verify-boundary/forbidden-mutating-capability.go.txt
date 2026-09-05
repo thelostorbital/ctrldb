@@ -1,0 +1,14 @@
+// Copyright 2026 CtrlBoard.dev
+// SPDX-License-Identifier: Apache-2.0
+
+package verify
+
+import "context"
+
+type mutator interface {
+	Delete(context.Context, string) error
+}
+
+func verify(ctx context.Context, client mutator) error {
+	return client.Delete(ctx, "resource")
+}

@@ -1,0 +1,12 @@
+// Copyright 2026 CtrlBoard.dev
+// SPDX-License-Identifier: Apache-2.0
+
+package verify
+
+type injectedCapability interface {
+	Destroy(string) error
+}
+
+func verify(client injectedCapability) error {
+	return client.Destroy("database")
+}

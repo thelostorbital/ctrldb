@@ -72,19 +72,66 @@ func TestFindArchitectureViolations(t *testing.T) {
 		{
 			name:     "source importer in archcheck implementation",
 			filename: "internal/archcheck/main.go",
-			source:   "package main\nimport _ \"go/importer\"\n",
+			source:   "package main\nimport (\n\t\"go/importer\"\n\t\"go/token\"\n)\nvar _ = importer.ForCompiler(token.NewFileSet(), \"source\", nil)\n",
 		},
 		{
 			name:     "build matcher in archcheck implementation",
 			filename: "internal/archcheck/main.go",
-			source:   "package main\nimport _ \"go/build\"\n",
+			source:   "package main\nimport \"go/build\"\nfunc match() { context := build.Default; _, _ = context.MatchFile(\".\", \"fixture.go\") }\n",
+		},
+		{
+			name:     "package loading through go build in archcheck implementation",
+			filename: "internal/archcheck/main.go",
+			source:   "package main\nimport \"go/build\"\nfunc load() { _, _ = build.Default.Import(\".\", \".\", 0) }\n",
+			want:     1,
+			message:  "go/build APIs other than Context.MatchFile are forbidden",
 		},
 		{
 			name:     "default importer in archcheck implementation",
 			filename: "internal/archcheck/main.go",
 			source:   "package main\nimport \"go/importer\"\nfunc load() { importer.Default() }\n",
 			want:     1,
-			message:  "go/importer.Default is forbidden",
+			message:  "process-capable go/importer constructors are forbidden",
+		},
+		{
+			name:     "gccgo importer in archcheck implementation",
+			filename: "internal/archcheck/main.go",
+			source:   "package main\nimport \"go/importer\"\nfunc load() { _ = importer.For(\"gccgo\", nil) }\n",
+			want:     1,
+			message:  "process-capable go/importer constructors are forbidden",
+		},
+		{
+			name:     "gccgo compiler importer in archcheck implementation",
+			filename: "internal/archcheck/main.go",
+			source:   "package main\nimport (\n\t\"go/importer\"\n\t\"go/token\"\n)\nfunc load() { _ = importer.ForCompiler(token.NewFileSet(), \"gccgo\", nil) }\n",
+			want:     1,
+			message:  "process-capable go/importer constructors are forbidden",
+		},
+		{
+			name:     "aliased compiler importer in archcheck implementation",
+			filename: "internal/archcheck/main.go",
+			source:   "package main\nimport \"go/importer\"\nvar load = importer.ForCompiler\n",
+			want:     1,
+			message:  "process-capable go/importer constructors are forbidden",
+		},
+		{
+			name:     "spoofed token constructor in archcheck implementation",
+			filename: "internal/archcheck/main.go",
+			source:   "package main\nimport (\n\t\"go/importer\"\n\tgotoken \"go/token\"\n)\ntype fakeToken struct{}\nfunc (fakeToken) NewFileSet() *gotoken.FileSet { return gotoken.NewFileSet() }\nvar token fakeToken\nvar _ = importer.ForCompiler(token.NewFileSet(), \"source\", nil)\n",
+			want:     1,
+			message:  "process-capable go/importer constructors are forbidden",
+		},
+		{
+			name:     "secret test build constraint",
+			filename: "internal/secret/value_darwin_test.go",
+			source:   "//go:build darwin\n\npackage secret\n",
+		},
+		{
+			name:     "secret production unsupported platform filename constraint",
+			filename: "internal/secret/reveal_windows.go",
+			source:   "package secret\n",
+			want:     1,
+			message:  "internal/secret source files must not use GOOS or GOARCH filename constraints",
 		},
 		{
 			name:   "go packages import",
@@ -179,6 +226,27 @@ func startProcess()
 			name:     "test unsafe",
 			filename: "internal/example/fixture_test.go",
 			source:   "package fixture\nimport _ \"unsafe\"\n",
+		},
+		{
+			name:    "production heap dump",
+			source:  "package fixture\nimport \"runtime/debug\"\nfunc dump() { debug.WriteHeapDump(1) }\n",
+			want:    1,
+			message: "runtime/debug.WriteHeapDump is forbidden",
+		},
+		{
+			name:     "test heap dump",
+			filename: "internal/example/fixture_test.go",
+			source:   "package fixture\nimport \"runtime/debug\"\nfunc dump() { debug.WriteHeapDump(1) }\n",
+		},
+		{
+			name:     "verifier test imports testing",
+			filename: "internal/verify/check_test.go",
+			source:   "package verify\nimport _ \"testing\"\n",
+		},
+		{
+			name:     "verifier imports safe family root",
+			filename: "internal/verify/check.go",
+			source:   "package verify\nimport _ \"math\"\n",
 		},
 		{
 			name: "cgo import directive",
@@ -312,6 +380,8 @@ func TestVerifierImportBoundaryFixtures(t *testing.T) {
 		{name: "forbidden-stdlib-reflect.go.txt", want: 1},
 		{name: "forbidden-stdlib-tls.go.txt", want: 1},
 		{name: "forbidden-workflow.go.txt", want: 1},
+		{name: "forbidden-mutating-capability.go.txt", want: 1},
+		{name: "forbidden-injected-capability.go.txt", want: 1},
 	}
 
 	for _, test := range tests {
@@ -380,7 +450,32 @@ func TestScanIncludesImportableSpecialDirectories(t *testing.T) {
 	}
 }
 
-func TestScanChecksVendoredNativeBoundariesWithoutApplyingFirstPartyImportPolicy(t *testing.T) {
+func TestScanRejectsSymbolicLinks(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeScanFixtureFiles(t, root, map[string]string{
+		"internal/provider/provider.go": "package provider\nfunc Delete() {}\n",
+		"internal/verify/check.go":      "package verify\n",
+	})
+	link := filepath.Join(root, "internal/verify/provider")
+	if err := os.Symlink("../provider", link); err != nil {
+		t.Fatalf("create fixture symlink: %v", err)
+	}
+
+	findings, err := scan(root)
+	if err != nil {
+		t.Fatalf("scan symlink fixture: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings (%v), want one symlink finding", len(findings), findings)
+	}
+	if findings[0].filename != link || !strings.Contains(findings[0].message, "symbolic links are forbidden") {
+		t.Fatalf("finding = %#v, want symlink rejection for %s", findings[0], link)
+	}
+}
+
+func TestScanChecksVendoredNativeAndProcessBoundaries(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -388,6 +483,12 @@ func TestScanChecksVendoredNativeBoundariesWithoutApplyingFirstPartyImportPolicy
 		"vendor/example.test/dependency/ordinary.go": `package dependency
 
 import _ "os/exec"
+`,
+		"vendor/example.test/dependency/start.go": `package dependency
+
+import "os"
+
+var _ = os.StartProcess
 `,
 		"vendor/example.test/dependency/native.s":    "TEXT ·launch(SB),$0-0\nRET\n",
 		"vendor/example.test/dependency/native.syso": "native object fixture\n",
@@ -407,14 +508,16 @@ func launch()
 	if err != nil {
 		t.Fatalf("scan vendor fixtures: %v", err)
 	}
-	if len(findings) != 4 {
-		t.Fatalf("got %d findings (%v), want four vendor native-boundary findings", len(findings), findings)
+	if len(findings) != 6 {
+		t.Fatalf("got %d findings (%v), want six vendor native/process-boundary findings", len(findings), findings)
 	}
 	foundByPath := make(map[string]int, len(findings))
 	for _, result := range findings {
 		foundByPath[filepath.ToSlash(result.filename)]++
 	}
 	for _, name := range []string{
+		"vendor/example.test/dependency/ordinary.go",
+		"vendor/example.test/dependency/start.go",
 		"vendor/example.test/dependency/native.s",
 		"vendor/example.test/dependency/native.syso",
 		"vendor/example.test/dependency/cgo.go",
@@ -424,10 +527,6 @@ func launch()
 		if foundByPath[path] != 1 {
 			t.Errorf("got %d findings for %s, want 1", foundByPath[path], name)
 		}
-	}
-	ordinary := filepath.ToSlash(filepath.Join(root, "vendor/example.test/dependency/ordinary.go"))
-	if foundByPath[ordinary] != 0 {
-		t.Errorf("ordinary vendored Go dependency received %d first-party findings", foundByPath[ordinary])
 	}
 }
 
@@ -534,6 +633,14 @@ func TestScanEnforcesSecretAPISurface(t *testing.T) {
 				"reveal_custom.go": "//go:build raw_secret_test\n\npackage secret\nfunc (*Value) Reveal() []byte { return nil }\n",
 			},
 			want: 1,
+		},
+		{
+			name:  "cgo-tagged exported accessor",
+			value: validSecretValueSource,
+			extra: map[string]string{
+				"reveal_cgo.go": "//go:build cgo\n\npackage secret\nfunc (*Value) Reveal() []byte { return nil }\n",
+			},
+			want: 2,
 		},
 		{
 			name:  "legacy custom-tag exported accessor",
@@ -825,6 +932,14 @@ func TestScanEnforcesVerifierBoundaryAcrossFirstPartyImportClosure(t *testing.T)
 			name: "domain provider dependency",
 			files: map[string]string{
 				"internal/domain/model.go": "package domain\nimport _ \"github.com/thelostorbital/ctrldb/internal/provider\"\n",
+			},
+			findingSuffix: "internal/domain/model.go",
+			wantFinding:   true,
+		},
+		{
+			name: "domain injected interface capability",
+			files: map[string]string{
+				"internal/domain/model.go": "package domain\ntype Mutator interface { Destroy() error }\n",
 			},
 			findingSuffix: "internal/domain/model.go",
 			wantFinding:   true,

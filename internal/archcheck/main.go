@@ -6,7 +6,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"go/ast"
 	"go/build"
@@ -15,7 +14,6 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -55,6 +53,7 @@ const (
 
 var verifierSafeStandardImports = map[string]struct{}{
 	"bytes": {}, "cmp": {}, "context": {}, "errors": {}, "fmt": {},
+	"encoding": {}, "hash": {}, "math": {}, "unicode": {},
 	"crypto": {}, "crypto/aes": {}, "crypto/cipher": {},
 	"crypto/ed25519": {}, "crypto/hmac": {}, "crypto/rand": {},
 	"crypto/rsa": {}, "crypto/sha256": {}, "crypto/sha512": {},
@@ -68,6 +67,18 @@ var verifierSafeStandardImports = map[string]struct{}{
 
 var verifierSafeStandardPrefixes = []string{
 	"archive/", "compress/", "encoding/", "hash/", "math/", "text/", "unicode/",
+}
+
+var filenameConstraintOperatingSystems = map[string]struct{}{
+	"aix": {}, "android": {}, "darwin": {}, "dragonfly": {}, "freebsd": {},
+	"illumos": {}, "ios": {}, "js": {}, "linux": {}, "netbsd": {},
+	"openbsd": {}, "plan9": {}, "solaris": {}, "wasip1": {}, "windows": {},
+}
+
+var filenameConstraintArchitectures = map[string]struct{}{
+	"386": {}, "amd64": {}, "arm": {}, "arm64": {}, "loong64": {},
+	"mips": {}, "mips64": {}, "mips64le": {}, "mipsle": {}, "ppc64": {},
+	"ppc64le": {}, "riscv64": {}, "s390x": {}, "wasm": {},
 }
 
 var forbiddenProcessImports = map[string]string{
@@ -118,11 +129,20 @@ func scan(root string) ([]finding, error) {
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
-			case ".git":
+			case ".git", ".qlty":
 				if path != root {
 					return filepath.SkipDir
 				}
 			}
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			findings = append(findings, finding{
+				filename: path,
+				line:     1,
+				column:   1,
+				message:  "symbolic links are forbidden because they can bypass repository package and architecture traversal",
+			})
 			return nil
 		}
 		extension := filepath.Ext(path)
@@ -236,7 +256,8 @@ func findVendorNativeViolations(filename string, contents []byte) ([]finding, er
 		if err != nil {
 			return nil, fmt.Errorf("decode import in %s: %w", filename, err)
 		}
-		if importPath != "C" {
+		message, forbidden := forbiddenProcessImportMessage(importPath, sourcePolicy{})
+		if !forbidden {
 			continue
 		}
 		position := files.Position(imported.Path.Pos())
@@ -244,9 +265,35 @@ func findVendorNativeViolations(filename string, contents []byte) ([]finding, er
 			filename: position.Filename,
 			line:     position.Line,
 			column:   position.Column,
-			message:  forbiddenProcessImports["C"],
+			message:  message,
 		})
 	}
+	uses := make(map[*ast.Ident]types.Object)
+	configuration := types.Config{
+		Importer:                 newArchitectureImporter(false),
+		DisableUnusedImportCheck: true,
+		Error:                    func(error) {},
+	}
+	typeInformation := &types.Info{Uses: uses}
+	_, _ = configuration.Check(modulePath+"/.archcheck/vendor/"+parsed.Name.Name, files, []*ast.File{parsed}, typeInformation)
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		object, ok := uses[identifier].(*types.Func)
+		if !ok || object.Pkg() == nil || object.Pkg().Path() != "os" || object.Name() != "StartProcess" {
+			return true
+		}
+		position := files.Position(identifier.Pos())
+		findings = append(findings, finding{
+			filename: position.Filename,
+			line:     position.Line,
+			column:   position.Column,
+			message:  "os.StartProcess is forbidden; process creation belongs to the validated adapter boundary",
+		})
+		return true
+	})
 	return findings, nil
 }
 
@@ -257,6 +304,7 @@ type repositoryImport struct {
 
 func findTransitiveVerifierViolations(sources []sourceFile) ([]finding, error) {
 	importsByPackage := make(map[string][]repositoryImport)
+	capabilityFindingsByPackage := make(map[string][]finding)
 	for _, source := range sources {
 		files := token.NewFileSet()
 		parsed, err := parser.ParseFile(files, source.filename, source.contents, parser.SkipObjectResolution)
@@ -264,6 +312,10 @@ func findTransitiveVerifierViolations(sources []sourceFile) ([]finding, error) {
 			return nil, fmt.Errorf("parse %s: %w", source.filename, err)
 		}
 		packagePath := repositoryPackagePath(source.relativePath)
+		if _, exists := importsByPackage[packagePath]; !exists {
+			importsByPackage[packagePath] = nil
+		}
+		capabilityFindingsByPackage[packagePath] = append(capabilityFindingsByPackage[packagePath], findForbiddenInterfaceCapabilities(files, parsed)...)
 		for _, imported := range parsed.Imports {
 			importPath, err := strconv.Unquote(imported.Path.Value)
 			if err != nil {
@@ -293,6 +345,7 @@ func findTransitiveVerifierViolations(sources []sourceFile) ([]finding, error) {
 			continue
 		}
 		visited[packagePath] = true
+		findings = append(findings, capabilityFindingsByPackage[packagePath]...)
 		for _, imported := range importsByPackage[packagePath] {
 			if message, forbidden := forbiddenVerifierImportMessage(imported.path); forbidden {
 				findings = append(findings, finding{
@@ -310,6 +363,42 @@ func findTransitiveVerifierViolations(sources []sourceFile) ([]finding, error) {
 		}
 	}
 	return findings, nil
+}
+
+func findForbiddenInterfaceCapabilities(files *token.FileSet, parsed *ast.File) []finding {
+	var findings []finding
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		interfaceType, ok := node.(*ast.InterfaceType)
+		if !ok || interfaceType.Methods == nil {
+			return true
+		}
+		for _, field := range interfaceType.Methods.List {
+			if len(field.Names) == 0 {
+				position := files.Position(field.Pos())
+				findings = append(findings, finding{
+					filename: position.Filename,
+					line:     position.Line,
+					column:   position.Column,
+					message:  "C-VERIFY contracts cannot embed interface capabilities; expose the exact read-only Observe capability",
+				})
+				continue
+			}
+			for _, name := range field.Names {
+				if name.Name == "Observe" {
+					continue
+				}
+				position := files.Position(name.Pos())
+				findings = append(findings, finding{
+					filename: position.Filename,
+					line:     position.Line,
+					column:   position.Column,
+					message:  "C-VERIFY contracts may expose only the exact read-only Observe capability",
+				})
+			}
+		}
+		return true
+	})
+	return findings
 }
 
 func repositoryPackagePath(relativePath string) string {
@@ -423,7 +512,7 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 	}
 
 	uses := make(map[*ast.Ident]types.Object)
-	packageImporter := newArchitectureImporter(false)
+	packageImporter := newArchitectureImporter(policy.allowSourceImporter)
 	configuration := types.Config{
 		Importer:                 packageImporter,
 		DisableUnusedImportCheck: true,
@@ -432,6 +521,43 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 	checkedPackagePath := modulePath + "/.archcheck/" + parsed.Name.Name
 	typeInformation := &types.Info{Uses: uses}
 	_, _ = configuration.Check(checkedPackagePath, files, []*ast.File{parsed}, typeInformation)
+	if policy.enforceVerifierBoundary {
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			object, ok := calledFunction(call.Fun, uses)
+			if !ok || !forbiddenVerifierInterfaceCall(object, filename) {
+				return true
+			}
+			position := files.Position(call.Fun.Pos())
+			findings = append(findings, finding{
+				filename: position.Filename,
+				line:     position.Line,
+				column:   position.Column,
+				message:  "C-VERIFY cannot invoke an injected interface capability; use the exact read-only observation contract",
+			})
+			return true
+		})
+	}
+
+	approvedImporterUses := make(map[*ast.Ident]struct{})
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || !approvedSourceImporterCall(call, uses) {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		object, ok := uses[selector.Sel].(*types.Func)
+		if ok && object.Pkg() != nil && object.Pkg().Path() == "go/importer" && object.Name() == "ForCompiler" {
+			approvedImporterUses[selector.Sel] = struct{}{}
+		}
+		return true
+	})
 
 	ast.Inspect(parsed, func(node ast.Node) bool {
 		identifier, ok := node.(*ast.Ident)
@@ -442,13 +568,33 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 		if !ok || object.Pkg() == nil {
 			return true
 		}
-		if object.Pkg().Path() == "go/importer" && object.Name() == "Default" {
+		if object.Pkg().Path() == "go/importer" && forbiddenImporterUse(object.Name(), identifier, approvedImporterUses) {
 			position := files.Position(identifier.Pos())
 			findings = append(findings, finding{
 				filename: position.Filename,
 				line:     position.Line,
 				column:   position.Column,
-				message:  "go/importer.Default is forbidden; use the source importer without invoking the Go tool",
+				message:  "process-capable go/importer constructors are forbidden; use the exact source importer construction",
+			})
+			return true
+		}
+		if policy.allowSourceImporter && object.Pkg().Path() == "go/build" && object.Name() != "MatchFile" {
+			position := files.Position(identifier.Pos())
+			findings = append(findings, finding{
+				filename: position.Filename,
+				line:     position.Line,
+				column:   position.Column,
+				message:  "go/build APIs other than Context.MatchFile are forbidden because package loading can launch the Go tool",
+			})
+			return true
+		}
+		if !policy.allowRuntimeIntrospection && object.Pkg().Path() == "runtime/debug" && object.Name() == "WriteHeapDump" {
+			position := files.Position(identifier.Pos())
+			findings = append(findings, finding{
+				filename: position.Filename,
+				line:     position.Line,
+				column:   position.Column,
+				message:  "runtime/debug.WriteHeapDump is forbidden in production because heap dumps can persist credentials",
 			})
 			return true
 		}
@@ -465,6 +611,88 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 		return true
 	})
 	return findings, nil
+}
+
+func calledFunction(expression ast.Expr, uses map[*ast.Ident]types.Object) (*types.Func, bool) {
+	var identifier *ast.Ident
+	switch value := expression.(type) {
+	case *ast.Ident:
+		identifier = value
+	case *ast.SelectorExpr:
+		identifier = value.Sel
+	default:
+		return nil, false
+	}
+	object, ok := uses[identifier].(*types.Func)
+	if !ok {
+		return nil, false
+	}
+	if _, ok := types.Unalias(object.Type()).(*types.Signature); !ok {
+		return nil, false
+	}
+	return object, true
+}
+
+func forbiddenVerifierInterfaceCall(object *types.Func, filename string) bool {
+	signature, ok := types.Unalias(object.Type()).(*types.Signature)
+	if !ok || signature.Recv() == nil {
+		return false
+	}
+	receiver := types.Unalias(signature.Recv().Type())
+	if pointer, ok := receiver.(*types.Pointer); ok {
+		receiver = types.Unalias(pointer.Elem())
+	}
+	if _, ok := receiver.Underlying().(*types.Interface); !ok {
+		return false
+	}
+	if object.Name() != "Observe" {
+		return true
+	}
+	if object.Pkg() != nil && object.Pkg().Path() == modulePath+"/internal/observation" {
+		return false
+	}
+	normalized := filepath.ToSlash(filepath.Clean(filename))
+	return !strings.Contains("/"+normalized, "/internal/observation/")
+}
+
+func approvedSourceImporterCall(call *ast.CallExpr, uses map[*ast.Ident]types.Object) bool {
+	if len(call.Args) != 3 {
+		return false
+	}
+	compiler, ok := call.Args[1].(*ast.BasicLit)
+	if !ok || compiler.Kind != token.STRING {
+		return false
+	}
+	compilerName, err := strconv.Unquote(compiler.Value)
+	if err != nil || compilerName != "source" {
+		return false
+	}
+	lookup, ok := call.Args[2].(*ast.Ident)
+	if !ok || lookup.Name != "nil" {
+		return false
+	}
+	fileSetCall, ok := call.Args[0].(*ast.CallExpr)
+	if !ok || len(fileSetCall.Args) != 0 {
+		return false
+	}
+	fileSetConstructor, ok := fileSetCall.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	constructor, ok := uses[fileSetConstructor.Sel].(*types.Func)
+	return ok && constructor.Pkg() != nil && constructor.Pkg().Path() == "go/token" && constructor.Name() == "NewFileSet"
+}
+
+func forbiddenImporterUse(name string, identifier *ast.Ident, approved map[*ast.Ident]struct{}) bool {
+	switch name {
+	case "Default", "For":
+		return true
+	case "ForCompiler":
+		_, allowed := approved[identifier]
+		return !allowed
+	default:
+		return false
+	}
 }
 
 // architectureImporter resolves standard-library packages from source when
@@ -504,9 +732,14 @@ func (loader *architectureImporter) Import(importPath string) (*types.Package, e
 	switch importPath {
 	case "go/importer":
 		addStubFunction(imported, "Default")
+		addStubFunction(imported, "For")
 		addStubFunction(imported, "ForCompiler")
+	case "go/token":
+		addStubFunction(imported, "NewFileSet")
 	case "os":
 		addStubFunction(imported, "StartProcess")
+	case "runtime/debug":
+		addStubFunction(imported, "WriteHeapDump")
 	}
 	imported.MarkComplete()
 	loader.packages[importPath] = imported
@@ -537,37 +770,51 @@ func findSecretAPIViolations(sources []sourceFile) ([]finding, error) {
 	directory := filepath.Dir(sources[0].filename)
 	var findings []finding
 	for _, target := range secretBuildTargets {
-		context := build.Default
-		context.GOOS = target.goos
-		context.GOARCH = target.goarch
-		context.CgoEnabled = false
+		seenSourceSets := make(map[string]struct{}, 2)
+		for _, cgoEnabled := range []bool{false, true} {
+			context := build.Default
+			context.GOOS = target.goos
+			context.GOARCH = target.goarch
+			context.CgoEnabled = cgoEnabled
 
-		files := token.NewFileSet()
-		var parsedFiles []*ast.File
-		for _, source := range sources {
-			matches, err := context.MatchFile(directory, filepath.Base(source.filename))
-			if err != nil {
-				return nil, fmt.Errorf("evaluate build constraints for %s: %w", source.filename, err)
+			var activeSources []sourceFile
+			var activeNames []string
+			for _, source := range sources {
+				matches, err := context.MatchFile(directory, filepath.Base(source.filename))
+				if err != nil {
+					return nil, fmt.Errorf("evaluate build constraints for %s: %w", source.filename, err)
+				}
+				if !matches {
+					continue
+				}
+				activeSources = append(activeSources, source)
+				activeNames = append(activeNames, source.filename)
 			}
-			if !matches {
+			if len(activeSources) == 0 {
+				return nil, fmt.Errorf("internal/secret has no source files for %s/%s cgo=%t", target.goos, target.goarch, cgoEnabled)
+			}
+			sourceSetKey := strings.Join(activeNames, "\x00")
+			if _, duplicate := seenSourceSets[sourceSetKey]; duplicate {
 				continue
 			}
-			parsed, err := parser.ParseFile(files, source.filename, source.contents, parser.SkipObjectResolution)
-			if err != nil {
-				return nil, fmt.Errorf("parse %s: %w", source.filename, err)
-			}
-			parsedFiles = append(parsedFiles, parsed)
-		}
-		if len(parsedFiles) == 0 {
-			return nil, fmt.Errorf("internal/secret has no source files for %s/%s", target.goos, target.goarch)
-		}
+			seenSourceSets[sourceSetKey] = struct{}{}
 
-		configuration := types.Config{Importer: newArchitectureImporter(true)}
-		checked, err := configuration.Check(secretPackagePath, files, parsedFiles, nil)
-		if err != nil {
-			return nil, fmt.Errorf("type-check internal/secret for %s/%s: %w", target.goos, target.goarch, err)
+			files := token.NewFileSet()
+			var parsedFiles []*ast.File
+			for _, source := range activeSources {
+				parsed, err := parser.ParseFile(files, source.filename, source.contents, parser.SkipObjectResolution)
+				if err != nil {
+					return nil, fmt.Errorf("parse %s: %w", source.filename, err)
+				}
+				parsedFiles = append(parsedFiles, parsed)
+			}
+			configuration := types.Config{Importer: newArchitectureImporter(true)}
+			checked, err := configuration.Check(secretPackagePath, files, parsedFiles, nil)
+			if err != nil {
+				return nil, fmt.Errorf("type-check internal/secret for %s/%s cgo=%t: %w", target.goos, target.goarch, cgoEnabled, err)
+			}
+			findings = append(findings, inspectSecretAPISurface(checked, files)...)
 		}
-		findings = append(findings, inspectSecretAPISurface(checked, files)...)
 	}
 	return uniqueFindings(findings), nil
 }
@@ -715,9 +962,9 @@ func policyForSource(relativePath string) sourcePolicy {
 		allowRuntimeIntrospection:    isTest,
 		allowSourceImporter:          normalized == "internal/archcheck/main.go",
 		allowTestInfrastructure:      isTest,
-		enforceVerifierBoundary:      strings.HasPrefix(normalized, "internal/verify/") || strings.HasPrefix(normalized, "internal/observation/"),
+		enforceVerifierBoundary:      !isTest && (strings.HasPrefix(normalized, "internal/verify/") || strings.HasPrefix(normalized, "internal/observation/")),
 		enforceSecretAPISurface:      strings.HasPrefix(normalized, "internal/secret/") && !isTest,
-		forbidSecretBuildConstraints: strings.HasPrefix(normalized, "internal/secret/"),
+		forbidSecretBuildConstraints: strings.HasPrefix(normalized, "internal/secret/") && !isTest,
 	}
 	if policy.allowTestInfrastructure {
 		return policy
@@ -737,7 +984,7 @@ func isBuildConstraint(comment string) bool {
 	return constraint.IsGoBuild(comment) || constraint.IsPlusBuild(comment)
 }
 
-func hasFilenameBuildConstraint(filename string, contents []byte) (bool, error) {
+func hasFilenameBuildConstraint(filename string, _ []byte) (bool, error) {
 	base := strings.TrimSuffix(filepath.Base(filename), ".go")
 	base = strings.TrimSuffix(base, "_test")
 	components := strings.Split(base, "_")
@@ -745,30 +992,17 @@ func hasFilenameBuildConstraint(filename string, contents []byte) (bool, error) 
 		return false, nil
 	}
 	last := components[len(components)-1]
-	operatingSystem := last
-	if len(components) >= 3 {
-		operatingSystem = components[len(components)-2]
+	_, operatingSystem := filenameConstraintOperatingSystems[last]
+	_, architecture := filenameConstraintArchitectures[last]
+	if operatingSystem || architecture {
+		return true, nil
 	}
-
-	matches := func(goos, goarch string) (bool, error) {
-		context := build.Default
-		context.GOOS = goos
-		context.GOARCH = goarch
-		context.CgoEnabled = false
-		context.OpenFile = func(string) (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(contents)), nil
-		}
-		return context.MatchFile(filepath.Dir(filename), filepath.Base(filename))
+	if len(components) < 3 {
+		return false, nil
 	}
-	candidateMatches, err := matches(operatingSystem, last)
-	if err != nil {
-		return false, err
-	}
-	unconstrainedMatches, err := matches("ctrldb_invalid_goos", "ctrldb_invalid_goarch")
-	if err != nil {
-		return false, err
-	}
-	return candidateMatches && !unconstrainedMatches, nil
+	previous := components[len(components)-2]
+	_, operatingSystem = filenameConstraintOperatingSystems[previous]
+	return operatingSystem && architecture, nil
 }
 
 func forbiddenVerifierImportMessage(importPath string) (string, bool) {

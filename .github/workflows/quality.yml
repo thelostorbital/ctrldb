@@ -63,7 +63,11 @@ jobs:
         run: qlty check --all --no-fix --level=low --fail-level=low
 
       - name: Scan for reachable Go vulnerabilities
-        run: govulncheck ./...
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            IFS=/ read -r goos goarch <<< "$target"
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 govulncheck ./...
+          done
 
       - name: Enforce Go dependency license policy
         run: bash scripts/check-go-licenses.sh

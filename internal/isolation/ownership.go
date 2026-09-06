@@ -123,6 +123,24 @@ type PermanentOwnershipRecordV1 struct {
 	DescriptionFingerprint  string
 }
 
+// PermanentOwnershipRecordFingerprint binds the complete canonical contents
+// of one durable singleton record. A trusted store revision must equal this
+// value, in addition to carrying a fresh object generation observation.
+func PermanentOwnershipRecordFingerprint(record PermanentOwnershipRecordV1) (string, error) {
+	if record.SchemaVersion != OwnershipRecordSchemaV1 || !canonicalIDPattern.MatchString(record.RecordID) ||
+		record.RecordGeneration == 0 || validateResourceIdentity(record.Identity) != nil ||
+		!supportedPermanentSingletonIdentity(record.Identity) || record.ProviderID == "" ||
+		strings.TrimSpace(record.ProviderID) != record.ProviderID {
+		return "", guardError(ErrInvalidOwnershipProof, "record", "does not identify one complete supported singleton record")
+	}
+	if err := validatePermanentSingletonFingerprints(
+		"record", record.Identity, record.DesiredStateFingerprint, record.DescriptionFingerprint,
+	); err != nil {
+		return "", err
+	}
+	return canonicalJSONFingerprint(record)
+}
+
 // PermanentSingletonExpectation is the independently trusted identity and
 // complete desired state derived from HarnessConfiguration and the sealed
 // plan. It contains no provider-sourced identity.
@@ -193,11 +211,15 @@ func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof, now time
 		return guardError(ErrInvalidOwnershipProof, "observed", "does not equal the complete desired singleton state")
 	}
 	record := proof.Record
-	if record.SchemaVersion != OwnershipRecordSchemaV1 || !canonicalIDPattern.MatchString(record.RecordID) || record.RecordGeneration == 0 {
-		return guardError(ErrInvalidOwnershipProof, "record", "does not identify a supported durable record generation")
+	recordRevision, err := PermanentOwnershipRecordFingerprint(record)
+	if err != nil {
+		return err
 	}
 	if record.RecordID != proof.ExpectedRecord.RecordID || record.RecordGeneration != proof.ExpectedRecord.RecordGeneration {
 		return guardError(ErrInvalidOwnershipProof, "record", "is not the current trusted control-store generation")
+	}
+	if recordRevision != proof.ExpectedRecord.Revision {
+		return guardError(ErrInvalidOwnershipProof, "record", "contents do not match the trusted control-store revision")
 	}
 	if record.Identity != proof.Expected.Identity || record.ProviderID != proof.Observed.ProviderID ||
 		record.DesiredStateFingerprint != proof.Expected.DesiredStateFingerprint ||
@@ -345,11 +367,14 @@ func ValidateRunFirewallCleanupTarget(policy CleanupPolicy, target RunFirewallCl
 		target.ExpectedRecord.RecordGeneration != target.RunLifetime.RecordGeneration {
 		return guardError(ErrInvalidOwnershipProof, "expectedRecord", "does not match the current run lifetime record")
 	}
+	if target.ExpectedRecord.Revision != fingerprint {
+		return guardError(ErrInvalidOwnershipProof, "expectedRecord", "revision does not bind the complete run lifetime record")
+	}
 	if target.Description != description {
 		return guardError(ErrInvalidOwnershipProof, "description", "does not match the durable lifetime record")
 	}
 	if target.ObservedAt.IsZero() || target.ObservedAt.After(now) || target.ObservedAt.Before(target.RunLifetime.CreatedAt) ||
-		now.Sub(target.ObservedAt) > MaxPreMutationProofLifetime {
+		now.Sub(target.ObservedAt) >= MaxPreMutationProofLifetime {
 		return guardError(ErrInvalidOwnershipProof, "observedAt", "does not bind a current complete observation")
 	}
 	if _, offset := target.ObservedAt.Zone(); offset != 0 {

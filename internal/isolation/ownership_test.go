@@ -113,6 +113,9 @@ func TestPermanentSingletonOwnershipRequiresExactStateAndDurableRecord(t *testin
 		{name: "malformed record ID", mutate: func(value *isolation.PermanentSingletonProof) { value.Record.RecordID = " not-canonical " }},
 		{name: "missing durable generation", mutate: func(value *isolation.PermanentSingletonProof) { value.Record.RecordGeneration = 0 }},
 		{name: "record identity drift", mutate: func(value *isolation.PermanentSingletonProof) { value.Record.ProviderID = "other" }},
+		{name: "record contents changed behind current identity", mutate: func(value *isolation.PermanentSingletonProof) {
+			value.Record.DesiredStateFingerprint = strings.Repeat("f", 64)
+		}},
 		{name: "unknown kind", mutate: func(value *isolation.PermanentSingletonProof) {
 			identity := resourceIdentityForProject("ctrldb-test-widget", isolation.ResourceKind("widgets"), isolation.ResourceScopeGlobal, "global", "example-test-project")
 			value.Expected.Identity, value.Observed.Identity, value.Record.Identity = identity, identity, identity
@@ -157,18 +160,23 @@ func TestPermanentSingletonWithoutProviderDescriptionRequiresNoInventedFingerpri
 		Identity: identity, ProviderID: "provider-id-nat", DesiredStateFingerprint: strings.Repeat("a", 64),
 		Revision: strings.Repeat("c", 64), ObservedAt: permanentOwnershipNow().Add(-time.Minute), ValidUntil: permanentOwnershipNow().Add(time.Minute),
 	}
+	record := isolation.PermanentOwnershipRecordV1{
+		SchemaVersion: isolation.OwnershipRecordSchemaV1, RecordID: "ownership-test-nat", RecordGeneration: 1,
+		Identity: identity, ProviderID: observation.ProviderID, DesiredStateFingerprint: observation.DesiredStateFingerprint,
+	}
+	recordRevision, err := isolation.PermanentOwnershipRecordFingerprint(record)
+	if err != nil {
+		t.Fatalf("PermanentOwnershipRecordFingerprint(NAT) unexpected error: %v", err)
+	}
 	proof := isolation.PermanentSingletonProof{
 		ProjectID: "example-test-project",
 		Expected:  isolation.PermanentSingletonExpectation{Identity: identity, DesiredStateFingerprint: observation.DesiredStateFingerprint},
 		ExpectedRecord: isolation.OwnershipRecordExpectation{
-			RecordID: "ownership-test-nat", RecordGeneration: 1, Revision: strings.Repeat("d", 64),
+			RecordID: "ownership-test-nat", RecordGeneration: 1, Revision: recordRevision,
 			ObservedAt: permanentOwnershipNow().Add(-time.Minute), ValidUntil: permanentOwnershipNow().Add(time.Minute),
 		},
 		Observed: observation,
-		Record: isolation.PermanentOwnershipRecordV1{
-			SchemaVersion: isolation.OwnershipRecordSchemaV1, RecordID: "ownership-test-nat", RecordGeneration: 1,
-			Identity: identity, ProviderID: observation.ProviderID, DesiredStateFingerprint: observation.DesiredStateFingerprint,
-		},
+		Record:   record,
 	}
 	if err := isolation.ValidatePermanentSingletonOwnership(proof, permanentOwnershipNow()); err != nil {
 		t.Fatalf("ValidatePermanentSingletonOwnership(NAT) unexpected error: %v", err)
@@ -237,6 +245,7 @@ func TestOnlyReservedHarnessFirewallsCanBePermanentSingletons(t *testing.T) {
 		proof.Observed.Identity = identity
 		proof.Record.Identity = identity
 		proof.Expected.Identity = identity
+		proof.ExpectedRecord.Revision, _ = isolation.PermanentOwnershipRecordFingerprint(proof.Record)
 		if err := isolation.ValidatePermanentSingletonOwnership(proof, permanentOwnershipNow()); err != nil {
 			t.Fatalf("ValidatePermanentSingletonOwnership(%q) unexpected error: %v", name, err)
 		}
@@ -271,7 +280,7 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 		Identity:    testResourceIdentity("ctrldb-test-run1-iap-ssh", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"),
 		Description: description, RunLifetime: lifetime,
 		ExpectedRecord: isolation.OwnershipRecordExpectation{
-			RecordID: lifetime.RecordID, RecordGeneration: lifetime.RecordGeneration, Revision: strings.Repeat("d", 64),
+			RecordID: lifetime.RecordID, RecordGeneration: lifetime.RecordGeneration, Revision: fingerprint,
 			ObservedAt: now.Add(-time.Minute), ValidUntil: now.Add(time.Minute),
 		},
 		ObservedAt: now,
@@ -308,6 +317,12 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 		{name: "stale lifetime record observation", mutate: func(value *isolation.RunFirewallCleanupTarget, _ *time.Time, _ *time.Duration) {
 			value.ExpectedRecord.ValidUntil = now
 		}},
+		{name: "firewall observation at expiry boundary", mutate: func(value *isolation.RunFirewallCleanupTarget, _ *time.Time, _ *time.Duration) {
+			value.ObservedAt = now.Add(-isolation.MaxPreMutationProofLifetime)
+		}},
+		{name: "lifetime contents changed behind current identity", mutate: func(value *isolation.RunFirewallCleanupTarget, _ *time.Time, _ *time.Duration) {
+			value.RunLifetime.RevocationWorkflowID = "WF-TEST-OTHER"
+		}},
 	}
 	for _, test := range tests {
 		test := test
@@ -331,6 +346,7 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 	if err != nil {
 		t.Fatalf("RunFirewallDescription(early teardown) unexpected error: %v", err)
 	}
+	early.ExpectedRecord.Revision = earlyFingerprint
 	if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), early, isolation.RunFirewallCleanupRecordedTeardown, now, 3*time.Hour); err != nil {
 		t.Fatalf("recorded teardown before expiry unexpected error: %v", err)
 	}
@@ -353,6 +369,14 @@ func validPermanentSingletonProof() isolation.PermanentSingletonProof {
 		ObservedAt:              now.Add(-time.Minute),
 		ValidUntil:              now.Add(time.Minute),
 	}
+	record := isolation.PermanentOwnershipRecordV1{
+		SchemaVersion: isolation.OwnershipRecordSchemaV1,
+		RecordID:      "ownership-test-vpc", RecordGeneration: 1,
+		Identity: identity, ProviderID: observation.ProviderID,
+		DesiredStateFingerprint: observation.DesiredStateFingerprint,
+		DescriptionFingerprint:  observation.DescriptionFingerprint,
+	}
+	recordRevision, _ := isolation.PermanentOwnershipRecordFingerprint(record)
 	return isolation.PermanentSingletonProof{
 		ProjectID: "example-test-project",
 		Expected: isolation.PermanentSingletonExpectation{
@@ -360,17 +384,11 @@ func validPermanentSingletonProof() isolation.PermanentSingletonProof {
 			DescriptionFingerprint: observation.DescriptionFingerprint,
 		},
 		ExpectedRecord: isolation.OwnershipRecordExpectation{
-			RecordID: "ownership-test-vpc", RecordGeneration: 1, Revision: strings.Repeat("d", 64),
+			RecordID: "ownership-test-vpc", RecordGeneration: 1, Revision: recordRevision,
 			ObservedAt: now.Add(-time.Minute), ValidUntil: now.Add(time.Minute),
 		},
 		Observed: observation,
-		Record: isolation.PermanentOwnershipRecordV1{
-			SchemaVersion: isolation.OwnershipRecordSchemaV1,
-			RecordID:      "ownership-test-vpc", RecordGeneration: 1,
-			Identity: identity, ProviderID: observation.ProviderID,
-			DesiredStateFingerprint: observation.DesiredStateFingerprint,
-			DescriptionFingerprint:  observation.DescriptionFingerprint,
-		},
+		Record:   record,
 	}
 }
 

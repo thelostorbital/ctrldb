@@ -138,10 +138,20 @@ func TestOpenHarnessRequiresFreshExactUsableT8ForTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarkTestsUnusable() unexpected error: %v", err)
 	}
-	if err := isolation.AdmitHarnessAction(drifted, validOpenTestAdmission()); !errors.Is(err, isolation.ErrHarnessAdmissionDenied) {
+	if err := isolation.AdmitHarnessAction(drifted, validOpenTestAdmission()); !errors.Is(err, isolation.ErrHarnessStateMismatch) {
+		t.Fatalf("AdmitHarnessAction(replayed pre-drift state) error = %v; want ErrHarnessStateMismatch", err)
+	}
+	driftedRequest := validOpenTestAdmission()
+	driftedRequest.Expected.TestUsability = isolation.TestUsabilityUnusable
+	driftedRequest.Expected.DriftObservationRevision = validDriftEvidence().Revision
+	driftedRequest.Expected.DriftDetectedAt = validDriftEvidence().DetectedAt
+	if err := isolation.AdmitHarnessAction(open, driftedRequest); !errors.Is(err, isolation.ErrHarnessStateMismatch) {
+		t.Fatalf("AdmitHarnessAction(replayed usable state after drift) error = %v; want ErrHarnessStateMismatch", err)
+	}
+	if err := isolation.AdmitHarnessAction(drifted, driftedRequest); !errors.Is(err, isolation.ErrHarnessAdmissionDenied) {
 		t.Fatalf("AdmitHarnessAction(unusable TEST-I) error = %v; want ErrHarnessAdmissionDenied", err)
 	}
-	unrelated := validOpenTestAdmission()
+	unrelated := driftedRequest
 	unrelated.Action = isolation.HarnessActionUnrelatedMutation
 	unrelated.T8ObservationRevision = ""
 	unrelated.Now = validT8Evidence().ValidUntil.Add(24 * time.Hour)
@@ -186,6 +196,7 @@ func validOpenTestAdmission() isolation.HarnessAdmissionRequest {
 	expected.T8ObservationRevision = evidence.Revision
 	expected.T8ObservedAt = evidence.ObservedAt
 	expected.T8ValidUntil = evidence.ValidUntil
+	expected.TestUsability = isolation.TestUsabilityUsable
 	return isolation.HarnessAdmissionRequest{
 		Action:                isolation.HarnessActionIntegrationTest,
 		T8ObservationRevision: evidence.Revision,
@@ -202,5 +213,6 @@ func validHarnessExpectation() isolation.HarnessStateExpectation {
 		Resources: seed.Resources, CleanupCapabilities: append([]isolation.CleanupCapability(nil), seed.CleanupCapabilities...),
 		BootstrapSteps: append([]string(nil), seed.BootstrapSteps...), RollbackSteps: append([]string(nil), seed.RollbackSteps...),
 		ApprovedAt: seed.ApprovedAt, ApprovalValidUntil: seed.ApprovalValidUntil,
+		TestUsability: isolation.TestUsabilityUnusable,
 	}
 }

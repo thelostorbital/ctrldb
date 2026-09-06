@@ -172,6 +172,10 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 	if wire.Spec.TestIsolation.OperatorServiceAccount == wire.Spec.TestIsolation.DestructiveServiceAccount {
 		return HarnessConfiguration{}, fmt.Errorf("%w: test operator and destructive service accounts must be distinct", ErrInvalidHarnessConfiguration)
 	}
+	if wire.Spec.TestIsolation.OperatorServiceAccount == wire.Spec.Host.ServiceAccount ||
+		wire.Spec.TestIsolation.DestructiveServiceAccount == wire.Spec.Host.ServiceAccount {
+		return HarnessConfiguration{}, fmt.Errorf("%w: test control and database VM service accounts must be distinct", ErrInvalidHarnessConfiguration)
+	}
 	if !workloadIdentityPrincipalPattern.MatchString(wire.Spec.TestIsolation.CIPrincipal) {
 		return HarnessConfiguration{}, fmt.Errorf("%w: CI principal must identify one canonical workload identity subject or repository", ErrInvalidHarnessConfiguration)
 	}

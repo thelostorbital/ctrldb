@@ -26,23 +26,26 @@ const (
 // the future control adapter supplies these from the manifest, approved plan,
 // and generation-bearing object observation.
 type HarnessStateExpectation struct {
-	ProjectID               string
-	Environment             string
-	EnvironmentClass        string
-	ManifestHash            string
-	ApprovedPlan            PlanIdentity
-	OperationID             string
-	BootstrapEnvelopeHash   string
-	ControlRecordGeneration uint64
-	Resources               HarnessResourceFingerprints
-	CleanupCapabilities     []CleanupCapability
-	BootstrapSteps          []string
-	RollbackSteps           []string
-	ApprovedAt              time.Time
-	ApprovalValidUntil      time.Time
-	T8ObservationRevision   string
-	T8ObservedAt            time.Time
-	T8ValidUntil            time.Time
+	ProjectID                string
+	Environment              string
+	EnvironmentClass         string
+	ManifestHash             string
+	ApprovedPlan             PlanIdentity
+	OperationID              string
+	BootstrapEnvelopeHash    string
+	ControlRecordGeneration  uint64
+	Resources                HarnessResourceFingerprints
+	CleanupCapabilities      []CleanupCapability
+	BootstrapSteps           []string
+	RollbackSteps            []string
+	ApprovedAt               time.Time
+	ApprovalValidUntil       time.Time
+	T8ObservationRevision    string
+	T8ObservedAt             time.Time
+	T8ValidUntil             time.Time
+	TestUsability            TestUsability
+	DriftObservationRevision string
+	DriftDetectedAt          time.Time
 }
 
 // HarnessAdmissionRequest asks only whether the TEST-ISO global blockade is
@@ -143,7 +146,10 @@ func validateHarnessExpectation(state HarnessStateV1, expected HarnessStateExpec
 		!slices.Equal(state.payload.BootstrapSteps, expected.BootstrapSteps) ||
 		!slices.Equal(state.payload.RollbackSteps, expected.RollbackSteps) ||
 		!state.payload.ApprovedAt.Equal(expected.ApprovedAt) ||
-		!state.payload.ApprovalValidUntil.Equal(expected.ApprovalValidUntil) {
+		!state.payload.ApprovalValidUntil.Equal(expected.ApprovalValidUntil) ||
+		state.payload.TestUsability != expected.TestUsability ||
+		state.payload.DriftObservationRevision != expected.DriftObservationRevision ||
+		!optionalTimeMatches(state.payload.DriftDetectedAt, expected.DriftDetectedAt) {
 		return guardError(ErrHarnessStateMismatch, "binding", "does not match trusted configuration and durable observation")
 	}
 	if err := validateUTCWindow(expected.ApprovedAt, expected.ApprovalValidUntil, 0); err != nil {
@@ -167,6 +173,13 @@ func validateHarnessExpectation(state HarnessStateV1, expected HarnessStateExpec
 		return guardError(ErrHarnessStateMismatch, "t8", "does not match the trusted complete T8 observation")
 	}
 	return nil
+}
+
+func optionalTimeMatches(actual *time.Time, expected time.Time) bool {
+	if actual == nil {
+		return expected.IsZero()
+	}
+	return actual.Equal(expected)
 }
 
 func equalCleanupCapabilities(first, second []CleanupCapability) bool {

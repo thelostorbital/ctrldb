@@ -163,6 +163,14 @@ func TestHarnessConfigurationRequiresCompleteValidation(t *testing.T) {
 			isolation := nestedMap(t, manifest, "spec", "testIsolation")
 			isolation["destructiveServiceAccount"] = isolation["operatorServiceAccount"]
 		}},
+		{name: "operator is database VM identity", mutate: func(t *testing.T, manifest map[string]any) {
+			isolation := nestedMap(t, manifest, "spec", "testIsolation")
+			isolation["operatorServiceAccount"] = nestedMap(t, manifest, "spec", "host")["serviceAccount"]
+		}},
+		{name: "destructive is database VM identity", mutate: func(t *testing.T, manifest map[string]any) {
+			isolation := nestedMap(t, manifest, "spec", "testIsolation")
+			isolation["destructiveServiceAccount"] = nestedMap(t, manifest, "spec", "host")["serviceAccount"]
+		}},
 	}
 	for _, test := range tests {
 		test := test

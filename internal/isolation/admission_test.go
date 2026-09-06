@@ -203,7 +203,7 @@ func validOpenTestAdmission() isolation.HarnessAdmissionRequest {
 	expected.T8ObservedAt = evidence.ObservedAt
 	expected.T8ValidUntil = evidence.ValidUntil
 	expected.BootstrapPhase = isolation.BootstrapPhaseOpen
-	expected.BootstrapOpenedAt = evidence.ObservedAt
+	expected.BootstrapOpenedAt = validT8BoundaryNow()
 	expected.TestUsability = isolation.TestUsabilityUsable
 	return isolation.HarnessAdmissionRequest{
 		Action:                isolation.HarnessActionIntegrationTest,

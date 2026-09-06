@@ -100,6 +100,24 @@ func TestHarnessStateFirstT8TransitionIsMonotonic(t *testing.T) {
 	if drifted.BootstrapPhase() != isolation.BootstrapPhaseOpen || drifted.TestUsability() != isolation.TestUsabilityUnusable {
 		t.Fatal("drift recreated the pending global bootstrap blockade")
 	}
+	secondDrift := drift
+	secondDrift.Revision = strings.Repeat("9", 64)
+	secondDrift.DetectedAt = drift.DetectedAt.Add(5 * time.Minute)
+	advancedDrift, err := drifted.MarkTestsUnusable(secondDrift)
+	if err != nil {
+		t.Fatalf("MarkTestsUnusable(newer drift) unexpected error: %v", err)
+	}
+	replayedDrift, err := advancedDrift.MarkTestsUnusable(secondDrift)
+	if err != nil || replayedDrift.IntegritySHA256() != advancedDrift.IntegritySHA256() {
+		t.Fatalf("MarkTestsUnusable(exact replay) was not idempotent: error=%v", err)
+	}
+	betweenDrifts := validT8Evidence()
+	betweenDrifts.Revision = strings.Repeat("e", 64)
+	betweenDrifts.ObservedAt = drift.DetectedAt.Add(time.Minute)
+	betweenDrifts.ValidUntil = betweenDrifts.ObservedAt.Add(30 * time.Minute)
+	if _, err := advancedDrift.RestoreTestsUsable(betweenDrifts, betweenDrifts.ObservedAt.Add(time.Minute)); !errors.Is(err, isolation.ErrHarnessStateStale) {
+		t.Fatalf("RestoreTestsUsable(evidence before latest drift) error = %v; want ErrHarnessStateStale", err)
+	}
 
 	newEvidence := validT8Evidence()
 	newEvidence.ObservedAt = validHarnessStateSeed().ApprovalValidUntil.Add(time.Hour)
@@ -271,7 +289,7 @@ func TestParsedOpenStateMustRetainApprovalWindowInvariant(t *testing.T) {
 	if err := json.Unmarshal(encoded, &wire); err != nil {
 		t.Fatalf("json.Unmarshal(wire) unexpected error: %v", err)
 	}
-	original := []byte(`"bootstrapOpenedAt":"` + validT8Evidence().ObservedAt.Format(time.RFC3339Nano) + `"`)
+	original := []byte(`"bootstrapOpenedAt":"` + validT8BoundaryNow().Format(time.RFC3339Nano) + `"`)
 	replacement := []byte(`"bootstrapOpenedAt":"` + validHarnessStateSeed().ApprovalValidUntil.Format(time.RFC3339Nano) + `"`)
 	if !bytes.Contains(wire.State, original) {
 		t.Fatal("canonical state omitted the bootstrap-open timestamp")

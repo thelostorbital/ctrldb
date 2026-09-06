@@ -157,7 +157,7 @@ func (state HarnessStateV1) OpenAfterT8(evidence T8Evidence, now time.Time) (Har
 	}
 	payload := cloneHarnessPayload(state.payload)
 	payload.BootstrapPhase = BootstrapPhaseOpen
-	payload.BootstrapOpenedAt = timePointer(evidence.ObservedAt)
+	payload.BootstrapOpenedAt = timePointer(now)
 	payload.TestUsability = TestUsabilityUsable
 	payload.T8ObservationRevision = evidence.Revision
 	payload.T8ObservedAt = timePointer(evidence.ObservedAt)
@@ -178,8 +178,8 @@ func (state HarnessStateV1) MarkTestsUnusable(drift HarnessDriftEvidence) (Harne
 	if err := state.validate(); err != nil {
 		return HarnessStateV1{}, err
 	}
-	if state.payload.BootstrapPhase != BootstrapPhaseOpen || state.payload.TestUsability != TestUsabilityUsable {
-		return HarnessStateV1{}, guardError(ErrHarnessStateMismatch, "bootstrapPhase", "is not currently open and usable")
+	if state.payload.BootstrapPhase != BootstrapPhaseOpen {
+		return HarnessStateV1{}, guardError(ErrHarnessStateMismatch, "bootstrapPhase", "is not open")
 	}
 	if !isSHA256Fingerprint(drift.Revision) || drift.DetectedAt.IsZero() || state.payload.T8ObservedAt == nil ||
 		!drift.DetectedAt.After(*state.payload.T8ObservedAt) {
@@ -187,6 +187,17 @@ func (state HarnessStateV1) MarkTestsUnusable(drift HarnessDriftEvidence) (Harne
 	}
 	if _, offset := drift.DetectedAt.Zone(); offset != 0 {
 		return HarnessStateV1{}, guardError(ErrInvalidHarnessState, "drift.detectedAt", "must use UTC")
+	}
+	if state.payload.TestUsability == TestUsabilityUnusable {
+		if state.payload.DriftDetectedAt == nil {
+			return HarnessStateV1{}, guardError(ErrInvalidHarnessState, "drift", "current unusable state has no drift boundary")
+		}
+		if drift.Revision == state.payload.DriftObservationRevision && drift.DetectedAt.Equal(*state.payload.DriftDetectedAt) {
+			return state, nil
+		}
+		if !drift.DetectedAt.After(*state.payload.DriftDetectedAt) {
+			return HarnessStateV1{}, guardError(ErrHarnessStateStale, "drift.detectedAt", "does not advance the current drift boundary")
+		}
 	}
 	payload := cloneHarnessPayload(state.payload)
 	payload.TestUsability = TestUsabilityUnusable
@@ -363,8 +374,7 @@ func (state HarnessStateV1) validatePayload() error {
 			return guardError(ErrInvalidHarnessState, "t8", "does not contain complete evidence")
 		}
 		if payload.BootstrapOpenedAt == nil || payload.BootstrapOpenedAt.Before(payload.ApprovedAt) ||
-			!payload.BootstrapOpenedAt.Before(payload.ApprovalValidUntil) ||
-			payload.T8ObservedAt.Before(*payload.BootstrapOpenedAt) {
+			!payload.BootstrapOpenedAt.Before(payload.ApprovalValidUntil) {
 			return guardError(ErrInvalidHarnessState, "bootstrapOpenedAt", "falls outside the approved bootstrap window")
 		}
 		if _, offset := payload.BootstrapOpenedAt.Zone(); offset != 0 {

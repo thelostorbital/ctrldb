@@ -78,9 +78,15 @@ type harnessManifestWire struct {
 	Metadata   ManifestMetadata `json:"metadata"`
 	Spec       struct {
 		GCP struct {
-			Project string `json:"project"`
-			Region  string `json:"region"`
-			Zone    string `json:"zone"`
+			Project  string `json:"project"`
+			Region   string `json:"region"`
+			Zone     string `json:"zone"`
+			Identity struct {
+				Discovery string `json:"discovery"`
+			} `json:"identity"`
+			SharedVPC struct {
+				HostProject *string `json:"hostProject"`
+			} `json:"sharedVpc"`
 		} `json:"gcp"`
 		Host struct {
 			ServiceAccount string `json:"serviceAccount"`
@@ -138,6 +144,12 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 	}
 	if string(wire.Metadata.Class) != TestEnvironmentLabel || wire.Spec.TestIsolation == nil {
 		return HarnessConfiguration{}, fmt.Errorf("%w: disposable testIsolation manifest required", ErrInvalidHarnessConfiguration)
+	}
+	if wire.Spec.GCP.Identity.Discovery != "user" {
+		return HarnessConfiguration{}, fmt.Errorf("%w: disposable harness discovery must use the human identity", ErrInvalidHarnessConfiguration)
+	}
+	if wire.Spec.GCP.SharedVPC.HostProject != nil {
+		return HarnessConfiguration{}, fmt.Errorf("%w: shared VPC is unsupported", ErrInvalidHarnessConfiguration)
 	}
 
 	lifetimeSeconds, ok := durationSeconds(wire.Spec.TestIsolation.Caps.MaxLifetime)

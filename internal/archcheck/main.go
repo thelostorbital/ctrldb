@@ -38,6 +38,7 @@ type sourceFile struct {
 
 type sourcePolicy struct {
 	allowBubbleTeaImport         bool
+	allowProcessBoundary         bool
 	allowRuntimeIntrospection    bool
 	allowSourceImporter          bool
 	allowTestInfrastructure      bool
@@ -483,6 +484,9 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 			return nil, fmt.Errorf("decode import in %s: %w", filename, err)
 		}
 		var messages []string
+		if policy.allowProcessBoundary && (importPath == "os/exec" || importPath == "syscall") && imported.Name != nil {
+			messages = append(messages, "the process boundary must use the standard import name; aliases, dot imports, and blank imports are forbidden")
+		}
 		if message, forbidden := forbiddenProcessImportMessage(importPath, policy); forbidden {
 			messages = append(messages, message)
 		}
@@ -509,6 +513,9 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 				message:  message,
 			})
 		}
+	}
+	if policy.allowProcessBoundary {
+		findings = append(findings, findProcessBoundarySelectorViolations(files, parsed)...)
 	}
 
 	uses := make(map[*ast.Ident]types.Object)
@@ -611,6 +618,38 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 		return true
 	})
 	return findings, nil
+}
+
+func findProcessBoundarySelectorViolations(files *token.FileSet, parsed *ast.File) []finding {
+	allowed := map[string]struct{}{
+		"ESRCH":       {},
+		"Kill":        {},
+		"SIGKILL":     {},
+		"SysProcAttr": {},
+	}
+	var findings []finding
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		qualifier, ok := selector.X.(*ast.Ident)
+		if !ok || qualifier.Name != "syscall" {
+			return true
+		}
+		if _, approved := allowed[selector.Sel.Name]; approved {
+			return true
+		}
+		position := files.Position(selector.Sel.Pos())
+		findings = append(findings, finding{
+			filename: position.Filename,
+			line:     position.Line,
+			column:   position.Column,
+			message:  "the process boundary may use syscall only to configure and terminate its isolated process group",
+		})
+		return true
+	})
+	return findings
 }
 
 func calledFunction(expression ast.Expr, uses map[*ast.Ident]types.Object) (*types.Func, bool) {
@@ -959,6 +998,7 @@ func policyForSource(relativePath string) sourcePolicy {
 	isTest := strings.HasSuffix(normalized, "_test.go")
 	policy := sourcePolicy{
 		allowBubbleTeaImport:         strings.HasPrefix(normalized, "internal/tui/"),
+		allowProcessBoundary:         normalized == "internal/gcp/process.go",
 		allowRuntimeIntrospection:    isTest,
 		allowSourceImporter:          normalized == "internal/archcheck/main.go",
 		allowTestInfrastructure:      isTest,
@@ -1065,6 +1105,9 @@ func isTestInfrastructureImport(importPath string) bool {
 
 func forbiddenProcessImportMessage(importPath string, policy sourcePolicy) (string, bool) {
 	if (importPath == "go/importer" || importPath == "go/build") && policy.allowSourceImporter {
+		return "", false
+	}
+	if policy.allowProcessBoundary && (importPath == "os/exec" || importPath == "syscall") {
 		return "", false
 	}
 	if message, forbidden := forbiddenProcessImports[importPath]; forbidden {

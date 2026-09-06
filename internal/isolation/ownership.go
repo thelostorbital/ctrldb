@@ -144,15 +144,27 @@ type PermanentSingletonObservation struct {
 	ValidUntil              time.Time
 }
 
+// PermanentOwnershipRecordExpectation is a fresh trusted control-store
+// observation of the exact ownership object generation current at the
+// mutation boundary.
+type PermanentOwnershipRecordExpectation struct {
+	RecordID         string
+	RecordGeneration uint64
+	Revision         string
+	ObservedAt       time.Time
+	ValidUntil       time.Time
+}
+
 // PermanentSingletonProof binds desired identity, a fresh complete provider
 // observation, and the matching durable ownership record. Observation expiry
 // proves mutation-boundary freshness only; permanent singletons are never
 // age-wipe candidates.
 type PermanentSingletonProof struct {
-	ProjectID string
-	Expected  PermanentSingletonExpectation
-	Observed  PermanentSingletonObservation
-	Record    PermanentOwnershipRecordV1
+	ProjectID      string
+	Expected       PermanentSingletonExpectation
+	ExpectedRecord PermanentOwnershipRecordExpectation
+	Observed       PermanentSingletonObservation
+	Record         PermanentOwnershipRecordV1
 }
 
 // ValidatePermanentSingletonOwnership rejects adoption by name alone and any
@@ -173,6 +185,9 @@ func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof, now time
 	if err := validatePermanentSingletonObservation(proof.ProjectID, proof.Observed, now); err != nil {
 		return err
 	}
+	if err := validatePermanentOwnershipRecordExpectation(proof.ExpectedRecord, now); err != nil {
+		return err
+	}
 	if proof.Observed.Identity != proof.Expected.Identity ||
 		proof.Observed.DesiredStateFingerprint != proof.Expected.DesiredStateFingerprint ||
 		proof.Observed.DescriptionFingerprint != proof.Expected.DescriptionFingerprint {
@@ -182,10 +197,24 @@ func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof, now time
 	if record.SchemaVersion != OwnershipRecordSchemaV1 || !canonicalIDPattern.MatchString(record.RecordID) || record.RecordGeneration == 0 {
 		return guardError(ErrInvalidOwnershipProof, "record", "does not identify a supported durable record generation")
 	}
+	if record.RecordID != proof.ExpectedRecord.RecordID || record.RecordGeneration != proof.ExpectedRecord.RecordGeneration {
+		return guardError(ErrInvalidOwnershipProof, "record", "is not the current trusted control-store generation")
+	}
 	if record.Identity != proof.Expected.Identity || record.ProviderID != proof.Observed.ProviderID ||
 		record.DesiredStateFingerprint != proof.Expected.DesiredStateFingerprint ||
 		record.DescriptionFingerprint != proof.Expected.DescriptionFingerprint {
 		return guardError(ErrInvalidOwnershipProof, "record", "does not match the desired singleton")
+	}
+	return nil
+}
+
+func validatePermanentOwnershipRecordExpectation(value PermanentOwnershipRecordExpectation, now time.Time) error {
+	if !canonicalIDPattern.MatchString(value.RecordID) || value.RecordGeneration == 0 || !isSHA256Fingerprint(value.Revision) {
+		return guardError(ErrInvalidOwnershipProof, "expectedRecord", "does not identify one exhaustive durable record observation")
+	}
+	if err := validateUTCWindow(value.ObservedAt, value.ValidUntil, MaxPreMutationProofLifetime); err != nil ||
+		now.Before(value.ObservedAt) || !now.Before(value.ValidUntil) {
+		return guardError(ErrInvalidOwnershipProof, "expectedRecord", "is not a fresh bounded control-store observation")
 	}
 	return nil
 }

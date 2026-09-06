@@ -124,6 +124,12 @@ func TestPermanentSingletonOwnershipRequiresExactStateAndDurableRecord(t *testin
 			value.Observed.ValidUntil = permanentOwnershipNow()
 		}},
 		{name: "missing observation revision", mutate: func(value *isolation.PermanentSingletonProof) { value.Observed.Revision = "" }},
+		{name: "superseded record generation", mutate: func(value *isolation.PermanentSingletonProof) { value.ExpectedRecord.RecordGeneration++ }},
+		{name: "other current record", mutate: func(value *isolation.PermanentSingletonProof) { value.ExpectedRecord.RecordID = "ownership-test-other" }},
+		{name: "stale record observation", mutate: func(value *isolation.PermanentSingletonProof) {
+			value.ExpectedRecord.ValidUntil = permanentOwnershipNow()
+		}},
+		{name: "missing record revision", mutate: func(value *isolation.PermanentSingletonProof) { value.ExpectedRecord.Revision = "" }},
 	}
 	for _, test := range tests {
 		test := test
@@ -154,7 +160,11 @@ func TestPermanentSingletonWithoutProviderDescriptionRequiresNoInventedFingerpri
 	proof := isolation.PermanentSingletonProof{
 		ProjectID: "example-test-project",
 		Expected:  isolation.PermanentSingletonExpectation{Identity: identity, DesiredStateFingerprint: observation.DesiredStateFingerprint},
-		Observed:  observation,
+		ExpectedRecord: isolation.PermanentOwnershipRecordExpectation{
+			RecordID: "ownership-test-nat", RecordGeneration: 1, Revision: strings.Repeat("d", 64),
+			ObservedAt: permanentOwnershipNow().Add(-time.Minute), ValidUntil: permanentOwnershipNow().Add(time.Minute),
+		},
+		Observed: observation,
 		Record: isolation.PermanentOwnershipRecordV1{
 			SchemaVersion: isolation.OwnershipRecordSchemaV1, RecordID: "ownership-test-nat", RecordGeneration: 1,
 			Identity: identity, ProviderID: observation.ProviderID, DesiredStateFingerprint: observation.DesiredStateFingerprint,
@@ -337,6 +347,10 @@ func validPermanentSingletonProof() isolation.PermanentSingletonProof {
 		Expected: isolation.PermanentSingletonExpectation{
 			Identity: identity, DesiredStateFingerprint: observation.DesiredStateFingerprint,
 			DescriptionFingerprint: observation.DescriptionFingerprint,
+		},
+		ExpectedRecord: isolation.PermanentOwnershipRecordExpectation{
+			RecordID: "ownership-test-vpc", RecordGeneration: 1, Revision: strings.Repeat("d", 64),
+			ObservedAt: now.Add(-time.Minute), ValidUntil: now.Add(time.Minute),
 		},
 		Observed: observation,
 		Record: isolation.PermanentOwnershipRecordV1{

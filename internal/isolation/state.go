@@ -224,6 +224,30 @@ func (state HarnessStateV1) RestoreTestsUsable(evidence T8Evidence, now time.Tim
 	return sealHarnessState(payload)
 }
 
+// RenewT8 replaces expiring evidence for an unchanged open harness. Renewal
+// cannot repair recorded drift; that requires RestoreTestsUsable.
+func (state HarnessStateV1) RenewT8(evidence T8Evidence, now time.Time) (HarnessStateV1, error) {
+	if err := state.validate(); err != nil {
+		return HarnessStateV1{}, err
+	}
+	if state.payload.BootstrapPhase != BootstrapPhaseOpen || state.payload.TestUsability != TestUsabilityUsable ||
+		state.payload.T8ObservedAt == nil {
+		return HarnessStateV1{}, guardError(ErrHarnessStateMismatch, "testUsability", "is not an unchanged usable harness")
+	}
+	if err := validateT8Evidence(evidence); err != nil {
+		return HarnessStateV1{}, err
+	}
+	if !isFreshAt(evidence.ObservedAt, evidence.ValidUntil, now) ||
+		!evidence.ObservedAt.After(*state.payload.T8ObservedAt) {
+		return HarnessStateV1{}, guardError(ErrHarnessStateStale, "t8ObservedAt", "is not a fresh strictly newer T8 observation")
+	}
+	payload := cloneHarnessPayload(state.payload)
+	payload.T8ObservationRevision = evidence.Revision
+	payload.T8ObservedAt = timePointer(evidence.ObservedAt)
+	payload.T8ValidUntil = timePointer(evidence.ValidUntil)
+	return sealHarnessState(payload)
+}
+
 // ParseHarnessStateV1 strictly decodes one canonical state object and verifies
 // its embedded integrity hash. Unknown fields and trailing data fail closed.
 func ParseHarnessStateV1(input []byte) (HarnessStateV1, error) {

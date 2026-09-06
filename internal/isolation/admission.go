@@ -5,6 +5,7 @@ package isolation
 
 import (
 	"errors"
+	"slices"
 	"time"
 )
 
@@ -29,9 +30,16 @@ type HarnessStateExpectation struct {
 	Environment             string
 	EnvironmentClass        string
 	ManifestHash            string
+	ApprovedPlan            PlanIdentity
+	OperationID             string
+	BootstrapEnvelopeHash   string
 	ControlRecordGeneration uint64
 	Resources               HarnessResourceFingerprints
 	CleanupCapabilities     []CleanupCapability
+	BootstrapSteps          []string
+	RollbackSteps           []string
+	ApprovedAt              time.Time
+	ApprovalValidUntil      time.Time
 }
 
 // HarnessAdmissionRequest asks only whether the TEST-ISO global blockade is
@@ -72,9 +80,6 @@ func AdmitHarnessAction(state HarnessStateV1, request HarnessAdmissionRequest) e
 }
 
 func admitPendingHarnessAction(state HarnessStateV1, request HarnessAdmissionRequest) error {
-	if request.Now.Before(state.payload.ApprovedAt) || !request.Now.Before(state.payload.ApprovalValidUntil) {
-		return guardError(ErrHarnessStateStale, "approval", "is outside the approved bootstrap window")
-	}
 	if request.Action != HarnessActionBootstrapStep && request.Action != HarnessActionRollbackStep {
 		return guardError(ErrHarnessAdmissionDenied, "bootstrapPhase", "admits only the approved WF-TEST-01 envelope")
 	}
@@ -88,6 +93,16 @@ func admitPendingHarnessAction(state HarnessStateV1, request HarnessAdmissionReq
 	}
 	if !containsStep(steps, request.StepID) {
 		return guardError(ErrHarnessAdmissionDenied, "stepID", "is not recorded in the approved bootstrap envelope")
+	}
+	if request.Now.Before(state.payload.ApprovedAt) {
+		return guardError(ErrHarnessStateStale, "approval", "precedes the approved bootstrap window")
+	}
+	// The approval deadline stops forward bootstrap work, not the exact
+	// compensation already approved in the same immutable envelope. Provider
+	// ownership, journal, lock, and live revalidation gates still apply to the
+	// admitted rollback step.
+	if request.Action == HarnessActionBootstrapStep && !request.Now.Before(state.payload.ApprovalValidUntil) {
+		return guardError(ErrHarnessStateStale, "approval", "is outside the approved bootstrap execution window")
 	}
 	return nil
 }
@@ -117,9 +132,19 @@ func validateHarnessExpectation(state HarnessStateV1, expected HarnessStateExpec
 	if state.payload.ProjectID != expected.ProjectID || state.payload.Environment != expected.Environment ||
 		state.payload.EnvironmentClass != expected.EnvironmentClass ||
 		state.payload.ManifestHash != expected.ManifestHash ||
+		state.payload.ApprovedPlan != expected.ApprovedPlan ||
+		state.payload.OperationID != expected.OperationID ||
+		state.payload.BootstrapEnvelopeHash != expected.BootstrapEnvelopeHash ||
 		state.payload.ControlRecordGeneration != expected.ControlRecordGeneration ||
-		state.payload.Resources != expected.Resources {
+		state.payload.Resources != expected.Resources ||
+		!slices.Equal(state.payload.BootstrapSteps, expected.BootstrapSteps) ||
+		!slices.Equal(state.payload.RollbackSteps, expected.RollbackSteps) ||
+		!state.payload.ApprovedAt.Equal(expected.ApprovedAt) ||
+		!state.payload.ApprovalValidUntil.Equal(expected.ApprovalValidUntil) {
 		return guardError(ErrHarnessStateMismatch, "binding", "does not match trusted configuration and durable observation")
+	}
+	if err := validateUTCWindow(expected.ApprovedAt, expected.ApprovalValidUntil, 0); err != nil {
+		return guardError(ErrHarnessStateMismatch, "approval", "trusted expectation is malformed")
 	}
 	if err := ValidateCleanupCapabilities(expected.CleanupCapabilities); err != nil ||
 		!equalCleanupCapabilities(state.payload.CleanupCapabilities, expected.CleanupCapabilities) {

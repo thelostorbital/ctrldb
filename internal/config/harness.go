@@ -139,10 +139,12 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 		return HarnessConfiguration{}, fmt.Errorf("%w: disposable testIsolation manifest required", ErrInvalidHarnessConfiguration)
 	}
 
-	lifetime, err := time.ParseDuration(wire.Spec.TestIsolation.Caps.MaxLifetime)
-	if err != nil || lifetime <= 0 {
+	lifetimeSeconds, ok := durationSeconds(wire.Spec.TestIsolation.Caps.MaxLifetime)
+	maximumDurationSeconds := big.NewInt(int64(time.Duration(1<<63-1) / time.Second))
+	if !ok || lifetimeSeconds.Sign() <= 0 || !lifetimeSeconds.IsInt64() || lifetimeSeconds.Cmp(maximumDurationSeconds) > 0 {
 		return HarnessConfiguration{}, fmt.Errorf("%w: invalid test lifetime", ErrInvalidHarnessConfiguration)
 	}
+	lifetime := time.Duration(lifetimeSeconds.Int64()) * time.Second
 	costMicros, err := usdNumberToMicrosCeiling(wire.Spec.TestIsolation.Caps.MaxEstimatedUSDPerRun)
 	if err != nil {
 		return HarnessConfiguration{}, fmt.Errorf("%w: invalid test cost cap", ErrInvalidHarnessConfiguration)

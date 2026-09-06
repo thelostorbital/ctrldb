@@ -73,6 +73,24 @@ func TestHarnessConfigurationFromManifestPreservesExplicitValues(t *testing.T) {
 	}
 }
 
+func TestHarnessConfigurationAcceptsSchemaDayLifetime(t *testing.T) {
+	t.Parallel()
+
+	manifest := validHarnessManifest(t)
+	nestedMap(t, manifest, "spec", "testIsolation", "caps")["maxLifetime"] = "1d"
+	document, err := DecodeManifest(marshalManifest(t, manifest))
+	if err != nil {
+		t.Fatalf("DecodeManifest(1d) unexpected error: %v", err)
+	}
+	configuration, err := HarnessConfigurationFromManifest(document)
+	if err != nil {
+		t.Fatalf("HarnessConfigurationFromManifest(1d) unexpected error: %v", err)
+	}
+	if got := configuration.Caps().MaxLifetime(); got != 24*time.Hour {
+		t.Fatalf("MaxLifetime() = %s; want %s", got, 24*time.Hour)
+	}
+}
+
 func TestHarnessConfigurationDoesNotAliasManifestOrReturnedLabels(t *testing.T) {
 	t.Parallel()
 

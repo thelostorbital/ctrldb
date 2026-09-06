@@ -122,6 +122,36 @@ func TestHarnessStateFirstT8TransitionIsMonotonic(t *testing.T) {
 	}
 }
 
+func TestHarnessStateRenewsFreshT8WithoutFabricatedDrift(t *testing.T) {
+	t.Parallel()
+
+	open, err := validPendingHarnessState(t).OpenAfterT8(validT8Evidence(), validT8BoundaryNow())
+	if err != nil {
+		t.Fatalf("OpenAfterT8() unexpected error: %v", err)
+	}
+	renewal := validT8Evidence()
+	renewal.Revision = strings.Repeat("9", 64)
+	renewal.ObservedAt = renewal.ObservedAt.Add(20 * time.Minute)
+	renewal.ValidUntil = renewal.ObservedAt.Add(30 * time.Minute)
+	renewed, err := open.RenewT8(renewal, renewal.ObservedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("RenewT8() unexpected error: %v", err)
+	}
+	if renewed.T8ObservationRevision() != renewal.Revision || renewed.TestUsability() != isolation.TestUsabilityUsable {
+		t.Fatal("RenewT8() did not preserve a usable harness with the replacement revision")
+	}
+	if _, err := open.RenewT8(validT8Evidence(), validT8BoundaryNow()); !errors.Is(err, isolation.ErrHarnessStateStale) {
+		t.Fatalf("RenewT8(replayed evidence) error = %v; want ErrHarnessStateStale", err)
+	}
+	drifted, err := open.MarkTestsUnusable(validDriftEvidence())
+	if err != nil {
+		t.Fatalf("MarkTestsUnusable() unexpected error: %v", err)
+	}
+	if _, err := drifted.RenewT8(renewal, renewal.ObservedAt.Add(time.Minute)); !errors.Is(err, isolation.ErrHarnessStateMismatch) {
+		t.Fatalf("RenewT8(drifted harness) error = %v; want ErrHarnessStateMismatch", err)
+	}
+}
+
 func TestHarnessStateRejectsIncompleteOrBypassableBindings(t *testing.T) {
 	t.Parallel()
 

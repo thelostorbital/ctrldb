@@ -8,7 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,7 +135,8 @@ func TestProcessBoundaryRejectsRequestDrift(t *testing.T) {
 	}
 
 	request := validProcessRequest(executable)
-	_, err := boundary.Run(nil, request)
+	var missingContext context.Context
+	_, err := boundary.Run(missingContext, request)
 	assertProcessFailure(t, err, processFailureInvalid)
 }
 
@@ -237,24 +238,30 @@ func TestProcessHelper(t *testing.T) {
 	arguments := os.Args[separator+1:]
 	switch arguments[0] {
 	case "inspect":
-		fmt.Printf("ambient=%s\nargument=%s", os.Getenv(arguments[1]), arguments[2])
+		writeHelper(os.Stdout, "ambient="+os.Getenv(arguments[1])+"\nargument="+arguments[2])
 	case "success-with-diagnostics":
-		fmt.Fprint(os.Stdout, `{"status":"ok"}`)
-		fmt.Fprint(os.Stderr, "token=SYNTHETIC_PROCESS_TOKEN")
+		writeHelper(os.Stdout, `{"status":"ok"}`)
+		writeHelper(os.Stderr, "token=SYNTHETIC_PROCESS_TOKEN")
 	case "sleep":
 		time.Sleep(5 * time.Second)
 	case "fail":
-		fmt.Fprint(os.Stdout, "token=SYNTHETIC_STDOUT_TOKEN")
-		fmt.Fprint(os.Stderr, "password=SYNTHETIC_PROCESS_PASSWORD")
+		writeHelper(os.Stdout, "token=SYNTHETIC_STDOUT_TOKEN")
+		writeHelper(os.Stderr, "password=SYNTHETIC_PROCESS_PASSWORD")
 		os.Exit(23)
 	case "overflow-stdout":
-		fmt.Fprint(os.Stdout, strings.Repeat("SYNTHETIC-STDOUT-", 16))
+		writeHelper(os.Stdout, strings.Repeat("SYNTHETIC-STDOUT-", 16))
 	case "overflow-stderr":
-		fmt.Fprint(os.Stderr, strings.Repeat("SYNTHETIC-STDERR-", 16))
+		writeHelper(os.Stderr, strings.Repeat("SYNTHETIC-STDERR-", 16))
 	default:
 		os.Exit(24)
 	}
 	os.Exit(0)
+}
+
+func writeHelper(destination io.Writer, value string) {
+	if _, err := io.WriteString(destination, value); err != nil {
+		os.Exit(25)
+	}
 }
 
 func helperExecutable(t *testing.T) string {

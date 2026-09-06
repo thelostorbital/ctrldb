@@ -78,8 +78,7 @@ func labelCapableCleanupIdentity(identity ResourceIdentity) bool {
 // FirewallValidationContext; ordinary labels are forbidden because the
 // classic Compute Firewall resource has no such field.
 func SelectRunFirewallMutationTargets(runID string, resources []MutationTarget) ([]MutationTarget, error) {
-	prefix, err := RunResourcePrefix(runID)
-	if err != nil {
+	if _, err := RunResourcePrefix(runID); err != nil {
 		return nil, err
 	}
 	selected := make([]MutationTarget, 0, len(resources))
@@ -96,8 +95,8 @@ func SelectRunFirewallMutationTargets(runID string, resources []MutationTarget) 
 		if len(resource.Labels) != 0 {
 			return nil, guardError(ErrUnsafeFirewall, path, "must not invent ordinary labels for a classic firewall")
 		}
-		if !strings.HasPrefix(resource.Identity.Name, prefix) || len(resource.Identity.Name) == len(prefix) {
-			return nil, guardError(ErrUnsafeFirewall, path, "does not have the exact run prefix")
+		if !isExactRunFirewallName(resource.Identity.Name, runID) {
+			return nil, guardError(ErrUnsafeFirewall, path, "is not one of the two exact run firewall identities")
 		}
 		if _, duplicate := seen[resource.Identity.CanonicalKey]; duplicate {
 			return nil, guardError(ErrInvalidGuardInput, path, "duplicates an earlier target")
@@ -137,10 +136,11 @@ type PermanentSingletonObservation struct {
 // and the matching durable ownership record. It deliberately has no age or
 // expiry field: permanent singletons are never wipe candidates.
 type PermanentSingletonProof struct {
-	ProjectID string
-	Desired   PermanentSingletonObservation
-	Observed  PermanentSingletonObservation
-	Record    PermanentOwnershipRecordV1
+	ProjectID        string
+	ExpectedIdentity ResourceIdentity
+	Desired          PermanentSingletonObservation
+	Observed         PermanentSingletonObservation
+	Record           PermanentOwnershipRecordV1
 }
 
 // ValidatePermanentSingletonOwnership rejects adoption by name alone and any
@@ -148,6 +148,10 @@ type PermanentSingletonProof struct {
 func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof) error {
 	if !projectIDPattern.MatchString(proof.ProjectID) {
 		return guardError(ErrInvalidOwnershipProof, "projectID", "must be an explicit canonical project")
+	}
+	if err := validateResourceIdentity(proof.ExpectedIdentity); err != nil ||
+		proof.ExpectedIdentity.Project != proof.ProjectID || !supportedPermanentSingletonIdentity(proof.ExpectedIdentity) {
+		return guardError(ErrInvalidOwnershipProof, "expectedIdentity", "is not an independently trusted harness singleton identity")
 	}
 	for _, entry := range []struct {
 		path  string
@@ -160,6 +164,9 @@ func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof) error {
 		if value.Identity.Project != proof.ProjectID {
 			return guardError(ErrInvalidOwnershipProof, path+".identity.project", "does not match the configured project")
 		}
+	}
+	if proof.Desired.Identity != proof.ExpectedIdentity {
+		return guardError(ErrInvalidOwnershipProof, "desired.identity", "does not match the independently trusted harness configuration")
 	}
 	if proof.Desired != proof.Observed {
 		return guardError(ErrInvalidOwnershipProof, "observed", "does not equal the complete desired singleton state")
@@ -240,12 +247,26 @@ type RunFirewallCleanupTarget struct {
 	ObservedAt  time.Time
 }
 
+// RunFirewallCleanupMode distinguishes an approved operation's immediate
+// teardown from the nightly wipe's expiry-based selection. The future mutation
+// gateway is responsible for deriving this closed value from the admitted
+// workflow; arbitrary provider callers never receive this API directly.
+type RunFirewallCleanupMode string
+
+const (
+	RunFirewallCleanupRecordedTeardown RunFirewallCleanupMode = "recorded-teardown"
+	RunFirewallCleanupExpiredWipe      RunFirewallCleanupMode = "expired-wipe"
+)
+
 // ValidateRunFirewallCleanupTarget verifies project, scope, exact run prefix,
 // immutable description, durable record, and expiry. It never accepts labels
 // as a substitute for the lifetime record.
-func ValidateRunFirewallCleanupTarget(policy CleanupPolicy, target RunFirewallCleanupTarget, now time.Time, maxLifetime time.Duration) error {
+func ValidateRunFirewallCleanupTarget(policy CleanupPolicy, target RunFirewallCleanupTarget, mode RunFirewallCleanupMode, now time.Time, maxLifetime time.Duration) error {
 	if !projectIDPattern.MatchString(policy.ProjectID) || now.IsZero() || maxLifetime <= 0 {
 		return guardError(ErrInvalidOwnershipProof, "cleanup", "requires explicit project and time")
+	}
+	if mode != RunFirewallCleanupRecordedTeardown && mode != RunFirewallCleanupExpiredWipe {
+		return guardError(ErrInvalidOwnershipProof, "cleanupMode", "is not a supported cleanup authority")
 	}
 	if _, offset := now.Zone(); offset != 0 {
 		return guardError(ErrInvalidOwnershipProof, "now", "must use UTC")
@@ -255,9 +276,8 @@ func ValidateRunFirewallCleanupTarget(policy CleanupPolicy, target RunFirewallCl
 		target.Identity.Scope != ResourceScopeGlobal {
 		return guardError(ErrInvalidOwnershipProof, "identity", "is not the exact configured-project classic firewall")
 	}
-	prefix, err := RunResourcePrefix(target.RunLifetime.RunID)
-	if err != nil || !strings.HasPrefix(target.Identity.Name, prefix) || len(target.Identity.Name) == len(prefix) {
-		return guardError(ErrInvalidOwnershipProof, "identity.name", "does not match the durable record run prefix")
+	if !isExactRunFirewallName(target.Identity.Name, target.RunLifetime.RunID) {
+		return guardError(ErrInvalidOwnershipProof, "identity.name", "is not one of the two exact durable-record firewall identities")
 	}
 	fingerprint, err := RunLifetimeContractFingerprint(target.RunLifetime)
 	if err != nil {
@@ -281,8 +301,18 @@ func ValidateRunFirewallCleanupTarget(policy CleanupPolicy, target RunFirewallCl
 		target.RunLifetime.ExpiresAt.Sub(target.RunLifetime.CreatedAt) > maxLifetime {
 		return guardError(ErrInvalidOwnershipProof, "expiresAt", "exceeds the configured maximum lifetime")
 	}
-	if now.Before(target.RunLifetime.ExpiresAt) {
+	if mode == RunFirewallCleanupExpiredWipe && now.Before(target.RunLifetime.ExpiresAt) {
 		return guardError(ErrInvalidOwnershipProof, "expiresAt", "has not reached its recorded expiry")
 	}
 	return nil
+}
+
+func isExactRunFirewallName(name, runID string) bool {
+	for _, purpose := range []FirewallPurpose{FirewallPurposeIAPSSH, FirewallPurposeInternalMongo} {
+		expected, err := RunFirewallRuleName(runID, purpose)
+		if err == nil && name == expected {
+			return true
+		}
+	}
+	return false
 }

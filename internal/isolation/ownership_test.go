@@ -73,6 +73,19 @@ func TestLabelCapableOwnershipRequiresPrefixAndAllLabels(t *testing.T) {
 	if _, err := isolation.SelectRunFirewallMutationTargets("run1", []isolation.MutationTarget{firewallWithInventedLabels}); !errors.Is(err, isolation.ErrUnsafeFirewall) {
 		t.Fatalf("classic firewall with labels error = %v; want ErrUnsafeFirewall", err)
 	}
+	validFirewall := isolation.MutationTarget{Identity: testResourceIdentity(
+		"ctrldb-test-run1-iap-ssh", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global",
+	)}
+	if _, err := isolation.SelectRunFirewallMutationTargets("run1", []isolation.MutationTarget{validFirewall}); err != nil {
+		t.Fatalf("exact run firewall unexpected error: %v", err)
+	}
+	wrongSuffix := validFirewall
+	wrongSuffix.Identity = testResourceIdentity(
+		"ctrldb-test-run1-unplanned", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global",
+	)
+	if _, err := isolation.SelectRunFirewallMutationTargets("run1", []isolation.MutationTarget{wrongSuffix}); !errors.Is(err, isolation.ErrUnsafeFirewall) {
+		t.Fatalf("unplanned run firewall error = %v; want ErrUnsafeFirewall", err)
+	}
 }
 
 func TestPermanentSingletonOwnershipRequiresExactStateAndDurableRecord(t *testing.T) {
@@ -102,7 +115,11 @@ func TestPermanentSingletonOwnershipRequiresExactStateAndDurableRecord(t *testin
 		{name: "record identity drift", mutate: func(value *isolation.PermanentSingletonProof) { value.Record.ProviderID = "other" }},
 		{name: "unknown kind", mutate: func(value *isolation.PermanentSingletonProof) {
 			identity := resourceIdentityForProject("ctrldb-test-widget", isolation.ResourceKind("widgets"), isolation.ResourceScopeGlobal, "global", "example-test-project")
+			value.ExpectedIdentity = identity
 			value.Desired.Identity, value.Observed.Identity, value.Record.Identity = identity, identity, identity
+		}},
+		{name: "trusted identity mismatch", mutate: func(value *isolation.PermanentSingletonProof) {
+			value.ExpectedIdentity = testResourceIdentity("ctrldb-test-other-vpc", isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
 		}},
 	}
 	for _, test := range tests {
@@ -126,7 +143,7 @@ func TestPermanentSingletonWithoutProviderDescriptionRequiresNoInventedFingerpri
 		Identity: identity, ProviderID: "provider-id-nat", DesiredStateFingerprint: strings.Repeat("a", 64),
 	}
 	proof := isolation.PermanentSingletonProof{
-		ProjectID: "example-test-project", Desired: observation, Observed: observation,
+		ProjectID: "example-test-project", ExpectedIdentity: identity, Desired: observation, Observed: observation,
 		Record: isolation.PermanentOwnershipRecordV1{
 			SchemaVersion: isolation.OwnershipRecordSchemaV1, RecordID: "ownership-test-nat", RecordGeneration: 1,
 			Identity: identity, ProviderID: observation.ProviderID, DesiredStateFingerprint: observation.DesiredStateFingerprint,
@@ -154,6 +171,7 @@ func TestRunScopedFirewallCannotBecomePermanentSingleton(t *testing.T) {
 	proof.Desired.Identity = identity
 	proof.Observed.Identity = identity
 	proof.Record.Identity = identity
+	proof.ExpectedIdentity = identity
 	if err := isolation.ValidatePermanentSingletonOwnership(proof); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
 		t.Fatalf("ValidatePermanentSingletonOwnership(run firewall) error = %v; want ErrInvalidOwnershipProof", err)
 	}
@@ -168,6 +186,7 @@ func TestOnlyReservedHarnessFirewallsCanBePermanentSingletons(t *testing.T) {
 		proof.Desired.Identity = identity
 		proof.Observed.Identity = identity
 		proof.Record.Identity = identity
+		proof.ExpectedIdentity = identity
 		if err := isolation.ValidatePermanentSingletonOwnership(proof); err != nil {
 			t.Fatalf("ValidatePermanentSingletonOwnership(%q) unexpected error: %v", name, err)
 		}
@@ -178,6 +197,7 @@ func TestOnlyReservedHarnessFirewallsCanBePermanentSingletons(t *testing.T) {
 	proof.Desired.Identity = identity
 	proof.Observed.Identity = identity
 	proof.Record.Identity = identity
+	proof.ExpectedIdentity = identity
 	if err := isolation.ValidatePermanentSingletonOwnership(proof); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
 		t.Fatalf("ValidatePermanentSingletonOwnership(unreserved firewall) error = %v; want ErrInvalidOwnershipProof", err)
 	}
@@ -202,7 +222,7 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 		Identity:    testResourceIdentity("ctrldb-test-run1-iap-ssh", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"),
 		Description: description, RunLifetime: lifetime, ObservedAt: now,
 	}
-	if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), target, now, 3*time.Hour); err != nil {
+	if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), target, isolation.RunFirewallCleanupExpiredWipe, now, 3*time.Hour); err != nil {
 		t.Fatalf("ValidateRunFirewallCleanupTarget() unexpected error: %v", err)
 	}
 
@@ -215,6 +235,9 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 		}},
 		{name: "wrong prefix", mutate: func(value *isolation.RunFirewallCleanupTarget, _ *time.Time, _ *time.Duration) {
 			value.Identity = testResourceIdentity("ctrldb-test-other-iap-ssh", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global")
+		}},
+		{name: "unplanned suffix", mutate: func(value *isolation.RunFirewallCleanupTarget, _ *time.Time, _ *time.Duration) {
+			value.Identity = testResourceIdentity("ctrldb-test-run1-unplanned", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global")
 		}},
 		{name: "description mismatch", mutate: func(value *isolation.RunFirewallCleanupTarget, _ *time.Time, _ *time.Duration) {
 			value.Description = "changed"
@@ -232,10 +255,30 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 			t.Parallel()
 			value, boundary, maximum := target, now, 3*time.Hour
 			test.mutate(&value, &boundary, &maximum)
-			if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), value, boundary, maximum); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
+			if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), value, isolation.RunFirewallCleanupExpiredWipe, boundary, maximum); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
 				t.Fatalf("error = %v; want ErrInvalidOwnershipProof", err)
 			}
 		})
+	}
+
+	early := target
+	early.RunLifetime.ExpiresAt = now.Add(time.Hour)
+	earlyFingerprint, err := isolation.RunLifetimeContractFingerprint(early.RunLifetime)
+	if err != nil {
+		t.Fatalf("RunLifetimeContractFingerprint(early teardown) unexpected error: %v", err)
+	}
+	early.Description, err = isolation.RunFirewallDescription(earlyFingerprint)
+	if err != nil {
+		t.Fatalf("RunFirewallDescription(early teardown) unexpected error: %v", err)
+	}
+	if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), early, isolation.RunFirewallCleanupRecordedTeardown, now, 3*time.Hour); err != nil {
+		t.Fatalf("recorded teardown before expiry unexpected error: %v", err)
+	}
+	if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), early, isolation.RunFirewallCleanupExpiredWipe, now, 3*time.Hour); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
+		t.Fatalf("nightly wipe before expiry error = %v; want ErrInvalidOwnershipProof", err)
+	}
+	if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), target, "unknown", now, 3*time.Hour); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
+		t.Fatalf("unknown cleanup mode error = %v; want ErrInvalidOwnershipProof", err)
 	}
 }
 
@@ -247,7 +290,7 @@ func validPermanentSingletonProof() isolation.PermanentSingletonProof {
 		DescriptionFingerprint:  strings.Repeat("b", 64),
 	}
 	return isolation.PermanentSingletonProof{
-		ProjectID: "example-test-project", Desired: observation, Observed: observation,
+		ProjectID: "example-test-project", ExpectedIdentity: identity, Desired: observation, Observed: observation,
 		Record: isolation.PermanentOwnershipRecordV1{
 			SchemaVersion: isolation.OwnershipRecordSchemaV1,
 			RecordID:      "ownership-test-vpc", RecordGeneration: 1,

@@ -151,6 +151,12 @@ func TestHarnessConfigurationRequiresCompleteValidation(t *testing.T) {
 		{name: "policy invalid", mutate: func(t *testing.T, manifest map[string]any) {
 			nestedMap(t, manifest, "spec", "testIsolation", "network")["cidr"] = "10.30.0.0/25"
 		}},
+		{name: "impersonated discovery identity", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "gcp", "identity")["discovery"] = "impersonate"
+		}},
+		{name: "shared VPC host project", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "gcp", "sharedVpc")["hostProject"] = "shared-host-project"
+		}},
 		{name: "public CI principal", mutate: func(t *testing.T, manifest map[string]any) {
 			nestedMap(t, manifest, "spec", "testIsolation")["ciPrincipal"] = "allUsers"
 		}},

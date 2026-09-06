@@ -139,8 +139,7 @@ func TestValidateCleanupTargetsRequiresPrefixAndAllLabels(t *testing.T) {
 		t.Fatalf("ValidateCleanupTargets() unexpected error: %v", err)
 	}
 	allowed := []isolation.ResourceIdentity{
-		testResourceIdentity("ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeRegion, "asia-south1"),
-		testResourceIdentity("ctrldb-test-run1-firewall", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"),
+		testResourceIdentity("ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeRegion, "us-central1"),
 	}
 	for _, identity := range allowed {
 		if err := isolation.ValidateCleanupTargets(validCleanupPolicy(), []isolation.MutationTarget{testTargetWithIdentity(identity, "run1")}); err != nil {
@@ -163,6 +162,9 @@ func TestValidateCleanupTargetsRequiresPrefixAndAllLabels(t *testing.T) {
 		}()},
 		{name: "network kind", resource: testTargetWithIdentity(
 			testResourceIdentity("ctrldb-test-run1-network", isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global"), "run1",
+		)},
+		{name: "classic firewall needs lifetime proof", resource: testTargetWithIdentity(
+			testResourceIdentity("ctrldb-test-run1-firewall", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"), "run1",
 		)},
 		{name: "snapshot kind", resource: testTargetWithIdentity(
 			testResourceIdentity("ctrldb-test-run1-snapshot", isolation.ResourceKind("snapshots"), isolation.ResourceScopeGlobal, "global"), "run1",
@@ -259,7 +261,7 @@ func TestRunMutationTargetsBindCompleteCrossProjectIdentity(t *testing.T) {
 			target.Identity.Scope = isolation.ResourceScopeRegion
 			target.Identity.Location = "asia-south"
 		}},
-		{name: "malformed zone", mutate: func(target *isolation.MutationTarget) { target.Identity.Location = "asia-south1" }},
+		{name: "malformed zone", mutate: func(target *isolation.MutationTarget) { target.Identity.Location = "us-central1" }},
 		{name: "swapped canonical key", mutate: func(target *isolation.MutationTarget) { target.Identity.CanonicalKey = second.Identity.CanonicalKey }},
 	}
 	for _, test := range tests {
@@ -308,8 +310,8 @@ func TestComputeResourceIdentityEnforcesProviderNameGrammar(t *testing.T) {
 		location string
 	}
 	shapes := []computeIdentityShape{
-		{kind: isolation.ComputeInstanceKind, scope: isolation.ResourceScopeZone, location: "asia-south1-a"},
-		{kind: isolation.ComputeDiskKind, scope: isolation.ResourceScopeRegion, location: "asia-south1"},
+		{kind: isolation.ComputeInstanceKind, scope: isolation.ResourceScopeZone, location: "us-central1-a"},
+		{kind: isolation.ComputeDiskKind, scope: isolation.ResourceScopeRegion, location: "us-central1"},
 		{kind: isolation.ComputeFirewallKind, scope: isolation.ResourceScopeGlobal, location: "global"},
 		{kind: isolation.ComputeNetworkKind, scope: isolation.ResourceScopeGlobal, location: "global"},
 		{kind: "snapshots", scope: isolation.ResourceScopeGlobal, location: "global"},
@@ -485,7 +487,7 @@ func TestValidateFirewallTagsAllowsOnlyReservedTestTags(t *testing.T) {
 func TestValidateNetworkCIDRAcceptsPrivateNonOverlappingRanges(t *testing.T) {
 	t.Parallel()
 
-	for _, cidr := range []string{"10.20.0.0/24", "172.16.0.0/16", "192.168.50.0/24", "10.30.0.0/29"} {
+	for _, cidr := range []string{"10.40.0.0/24", "172.16.0.0/16", "192.168.50.0/24", "10.30.0.0/29"} {
 		if err := isolation.ValidateNetworkCIDR(cidr, []string{"10.10.0.0/16", "172.20.0.0/16"}); err != nil {
 			t.Errorf("ValidateNetworkCIDR(%q) unexpected error: %v", cidr, err)
 		}
@@ -510,8 +512,8 @@ func TestValidateNetworkCIDRRejectsPublicOverlapAndMalformedDiscovery(t *testing
 		{name: "invalid", testCIDR: "not-a-cidr", kind: isolation.ErrInvalidGuardInput},
 		{name: "test contains existing", testCIDR: "10.20.0.0/16", forbidden: []string{"10.20.1.0/24"}, kind: isolation.ErrNetworkOverlap},
 		{name: "existing contains test", testCIDR: "10.20.1.0/24", forbidden: []string{"10.20.0.0/16"}, kind: isolation.ErrNetworkOverlap},
-		{name: "equal", testCIDR: "10.20.0.0/24", forbidden: []string{"10.20.0.0/24"}, kind: isolation.ErrNetworkOverlap},
-		{name: "malformed discovered CIDR", testCIDR: "10.20.0.0/24", forbidden: []string{"unknown"}, kind: isolation.ErrInvalidGuardInput},
+		{name: "equal", testCIDR: "10.40.0.0/24", forbidden: []string{"10.40.0.0/24"}, kind: isolation.ErrNetworkOverlap},
+		{name: "malformed discovered CIDR", testCIDR: "10.40.0.0/24", forbidden: []string{"unknown"}, kind: isolation.ErrInvalidGuardInput},
 	}
 	for _, test := range tests {
 		test := test
@@ -617,9 +619,9 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 	}
 	boundaryIntents := boundary.Intents()
 	boundaryTarget := boundaryIntents[0].Target()
-	boundaryTarget.Labels[config.LabelPurpose] = "changed"
+	boundaryTarget.Labels = map[string]string{config.LabelPurpose: "changed"}
 	for _, target := range input.Targets {
-		if target.Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
+		if len(target.Labels) != 0 {
 			t.Fatal("RevalidatePreMutation() intents alias authorization input")
 		}
 	}
@@ -632,7 +634,7 @@ func TestPreMutationGateRequiresEveryLocalProofFamily(t *testing.T) {
 		{name: "operation attempt proof", mutate: func(value *isolation.PreMutationInput) { value.Operation.Attempt = 0 }, kind: isolation.ErrInvalidGuardInput},
 		{name: "operation ID proof", mutate: func(value *isolation.PreMutationInput) { value.Operation.OperationID = "Operation 1" }, kind: isolation.ErrInvalidGuardInput},
 		{name: "step ID proof", mutate: func(value *isolation.PreMutationInput) { value.Operation.StepID = "create/test" }, kind: isolation.ErrInvalidGuardInput},
-		{name: "selector proof", mutate: func(value *isolation.PreMutationInput) { value.RunID = "different" }, kind: isolation.ErrUnsafeTarget},
+		{name: "selector proof", mutate: func(value *isolation.PreMutationInput) { value.RunID = "different" }, kind: isolation.ErrUnsafeFirewall},
 		{name: "Compute target underscore", mutate: func(value *isolation.PreMutationInput) {
 			value.Targets[0].Identity.Name = "ctrldb-test-run1_vm"
 		}, kind: isolation.ErrInvalidGuardInput},
@@ -986,9 +988,9 @@ func TestMutationBoundarySealsAndDetachesProviderRequests(t *testing.T) {
 	}
 
 	firstTarget := intents[0].Target()
-	firstTarget.Labels[config.LabelPurpose] = "changed"
+	firstTarget.Labels = map[string]string{config.LabelPurpose: "changed"}
 	for _, intent := range boundary.Intents() {
-		if intent.Target().Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
+		if len(intent.Target().Labels) != 0 {
 			t.Fatal("MutationBoundary target labels alias an earlier accessor result")
 		}
 	}
@@ -1008,7 +1010,7 @@ func TestMutationBoundarySealsAndDetachesProviderRequests(t *testing.T) {
 		firewall.TargetTags[0] = "changed"
 		firewall.ResourceManagerTags = map[string]string{"tagKeys/123": "tagValues/456"}
 	}
-	fresh.MutationIntents[0].Target.Labels[config.LabelPurpose] = "changed"
+	fresh.MutationIntents[0].Target.Labels = map[string]string{config.LabelPurpose: "changed"}
 	for _, intent := range fresh.MutationIntents {
 		if intent.Create.Firewall != nil {
 			intent.Create.Firewall.Allowed[0].Ports[0] = 443
@@ -1024,7 +1026,7 @@ func TestMutationBoundarySealsAndDetachesProviderRequests(t *testing.T) {
 	}
 	for _, intent := range boundary.Intents() {
 		target := intent.Target()
-		if target.Labels[config.LabelPurpose] != config.TestResourcePurposeLabel {
+		if len(target.Labels) != 0 {
 			t.Fatal("MutationBoundary target aliases revalidation input")
 		}
 		if firewall, ok := intent.FirewallCreateState(); ok {
@@ -1174,9 +1176,9 @@ func TestPreMutationCapacityProofUsesTheFullPlannedInventory(t *testing.T) {
 		}, kind: isolation.ErrInvalidGuardInput},
 		{name: "zero disk size", mutate: func(input *isolation.PreMutationInput) { input.Capacity.Disks[0].SizeGiB = 0 }, kind: isolation.ErrInvalidGuardInput},
 		{name: "cross-run disk", mutate: func(input *isolation.PreMutationInput) { input.Capacity.Disks[0].RunID = "run-42" }, kind: isolation.ErrInvalidGuardInput},
-		{name: "target absent from plan", mutate: func(input *isolation.PreMutationInput) {
+		{name: "non firewall target", mutate: func(input *isolation.PreMutationInput) {
 			input.Targets = append(input.Targets, testTarget("ctrldb-test-run1-other", "run1"))
-		}, kind: isolation.ErrInvalidGuardInput},
+		}, kind: isolation.ErrUnsafeFirewall},
 	}
 	for _, test := range tests {
 		test := test
@@ -1494,7 +1496,7 @@ func TestPreMutationRequiresCurrentBoundedRunLifetime(t *testing.T) {
 		mutate func(*isolation.PreMutationInput)
 		kind   error
 	}{
-		{name: "absent record", mutate: func(value *isolation.PreMutationInput) { value.RunLifetime = isolation.RunLifetimeContract{} }, kind: isolation.ErrInvalidRunID},
+		{name: "absent record", mutate: func(value *isolation.PreMutationInput) { value.RunLifetime = isolation.RunLifetimeContract{} }, kind: isolation.ErrInvalidGuardInput},
 		{name: "expired", mutate: func(value *isolation.PreMutationInput) {
 			value.RunLifetime.ExpiresAt = authorizationNow()
 			refreshRunLifetimeFingerprint(value)
@@ -1738,8 +1740,8 @@ func validPreMutationInput() isolation.PreMutationInput {
 	permissions := validPermissionProofInput()
 	locks, expectedEnvironments := validLockProof()
 	observedAt := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
-	instance := testResourceIdentity("ctrldb-test-run1-vm", isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "asia-south1-a")
-	disk := testResourceIdentity("ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeZone, "asia-south1-a")
+	instance := testResourceIdentity("ctrldb-test-run1-vm", isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "us-central1-a")
+	disk := testResourceIdentity("ctrldb-test-run1-disk", isolation.ComputeDiskKind, isolation.ResourceScopeZone, "us-central1-a")
 	input := isolation.PreMutationInput{
 		Operation: isolation.OperationBinding{OperationID: "op-0123456789abcdef", StepID: "create-test-resources", Attempt: 1},
 		RunID:     "run1",
@@ -1750,7 +1752,7 @@ func validPreMutationInput() isolation.PreMutationInput {
 			Disks:     []isolation.PlannedDisk{{Identity: disk, RunID: "run1", SizeGiB: 100}},
 			Lifetime:  time.Hour, EstimatedCostMicros: 1_000_000,
 		},
-		TestCIDR:                          "10.20.0.0/24",
+		TestCIDR:                          "10.40.0.0/24",
 		ProductionCIDRs:                   []string{"10.80.0.0/16"},
 		ExpectedNonDisposableEnvironments: expectedEnvironments,
 		Locks:                             locks,
@@ -1961,12 +1963,14 @@ func moveAllResourceProjects(input *isolation.PreMutationInput, project string) 
 	for index := range input.Permissions.Observed {
 		moveResourceProject(&input.Permissions.Observed[index].Resource, project)
 	}
+	input.RunLifetime.ProjectID = project
 	refreshCapacityFingerprint(&input.Capacity)
+	refreshRunLifetimeFingerprint(input)
 	input.MutationIntents = validMutationIntents(*input)
 }
 
 func testTarget(name, runID string) isolation.MutationTarget {
-	return testTargetWithIdentity(testResourceIdentity(name, isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "asia-south1-a"), runID)
+	return testTargetWithIdentity(testResourceIdentity(name, isolation.ComputeInstanceKind, isolation.ResourceScopeZone, "us-central1-a"), runID)
 }
 
 func testResourceIdentity(name string, kind isolation.ResourceKind, scope isolation.ResourceScope, location string) isolation.ResourceIdentity {

@@ -54,7 +54,7 @@ func TestTESTISO04FirewallPurposeShapesAreExact(t *testing.T) {
 			rule.Allowed = append(rule.Allowed, isolation.FirewallTrafficRule{IPProtocol: isolation.FirewallIPProtocolTCP, Ports: []uint16{443}})
 		}},
 		{name: "extra port", mutate: func(rule *isolation.FirewallRule) { rule.Allowed[0].Ports = append(rule.Allowed[0].Ports, 443) }},
-		{name: "destination selector", mutate: func(rule *isolation.FirewallRule) { rule.DestinationCIDRs = []string{"10.20.0.0/24"} }},
+		{name: "destination selector", mutate: func(rule *isolation.FirewallRule) { rule.DestinationCIDRs = []string{"10.40.0.0/24"} }},
 		{name: "source service account", mutate: func(rule *isolation.FirewallRule) {
 			rule.SourceServiceAccounts = []string{"source@example-test-project.iam.gserviceaccount.com"}
 		}},
@@ -100,7 +100,7 @@ func TestTESTISO04InternalMongoDBRuleRequiresMatchingTestTags(t *testing.T) {
 	}{
 		{name: "wrong port", mutate: func(rule *isolation.FirewallRule) { rule.Allowed[0].Ports = []uint16{22} }, kind: isolation.ErrUnsafeFirewall},
 		{name: "disabled", mutate: func(rule *isolation.FirewallRule) { rule.Enabled = false }, kind: isolation.ErrUnsafeFirewall},
-		{name: "CIDR source", mutate: func(rule *isolation.FirewallRule) { rule.SourceCIDRs = []string{"10.20.0.0/24"} }, kind: isolation.ErrUnsafeFirewall},
+		{name: "CIDR source", mutate: func(rule *isolation.FirewallRule) { rule.SourceCIDRs = []string{"10.40.0.0/24"} }, kind: isolation.ErrUnsafeFirewall},
 		{name: "missing source tag", mutate: func(rule *isolation.FirewallRule) { rule.SourceTags = nil }, kind: isolation.ErrInvalidGuardInput},
 		{name: "different source tag", mutate: func(rule *isolation.FirewallRule) { rule.SourceTags = []string{"ctrldb-test-client"} }, kind: isolation.ErrUnsafeFirewall},
 		{name: "other run source tag", mutate: func(rule *isolation.FirewallRule) { rule.SourceTags = []string{run2Tag} }, kind: isolation.ErrUnsafeFirewall},
@@ -473,6 +473,7 @@ func firewallRulesForRun(runID string) []isolation.FirewallRule {
 
 func validRunLifetimeContract(runID string) isolation.RunLifetimeContract {
 	return isolation.RunLifetimeContract{
+		ProjectID:   "example-test-project",
 		RunID:       runID,
 		Plan:        isolation.PlanIdentity{ID: "plan-0123456789abcdef", Hash: strings.Repeat("a", 64)},
 		OperationID: "op-0123456789abcdef",
@@ -506,8 +507,8 @@ func validFirewallValidationContext(runID string) isolation.FirewallValidationCo
 func firewallTargets(runID string) []isolation.MutationTarget {
 	rules := firewallRulesForRun(runID)
 	return []isolation.MutationTarget{
-		testTargetWithIdentity(rules[0].Identity, runID),
-		testTargetWithIdentity(rules[1].Identity, runID),
+		{Identity: rules[0].Identity},
+		{Identity: rules[1].Identity},
 	}
 }
 

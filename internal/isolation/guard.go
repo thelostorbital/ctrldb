@@ -206,6 +206,16 @@ const (
 	ComputeDiskKind                 ResourceKind    = "disks"
 	ComputeFirewallKind             ResourceKind    = "firewalls"
 	ComputeNetworkKind              ResourceKind    = "networks"
+	ComputeSubnetworkKind           ResourceKind    = "subnetworks"
+	ComputeRouterKind               ResourceKind    = "routers"
+	ComputeRouterNATKind            ResourceKind    = "routerNats"
+	IAMServiceName                  ProviderService = "iam.googleapis.com"
+	IAMServiceAccountKind           ResourceKind    = "serviceAccounts"
+	IAMRoleKind                     ResourceKind    = "roles"
+	RunServiceName                  ProviderService = "run.googleapis.com"
+	RunJobKind                      ResourceKind    = "jobs"
+	SchedulerServiceName            ProviderService = "cloudscheduler.googleapis.com"
+	SchedulerJobKind                ResourceKind    = "jobs"
 	CloudResourceManagerServiceName ProviderService = "cloudresourcemanager.googleapis.com"
 	CloudResourceManagerProjectKind ResourceKind    = "projects"
 )
@@ -223,8 +233,9 @@ type ResourceIdentity struct {
 	CanonicalKey string
 }
 
-// MutationTarget binds full provider identity to the labels observed for that
-// exact resource.
+// MutationTarget binds full provider identity to ordinary labels when its
+// provider kind supports them. Classic firewall targets keep Labels empty and
+// use their separate lifetime-record ownership proof.
 type MutationTarget struct {
 	Identity ResourceIdentity
 	Labels   map[string]string
@@ -290,6 +301,9 @@ func SelectRunMutationTargets(runID string, resources []MutationTarget) ([]Mutat
 		if err := validateMutationTarget(resource); err != nil {
 			return nil, guardError(err, path, "has invalid full identity")
 		}
+		if !labelCapableCleanupIdentity(resource.Identity) {
+			return nil, guardError(ErrUnsafeTarget, path, "does not use the label-capable ownership contract")
+		}
 		if !strings.HasPrefix(resource.Identity.Name, prefix) || len(resource.Identity.Name) == len(prefix) || resource.Labels[LabelRunID] != runID {
 			return nil, guardError(ErrUnsafeTarget, path, "does not have exact run-scoped disposable identity")
 		}
@@ -303,13 +317,15 @@ func SelectRunMutationTargets(runID string, resources []MutationTarget) ([]Mutat
 	return selected, nil
 }
 
-// CleanupPolicy is the trusted boundary for global-prefix teardown discovery.
+// CleanupPolicy is the trusted project boundary for cleanup discovery.
+// Provider-kind-specific selectors supply the remaining ownership proof.
 type CleanupPolicy struct {
 	ProjectID string
 }
 
-// ValidateCleanupTargets validates the global-prefix selector reserved for
-// teardown and nightly cleanup. Run mutations must use
+// ValidateCleanupTargets validates label-capable instance and disk targets
+// reserved for teardown and nightly cleanup. Classic firewall rules use their
+// description and durable lifetime record instead. Run mutations must use
 // SelectRunMutationTargets instead.
 func ValidateCleanupTargets(policy CleanupPolicy, resources []MutationTarget) error {
 	if !projectIDPattern.MatchString(policy.ProjectID) {
@@ -324,7 +340,7 @@ func ValidateCleanupTargets(policy CleanupPolicy, resources []MutationTarget) er
 		if resource.Identity.Project != policy.ProjectID {
 			return guardError(ErrUnsafeTarget, path, "does not belong to the configured cleanup project")
 		}
-		if !supportedCleanupIdentity(resource.Identity) {
+		if !labelCapableCleanupIdentity(resource.Identity) {
 			return guardError(ErrUnsafeTarget, path, "uses a resource kind that cleanup does not support")
 		}
 		if !config.IsTestResource(config.GeneratedResource{Name: resource.Identity.Name, Labels: resource.Labels}) {
@@ -338,27 +354,17 @@ func ValidateCleanupTargets(policy CleanupPolicy, resources []MutationTarget) er
 	return nil
 }
 
-func supportedCleanupIdentity(identity ResourceIdentity) bool {
-	if identity.Service != ComputeServiceName {
-		return false
-	}
-	switch identity.Kind {
-	case ComputeInstanceKind, ComputeDiskKind, ComputeFirewallKind:
-		return true
-	default:
-		return false
-	}
-}
-
-// ExpirableTarget is a disposable resource considered by the nightly wipe.
+// ExpirableTarget is a label-capable disposable instance or disk considered
+// by the nightly wipe. Permanent singletons and classic firewall rules use
+// separate ownership contracts and cannot be represented here.
 type ExpirableTarget struct {
 	Target    MutationTarget
 	CreatedAt time.Time
 }
 
-// SelectExpiredTargets returns a detached, name-sorted set whose age has
-// reached maxLifetime. Any ambiguous candidate makes the entire selection
-// fail; it is never silently skipped.
+// SelectExpiredTargets returns a detached, name-sorted set of label-capable
+// instances and disks whose age has reached maxLifetime. Any ambiguous
+// candidate makes the entire selection fail; it is never silently skipped.
 func SelectExpiredTargets(policy CleanupPolicy, candidates []ExpirableTarget, now time.Time, maxLifetime time.Duration) ([]ExpirableTarget, error) {
 	if now.IsZero() {
 		return nil, guardError(ErrInvalidGuardInput, "now", "must not be zero")
@@ -754,7 +760,7 @@ func evaluatePreMutation(policy PreMutationPolicy, input PreMutationInput, now t
 	if err := validatePreMutationPolicy(policy, input); err != nil {
 		return nil, zero, err
 	}
-	targets, err := SelectRunMutationTargets(input.RunID, input.Targets)
+	targets, err := SelectRunFirewallMutationTargets(input.RunID, input.Targets)
 	if err != nil {
 		return nil, zero, err
 	}
@@ -906,9 +912,11 @@ func validateMutationIntents(policy PreMutationPolicy, input PreMutationInput, t
 		if intent.RequiredPrincipalRole != TestPrincipalRoleOperator {
 			return nil, guardError(ErrPermissionProof, path+".requiredPrincipalRole", "does not select the configured test operator")
 		}
-		if err := validateMutationTarget(intent.Target); err != nil {
-			return nil, guardError(err, path+".target", "is not a valid disposable target")
+		selectedIntentTarget, err := SelectRunFirewallMutationTargets(input.RunID, []MutationTarget{intent.Target})
+		if err != nil {
+			return nil, guardError(err, path+".target", "is not a valid run firewall target")
 		}
+		intent.Target = selectedIntentTarget[0]
 		wantTarget, exists := targetsByKey[intent.Target.Identity.CanonicalKey]
 		if !exists || !equalMutationTarget(intent.Target, wantTarget) {
 			return nil, guardError(ErrInvalidGuardInput, path+".target", "does not match one selected target")
@@ -1592,6 +1600,10 @@ func validateKnownResourceScope(identity ResourceIdentity) error {
 		case ComputeFirewallKind, ComputeNetworkKind:
 			if identity.Scope != ResourceScopeGlobal {
 				return guardError(ErrInvalidGuardInput, "target.identity.scope", "Compute networks and firewalls must be global")
+			}
+		case ComputeSubnetworkKind, ComputeRouterKind, ComputeRouterNATKind:
+			if identity.Scope != ResourceScopeRegion {
+				return guardError(ErrInvalidGuardInput, "target.identity.scope", "Compute subnetworks, routers, and NATs must be regional")
 			}
 		}
 	}

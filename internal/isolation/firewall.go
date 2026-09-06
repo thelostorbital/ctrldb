@@ -11,11 +11,13 @@ import (
 )
 
 const (
-	TestVPCName              = "ctrldb-test-vpc"
-	IAPTCPSourceCIDR         = "35.235.240.0/20"
-	FirewallPortSSH   uint16 = 22
-	FirewallPortMongo uint16 = 27017
-	FirewallPriority         = uint32(1000)
+	TestVPCName                     = "ctrldb-test-vpc"
+	TestIAPSSHFirewallName          = "ctrldb-test-iap-ssh"
+	TestInternalFirewallName        = "ctrldb-test-internal"
+	IAPTCPSourceCIDR                = "35.235.240.0/20"
+	FirewallPortSSH          uint16 = 22
+	FirewallPortMongo        uint16 = 27017
+	FirewallPriority                = uint32(1000)
 	// TestHarnessRevocationWorkflowID is the only workflow allowed to revoke
 	// or tear down run-scoped TEST-ISO exposure.
 	TestHarnessRevocationWorkflowID = "WF-TEST-01"
@@ -132,6 +134,7 @@ type FirewallObservation struct {
 // later than ExpiresAt. This pure package performs no provider or durable-record
 // I/O.
 type RunLifetimeContract struct {
+	ProjectID            string
 	RunID                string
 	Plan                 PlanIdentity
 	OperationID          string
@@ -163,6 +166,9 @@ type FirewallValidationContext struct {
 // Time and policy bounds are evaluated separately at each independent mutation
 // boundary; this function performs no provider or durable-record I/O.
 func RunLifetimeContractFingerprint(contract RunLifetimeContract) (string, error) {
+	if !projectIDPattern.MatchString(contract.ProjectID) {
+		return "", guardError(ErrInvalidGuardInput, "runLifetime.projectID", "must identify the explicit configured project")
+	}
 	if err := ValidateRunID(contract.RunID); err != nil {
 		return "", err
 	}
@@ -288,7 +294,7 @@ func ValidateFirewallRules(rules []FirewallRule, observations []FirewallObservat
 	if len(observations) != len(rules) {
 		return guardError(ErrUnsafeFirewall, "firewallObservations", "must contain one exhaustive observation per required rule")
 	}
-	selected, err := SelectRunMutationTargets(context.RunID, targets)
+	selected, err := SelectRunFirewallMutationTargets(context.RunID, targets)
 	if err != nil {
 		return err
 	}
@@ -309,7 +315,7 @@ func ValidateFirewallRules(rules []FirewallRule, observations []FirewallObservat
 			return guardError(ErrInvalidGuardInput, path, "duplicates an earlier firewall purpose")
 		}
 		seen[rule.Purpose] = struct{}{}
-		if err := validateFirewallRule(rule, productionCIDRs, context.RunID, lifetimeFingerprint); err != nil {
+		if err := validateFirewallRule(rule, productionCIDRs, context.RunID, context.RunLifetime.ProjectID, lifetimeFingerprint); err != nil {
 			return guardError(err, path, "failed its purpose proof")
 		}
 		if _, exists := rulesByKey[rule.Identity.CanonicalKey]; exists {
@@ -349,7 +355,7 @@ func ValidateFirewallRules(rules []FirewallRule, observations []FirewallObservat
 			if observation.PresentRule == nil {
 				return guardError(ErrInvalidGuardInput, path, "must include complete present provider state")
 			}
-			if err := validateFirewallRule(*observation.PresentRule, productionCIDRs, context.RunID, lifetimeFingerprint); err != nil {
+			if err := validateFirewallRule(*observation.PresentRule, productionCIDRs, context.RunID, context.RunLifetime.ProjectID, lifetimeFingerprint); err != nil {
 				return guardError(err, path+".presentRule", "is not a safe complete provider state")
 			}
 			if !equalFirewallRule(*observation.PresentRule, desired) {
@@ -387,10 +393,10 @@ func ValidateFirewallRule(rule FirewallRule, productionCIDRs []string, context F
 	if err != nil {
 		return err
 	}
-	return validateFirewallRule(rule, productionCIDRs, context.RunID, lifetimeFingerprint)
+	return validateFirewallRule(rule, productionCIDRs, context.RunID, context.RunLifetime.ProjectID, lifetimeFingerprint)
 }
 
-func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID string, lifetimeFingerprint string) error {
+func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID, projectID, lifetimeFingerprint string) error {
 	rule = normalizeFirewallRule(rule)
 	if err := ValidateRunID(runID); err != nil {
 		return err
@@ -419,7 +425,7 @@ func validateFirewallRule(rule FirewallRule, productionCIDRs []string, runID str
 	}
 	if rule.Identity.Service != ComputeServiceName || rule.Identity.Kind != ComputeFirewallKind || rule.Identity.Scope != ResourceScopeGlobal ||
 		rule.Network.Service != ComputeServiceName || rule.Network.Kind != ComputeNetworkKind || rule.Network.Scope != ResourceScopeGlobal ||
-		rule.Network.Name != TestVPCName || rule.Identity.Project != rule.Network.Project {
+		rule.Network.Name != TestVPCName || rule.Identity.Project != rule.Network.Project || rule.Identity.Project != projectID {
 		return guardError(ErrUnsafeFirewall, "identity", "must bind a global Compute firewall to the explicit test VPC project")
 	}
 	if rule.Priority != FirewallPriority {

@@ -5,6 +5,7 @@ package config
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -170,6 +171,33 @@ func TestHarnessConfigurationRequiresCompleteValidation(t *testing.T) {
 		{name: "destructive is database VM identity", mutate: func(t *testing.T, manifest map[string]any) {
 			isolation := nestedMap(t, manifest, "spec", "testIsolation")
 			isolation["destructiveServiceAccount"] = nestedMap(t, manifest, "spec", "host")["serviceAccount"]
+		}},
+		{name: "wipe is database VM identity", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "reconciler")["serviceAccount"] = nestedMap(t, manifest, "spec", "host")["serviceAccount"]
+		}},
+		{name: "wipe is operator identity", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "reconciler")["serviceAccount"] = nestedMap(t, manifest, "spec", "testIsolation")["operatorServiceAccount"]
+		}},
+		{name: "wipe is destructive identity", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "reconciler")["serviceAccount"] = nestedMap(t, manifest, "spec", "testIsolation")["destructiveServiceAccount"]
+		}},
+		{name: "operator belongs to another project", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "testIsolation")["operatorServiceAccount"] = "ctrldb-test-operator@foreign-project.iam.gserviceaccount.com"
+		}},
+		{name: "destructive belongs to another project", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "testIsolation")["destructiveServiceAccount"] = "ctrldb-test-destructive@foreign-project.iam.gserviceaccount.com"
+		}},
+		{name: "wipe belongs to another project", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "reconciler")["serviceAccount"] = "ctrldb-test-wipe@foreign-project.iam.gserviceaccount.com"
+		}},
+		{name: "operator has provider-invalid identity", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "testIsolation")["operatorServiceAccount"] = "BAD@example-project.iam.gserviceaccount.com"
+		}},
+		{name: "subnet has trailing hyphen", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "testIsolation", "network")["subnet"] = "ctrldb-test-invalid-"
+		}},
+		{name: "subnet exceeds provider length", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "testIsolation", "network")["subnet"] = "ctrldb-test-" + strings.Repeat("a", 53)
 		}},
 	}
 	for _, test := range tests {

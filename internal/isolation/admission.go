@@ -40,6 +40,8 @@ type HarnessStateExpectation struct {
 	RollbackSteps            []string
 	ApprovedAt               time.Time
 	ApprovalValidUntil       time.Time
+	BootstrapPhase           BootstrapPhase
+	BootstrapOpenedAt        time.Time
 	T8ObservationRevision    string
 	T8ObservedAt             time.Time
 	T8ValidUntil             time.Time
@@ -147,6 +149,8 @@ func validateHarnessExpectation(state HarnessStateV1, expected HarnessStateExpec
 		!slices.Equal(state.payload.RollbackSteps, expected.RollbackSteps) ||
 		!state.payload.ApprovedAt.Equal(expected.ApprovedAt) ||
 		!state.payload.ApprovalValidUntil.Equal(expected.ApprovalValidUntil) ||
+		state.payload.BootstrapPhase != expected.BootstrapPhase ||
+		!optionalTimeMatches(state.payload.BootstrapOpenedAt, expected.BootstrapOpenedAt) ||
 		state.payload.TestUsability != expected.TestUsability ||
 		state.payload.DriftObservationRevision != expected.DriftObservationRevision ||
 		!optionalTimeMatches(state.payload.DriftDetectedAt, expected.DriftDetectedAt) {

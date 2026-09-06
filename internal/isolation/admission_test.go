@@ -121,6 +121,12 @@ func TestOpenHarnessRequiresFreshExactUsableT8ForTests(t *testing.T) {
 		{name: "trusted validity extension", mutate: func(value *isolation.HarnessAdmissionRequest) {
 			value.Expected.T8ValidUntil = value.Expected.T8ValidUntil.Add(time.Minute)
 		}, kind: isolation.ErrHarnessStateMismatch},
+		{name: "trusted bootstrap-open time drift", mutate: func(value *isolation.HarnessAdmissionRequest) {
+			value.Expected.BootstrapOpenedAt = value.Expected.BootstrapOpenedAt.Add(time.Minute)
+		}, kind: isolation.ErrHarnessStateMismatch},
+		{name: "trusted bootstrap phase drift", mutate: func(value *isolation.HarnessAdmissionRequest) {
+			value.Expected.BootstrapPhase = isolation.BootstrapPhasePending
+		}, kind: isolation.ErrHarnessStateMismatch},
 	}
 	for _, test := range tests {
 		test := test
@@ -196,6 +202,8 @@ func validOpenTestAdmission() isolation.HarnessAdmissionRequest {
 	expected.T8ObservationRevision = evidence.Revision
 	expected.T8ObservedAt = evidence.ObservedAt
 	expected.T8ValidUntil = evidence.ValidUntil
+	expected.BootstrapPhase = isolation.BootstrapPhaseOpen
+	expected.BootstrapOpenedAt = evidence.ObservedAt
 	expected.TestUsability = isolation.TestUsabilityUsable
 	return isolation.HarnessAdmissionRequest{
 		Action:                isolation.HarnessActionIntegrationTest,
@@ -213,6 +221,6 @@ func validHarnessExpectation() isolation.HarnessStateExpectation {
 		Resources: seed.Resources, CleanupCapabilities: append([]isolation.CleanupCapability(nil), seed.CleanupCapabilities...),
 		BootstrapSteps: append([]string(nil), seed.BootstrapSteps...), RollbackSteps: append([]string(nil), seed.RollbackSteps...),
 		ApprovedAt: seed.ApprovedAt, ApprovalValidUntil: seed.ApprovalValidUntil,
-		TestUsability: isolation.TestUsabilityUnusable,
+		BootstrapPhase: isolation.BootstrapPhasePending, TestUsability: isolation.TestUsabilityUnusable,
 	}
 }

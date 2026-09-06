@@ -25,6 +25,7 @@ const (
 
 var (
 	ErrInvalidHarnessConfiguration   = errors.New("invalid test harness configuration")
+	harnessServiceAccountPattern     = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$`)
 	workloadIdentityPrincipalPattern = regexp.MustCompile(
 		`^(?:principal://iam\.googleapis\.com/projects/[1-9][0-9]*/locations/global/workloadIdentityPools/[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?/subject/[A-Za-z0-9][A-Za-z0-9._:@/-]*|principalSet://iam\.googleapis\.com/projects/[1-9][0-9]*/locations/global/workloadIdentityPools/[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?/attribute\.repository/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$`,
 	)
@@ -175,6 +176,24 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 	if wire.Spec.TestIsolation.OperatorServiceAccount == wire.Spec.Host.ServiceAccount ||
 		wire.Spec.TestIsolation.DestructiveServiceAccount == wire.Spec.Host.ServiceAccount {
 		return HarnessConfiguration{}, fmt.Errorf("%w: test control and database VM service accounts must be distinct", ErrInvalidHarnessConfiguration)
+	}
+	if wire.Spec.Reconciler.ServiceAccount == wire.Spec.Host.ServiceAccount ||
+		wire.Spec.Reconciler.ServiceAccount == wire.Spec.TestIsolation.OperatorServiceAccount ||
+		wire.Spec.Reconciler.ServiceAccount == wire.Spec.TestIsolation.DestructiveServiceAccount {
+		return HarnessConfiguration{}, fmt.Errorf("%w: wipe reconciler service account must be distinct from runtime and test control identities", ErrInvalidHarnessConfiguration)
+	}
+	for _, account := range []string{
+		wire.Spec.TestIsolation.OperatorServiceAccount,
+		wire.Spec.TestIsolation.DestructiveServiceAccount,
+		wire.Spec.Reconciler.ServiceAccount,
+	} {
+		if !harnessServiceAccountPattern.MatchString(account) ||
+			!serviceAccountBelongsToProject(account, wire.Spec.GCP.Project) {
+			return HarnessConfiguration{}, fmt.Errorf("%w: test control service accounts must be canonical identities in the configured project", ErrInvalidHarnessConfiguration)
+		}
+	}
+	if !generatedResourceNamePattern.MatchString(wire.Spec.TestIsolation.Network.Subnet) {
+		return HarnessConfiguration{}, fmt.Errorf("%w: test subnet must be a provider-valid Compute resource name", ErrInvalidHarnessConfiguration)
 	}
 	if !workloadIdentityPrincipalPattern.MatchString(wire.Spec.TestIsolation.CIPrincipal) {
 		return HarnessConfiguration{}, fmt.Errorf("%w: CI principal must identify one canonical workload identity subject or repository", ErrInvalidHarnessConfiguration)

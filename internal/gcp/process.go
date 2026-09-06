@@ -69,6 +69,7 @@ func (failure *processFailure) Error() string {
 type processBoundary struct {
 	configuredExecutable string
 	resolvedExecutable   string
+	executableInfo       os.FileInfo
 	environment          []string
 }
 
@@ -111,6 +112,7 @@ func newProcessBoundary(executable string, environment []runner.EnvironmentVaria
 	return &processBoundary{
 		configuredExecutable: executable,
 		resolvedExecutable:   resolved,
+		executableInfo:       info,
 		environment:          append([]string(nil), environmentStrings...),
 	}, nil
 }
@@ -124,6 +126,9 @@ func (boundary *processBoundary) Run(ctx context.Context, request runner.Request
 	}
 	environment, err := runner.EnvironmentStrings(request)
 	if err != nil || request.Executable != boundary.configuredExecutable || !equalStrings(environment, boundary.environment) {
+		return runner.Result{}, &processFailure{kind: processFailureInvalid}
+	}
+	if !boundary.executableIdentityMatches() {
 		return runner.Result{}, &processFailure{kind: processFailureInvalid}
 	}
 
@@ -152,17 +157,13 @@ func (boundary *processBoundary) Run(ctx context.Context, request runner.Request
 
 	startedAt := time.Now().UTC()
 	runErr := command.Run()
+	parentContextErr := ctx.Err()
+	runContextErr := runContext.Err()
 	endedAt := time.Now().UTC()
 	result := processResult(command, stdout, stderr, startedAt, endedAt, runErr)
 
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return failureResult(result), &processFailure{kind: processFailureTimeout}
-	}
-	if ctx.Err() != nil {
-		return failureResult(result), &processFailure{kind: processFailureCanceled}
-	}
-	if runContext.Err() != nil {
-		return failureResult(result), &processFailure{kind: processFailureTimeout}
+	if kind := processContextFailure(runErr, parentContextErr, runContextErr); kind != 0 {
+		return failureResult(result), &processFailure{kind: kind}
 	}
 	if stdout.exceeded {
 		return failureResult(result), &processFailure{kind: processFailureStdoutLimit}
@@ -181,6 +182,34 @@ func (boundary *processBoundary) Run(ctx context.Context, request runner.Request
 	return result, nil
 }
 
+func (boundary *processBoundary) executableIdentityMatches() bool {
+	resolved, err := filepath.EvalSymlinks(boundary.configuredExecutable)
+	if err != nil || resolved != boundary.resolvedExecutable {
+		return false
+	}
+	info, err := os.Stat(resolved)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 &&
+		os.SameFile(boundary.executableInfo, info)
+}
+
+func processContextFailure(runErr, parentContextErr, runContextErr error) processFailureKind {
+	// A context may expire after a child has already completed successfully.
+	// Only a failed command can have been terminated by its run context.
+	if runErr == nil {
+		return 0
+	}
+	if errors.Is(parentContextErr, context.DeadlineExceeded) {
+		return processFailureTimeout
+	}
+	if parentContextErr != nil {
+		return processFailureCanceled
+	}
+	if runContextErr != nil {
+		return processFailureTimeout
+	}
+	return 0
+}
+
 func processResult(
 	command *exec.Cmd,
 	stdout *boundedCapture,
@@ -196,11 +225,15 @@ func processResult(
 			exitCode = command.ProcessState.ExitCode()
 		}
 	}
+	diagnostics := redact.Sanitize("")
+	if !stderr.exceeded {
+		diagnostics = redact.Sanitize(string(stderr.bytes()))
+	}
 	return runner.Result{
 		ExitCode:     exitCode,
 		Stdout:       append([]byte(nil), stdout.bytes()...),
 		StdoutSHA256: stdout.digest(),
-		Stderr:       redact.Sanitize(string(stderr.bytes())),
+		Stderr:       diagnostics,
 		StderrSHA256: stderr.digest(),
 		StartedAt:    startedAt,
 		EndedAt:      endedAt,

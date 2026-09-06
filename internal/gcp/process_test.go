@@ -145,6 +145,23 @@ func TestProcessBoundaryRejectsRequestDrift(t *testing.T) {
 	assertProcessFailure(t, err, processFailureInvalid)
 }
 
+func TestProcessBoundaryRejectsExecutableReplacementBeforeRun(t *testing.T) {
+	t.Parallel()
+
+	executable := helperExecutable(t)
+	boundary := mustProcessBoundary(t, executable)
+	replacement := filepath.Join(filepath.Dir(executable), "replacement")
+	if err := os.WriteFile(replacement, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write replacement executable: %v", err)
+	}
+	if err := os.Rename(replacement, executable); err != nil {
+		t.Fatalf("replace executable: %v", err)
+	}
+
+	_, err := boundary.Run(context.Background(), validProcessRequest(executable))
+	assertProcessFailure(t, err, processFailureInvalid)
+}
+
 func TestProcessBoundaryClassifiesCancellationAndTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -166,6 +183,17 @@ func TestProcessBoundaryClassifiesCancellationAndTimeout(t *testing.T) {
 	assertProcessFailure(t, err, processFailureTimeout)
 	assertFailureResultHasNoStdout(t, result)
 
+	request = validProcessRequest(executable)
+	request.Arguments = helperArguments("overflow-stderr-sleep")
+	request.Timeout = 50 * time.Millisecond
+	request.StderrLimitBytes = 32
+	result, err = boundary.Run(context.Background(), request)
+	assertProcessFailure(t, err, processFailureTimeout)
+	assertFailureResultHasNoStdout(t, result)
+	if result.Stderr.String() != "" {
+		t.Fatalf("timeout overflow stderr = %q, want discarded diagnostics", result.Stderr.String())
+	}
+
 	deadline, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer stop()
 	request = validProcessRequest(executable)
@@ -173,6 +201,21 @@ func TestProcessBoundaryClassifiesCancellationAndTimeout(t *testing.T) {
 	result, err = boundary.Run(deadline, request)
 	assertProcessFailure(t, err, processFailureTimeout)
 	assertFailureResultHasNoStdout(t, result)
+}
+
+func TestProcessContextFailureDoesNotRewriteSuccessfulCompletion(t *testing.T) {
+	t.Parallel()
+
+	if got := processContextFailure(nil, context.DeadlineExceeded, context.DeadlineExceeded); got != 0 {
+		t.Fatalf("successful completion classified as failure kind %d", got)
+	}
+	processErr := errors.New("synthetic process failure")
+	if got := processContextFailure(processErr, context.DeadlineExceeded, context.DeadlineExceeded); got != processFailureTimeout {
+		t.Fatalf("deadline failure kind = %d, want %d", got, processFailureTimeout)
+	}
+	if got := processContextFailure(processErr, context.Canceled, context.Canceled); got != processFailureCanceled {
+		t.Fatalf("cancellation failure kind = %d, want %d", got, processFailureCanceled)
+	}
 }
 
 func TestProcessBoundaryClassifiesExitAndRedactsFailureOutput(t *testing.T) {
@@ -209,6 +252,7 @@ func TestProcessBoundaryClassifiesOutputLimits(t *testing.T) {
 	}{
 		{name: "stdout", mode: "overflow-stdout", kind: processFailureStdoutLimit},
 		{name: "stderr", mode: "overflow-stderr", kind: processFailureStderrLimit},
+		{name: "both", mode: "overflow-both", kind: processFailureStdoutLimit},
 	}
 
 	for _, test := range tests {
@@ -224,7 +268,7 @@ func TestProcessBoundaryClassifiesOutputLimits(t *testing.T) {
 			if strings.Contains(err.Error(), "SYNTHETIC") {
 				t.Fatalf("error leaked output: %q", err)
 			}
-			if test.kind == processFailureStderrLimit && result.Stderr.String() != "" {
+			if (test.kind == processFailureStderrLimit || test.mode == "overflow-both") && result.Stderr.String() != "" {
 				t.Fatalf("overflow stderr = %q, want discarded diagnostics", result.Stderr.String())
 			}
 		})
@@ -259,7 +303,13 @@ func TestProcessHelper(t *testing.T) {
 	case "overflow-stdout":
 		writeHelper(os.Stdout, strings.Repeat("SYNTHETIC-STDOUT-", 16))
 	case "overflow-stderr":
-		writeHelper(os.Stderr, "-----BEGIN PRIVATE KEY-----\n"+strings.Repeat("SYNTHETIC-SECRET-", 16))
+		writeHelper(os.Stderr, overflowSecretDiagnostic())
+	case "overflow-both":
+		writeHelper(os.Stdout, strings.Repeat("SYNTHETIC-STDOUT-", 16))
+		writeHelper(os.Stderr, overflowSecretDiagnostic())
+	case "overflow-stderr-sleep":
+		writeHelper(os.Stderr, overflowSecretDiagnostic())
+		time.Sleep(5 * time.Second)
 	default:
 		os.Exit(24)
 	}
@@ -270,6 +320,11 @@ func writeHelper(destination io.Writer, value string) {
 	if _, err := io.WriteString(destination, value); err != nil {
 		os.Exit(25)
 	}
+}
+
+func overflowSecretDiagnostic() string {
+	return strings.Join([]string{"-----BEGIN PRIVATE", "KEY-----\n"}, " ") +
+		strings.Repeat("SYNTHETIC-SECRET-", 16)
 }
 
 func helperExecutable(t *testing.T) string {

@@ -5,6 +5,8 @@ package isolation_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -79,18 +81,19 @@ func TestHarnessStateFirstT8TransitionIsMonotonic(t *testing.T) {
 	t.Parallel()
 
 	pending := validPendingHarnessState(t)
-	open, err := pending.OpenAfterT8(validT8Evidence())
+	open, err := pending.OpenAfterT8(validT8Evidence(), validT8BoundaryNow())
 	if err != nil {
 		t.Fatalf("OpenAfterT8() unexpected error: %v", err)
 	}
 	if open.BootstrapPhase() != isolation.BootstrapPhaseOpen || open.TestUsability() != isolation.TestUsabilityUsable {
 		t.Fatal("OpenAfterT8() did not open a usable harness")
 	}
-	if _, err := open.OpenAfterT8(validT8Evidence()); !errors.Is(err, isolation.ErrHarnessStateMismatch) {
+	if _, err := open.OpenAfterT8(validT8Evidence(), validT8BoundaryNow()); !errors.Is(err, isolation.ErrHarnessStateMismatch) {
 		t.Fatalf("second OpenAfterT8() error = %v; want ErrHarnessStateMismatch", err)
 	}
 
-	drifted, err := open.MarkTestsUnusable()
+	drift := validDriftEvidence()
+	drifted, err := open.MarkTestsUnusable(drift)
 	if err != nil {
 		t.Fatalf("MarkTestsUnusable() unexpected error: %v", err)
 	}
@@ -99,17 +102,23 @@ func TestHarnessStateFirstT8TransitionIsMonotonic(t *testing.T) {
 	}
 
 	newEvidence := validT8Evidence()
-	newEvidence.ObservedAt = newEvidence.ObservedAt.Add(10 * time.Minute)
-	newEvidence.ValidUntil = newEvidence.ValidUntil.Add(10 * time.Minute)
+	newEvidence.ObservedAt = validHarnessStateSeed().ApprovalValidUntil.Add(time.Hour)
+	newEvidence.ValidUntil = newEvidence.ObservedAt.Add(30 * time.Minute)
 	newEvidence.Revision = strings.Repeat("d", 64)
-	restored, err := drifted.RestoreTestsUsable(newEvidence)
+	restored, err := drifted.RestoreTestsUsable(newEvidence, newEvidence.ObservedAt.Add(time.Minute))
 	if err != nil || restored.BootstrapPhase() != isolation.BootstrapPhaseOpen || restored.TestUsability() != isolation.TestUsabilityUsable {
 		t.Fatalf("RestoreTestsUsable() did not preserve open and restore usable: state=%v error=%v", restored.TestUsability(), err)
 	}
 	older := newEvidence
-	older.ObservedAt = validT8Evidence().ObservedAt.Add(-time.Second)
-	if _, err := restored.RestoreTestsUsable(older); !errors.Is(err, isolation.ErrHarnessStateStale) {
+	older.ObservedAt = drift.DetectedAt
+	older.ValidUntil = older.ObservedAt.Add(30 * time.Minute)
+	if _, err := drifted.RestoreTestsUsable(older, older.ObservedAt.Add(time.Minute)); !errors.Is(err, isolation.ErrHarnessStateStale) {
 		t.Fatalf("RestoreTestsUsable(older) error = %v; want ErrHarnessStateStale", err)
+	}
+	equalDrift := drift
+	equalDrift.DetectedAt = validT8Evidence().ObservedAt
+	if _, err := open.MarkTestsUnusable(equalDrift); !errors.Is(err, isolation.ErrInvalidHarnessState) {
+		t.Fatalf("MarkTestsUnusable(equal T8 time) error = %v; want ErrInvalidHarnessState", err)
 	}
 }
 
@@ -173,10 +182,79 @@ func TestHarnessStateRejectsStaleOrInvalidT8(t *testing.T) {
 			t.Parallel()
 			evidence := validT8Evidence()
 			test.mutate(&evidence)
-			if _, err := validPendingHarnessState(t).OpenAfterT8(evidence); !errors.Is(err, isolation.ErrHarnessStateStale) {
+			if _, err := validPendingHarnessState(t).OpenAfterT8(evidence, evidence.ObservedAt); !errors.Is(err, isolation.ErrHarnessStateStale) {
 				t.Fatalf("OpenAfterT8() error = %v; want ErrHarnessStateStale", err)
 			}
 		})
+	}
+}
+
+func TestOpenAfterT8RequiresCurrentExclusiveApprovalBoundary(t *testing.T) {
+	t.Parallel()
+
+	pending := validPendingHarnessState(t)
+	evidence := validT8Evidence()
+	tests := []struct {
+		name string
+		now  time.Time
+	}{
+		{name: "archived evidence", now: evidence.ValidUntil},
+		{name: "expired approval", now: validHarnessStateSeed().ApprovalValidUntil},
+		{name: "before observation", now: evidence.ObservedAt.Add(-time.Second)},
+		{name: "non UTC", now: validT8BoundaryNow().In(time.FixedZone("offset", 60))},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := pending.OpenAfterT8(evidence, test.now); !errors.Is(err, isolation.ErrHarnessStateStale) {
+				t.Fatalf("OpenAfterT8() error = %v; want ErrHarnessStateStale", err)
+			}
+		})
+	}
+
+	deadlineEvidence := evidence
+	deadlineEvidence.ObservedAt = validHarnessStateSeed().ApprovalValidUntil
+	deadlineEvidence.ValidUntil = deadlineEvidence.ObservedAt.Add(time.Minute)
+	if _, err := pending.OpenAfterT8(deadlineEvidence, deadlineEvidence.ObservedAt); !errors.Is(err, isolation.ErrHarnessStateStale) {
+		t.Fatalf("OpenAfterT8(deadline observation) error = %v; want ErrHarnessStateStale", err)
+	}
+}
+
+func TestParsedOpenStateMustRetainApprovalWindowInvariant(t *testing.T) {
+	t.Parallel()
+
+	open, err := validPendingHarnessState(t).OpenAfterT8(validT8Evidence(), validT8BoundaryNow())
+	if err != nil {
+		t.Fatalf("OpenAfterT8() unexpected error: %v", err)
+	}
+	encoded, err := open.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("CanonicalJSON() unexpected error: %v", err)
+	}
+	type wireDocument struct {
+		SchemaVersion   string          `json:"schemaVersion"`
+		State           json.RawMessage `json:"state"`
+		IntegritySHA256 string          `json:"integritySha256"`
+	}
+	var wire wireDocument
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatalf("json.Unmarshal(wire) unexpected error: %v", err)
+	}
+	original := []byte(`"bootstrapOpenedAt":"` + validT8Evidence().ObservedAt.Format(time.RFC3339Nano) + `"`)
+	replacement := []byte(`"bootstrapOpenedAt":"` + validHarnessStateSeed().ApprovalValidUntil.Format(time.RFC3339Nano) + `"`)
+	if !bytes.Contains(wire.State, original) {
+		t.Fatal("canonical state omitted the bootstrap-open timestamp")
+	}
+	wire.State = bytes.Replace(wire.State, original, replacement, 1)
+	digest := sha256.Sum256(wire.State)
+	wire.IntegritySHA256 = hex.EncodeToString(digest[:])
+	forged, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("json.Marshal(wire) unexpected error: %v", err)
+	}
+	if _, err := isolation.ParseHarnessStateV1(forged); !errors.Is(err, isolation.ErrInvalidHarnessState) {
+		t.Fatalf("ParseHarnessStateV1(forged approval) error = %v; want ErrInvalidHarnessState", err)
 	}
 }
 
@@ -212,6 +290,16 @@ func validHarnessStateSeed() isolation.HarnessStateSeed {
 func validT8Evidence() isolation.T8Evidence {
 	observedAt := time.Date(2026, 9, 6, 11, 0, 0, 0, time.UTC)
 	return isolation.T8Evidence{Revision: strings.Repeat("7", 64), ObservedAt: observedAt, ValidUntil: observedAt.Add(30 * time.Minute)}
+}
+
+func validT8BoundaryNow() time.Time {
+	return validT8Evidence().ObservedAt.Add(time.Minute)
+}
+
+func validDriftEvidence() isolation.HarnessDriftEvidence {
+	return isolation.HarnessDriftEvidence{
+		Revision: strings.Repeat("8", 64), DetectedAt: validT8Evidence().ObservedAt.Add(5 * time.Minute),
+	}
 }
 
 func cloneJSONDocument(t *testing.T, source map[string]any) map[string]any {

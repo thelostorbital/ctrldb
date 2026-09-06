@@ -229,6 +229,7 @@ type ResourceIdentity struct {
 	Kind         ResourceKind
 	Scope        ResourceScope
 	Location     string
+	ParentName   string
 	Name         string
 	CanonicalKey string
 }
@@ -283,7 +284,16 @@ func CanonicalTargetKey(identity ResourceIdentity) (string, error) {
 	if identity.Service == ComputeServiceName && !computeResourceNamePattern.MatchString(identity.Name) {
 		return "", guardError(ErrInvalidGuardInput, "target.identity.name", "must be a 1-63 character RFC 1035 Compute resource name")
 	}
-	return "ctrldb-target-key:v1|" + identity.Project + "|" + string(identity.Service) + "|" + scopePath + "|" + string(identity.Kind) + "|" + identity.Name, nil
+	parentPath := ""
+	if identity.Service == ComputeServiceName && identity.Kind == ComputeRouterNATKind {
+		if !computeResourceNamePattern.MatchString(identity.ParentName) {
+			return "", guardError(ErrInvalidGuardInput, "target.identity.parentName", "must identify the parent Compute router")
+		}
+		parentPath = "|parent=" + identity.ParentName
+	} else if identity.ParentName != "" {
+		return "", guardError(ErrInvalidGuardInput, "target.identity.parentName", "is only supported for nested router NAT resources")
+	}
+	return "ctrldb-target-key:v1|" + identity.Project + "|" + string(identity.Service) + "|" + scopePath + parentPath + "|" + string(identity.Kind) + "|" + identity.Name, nil
 }
 
 // SelectRunMutationTargets validates and returns a detached, deterministically

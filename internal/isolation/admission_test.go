@@ -66,7 +66,7 @@ func TestOpenHarnessRequiresFreshExactUsableT8ForTests(t *testing.T) {
 	t.Parallel()
 
 	pending := validPendingHarnessState(t)
-	open, err := pending.OpenAfterT8(validT8Evidence())
+	open, err := pending.OpenAfterT8(validT8Evidence(), validT8BoundaryNow())
 	if err != nil {
 		t.Fatalf("OpenAfterT8() unexpected error: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestOpenHarnessRequiresFreshExactUsableT8ForTests(t *testing.T) {
 		})
 	}
 
-	drifted, err := open.MarkTestsUnusable()
+	drifted, err := open.MarkTestsUnusable(validDriftEvidence())
 	if err != nil {
 		t.Fatalf("MarkTestsUnusable() unexpected error: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestHarnessAdmissionRejectsMalformedAndUnknownRequests(t *testing.T) {
 	if err := isolation.AdmitHarnessAction(state, request); !errors.Is(err, isolation.ErrHarnessAdmissionDenied) {
 		t.Fatalf("non-UTC request error = %v; want ErrHarnessAdmissionDenied", err)
 	}
-	open, _ := state.OpenAfterT8(validT8Evidence())
+	open, _ := state.OpenAfterT8(validT8Evidence(), validT8BoundaryNow())
 	unknown := validOpenTestAdmission(open)
 	unknown.Action = "unknown"
 	if err := isolation.AdmitHarnessAction(open, unknown); !errors.Is(err, isolation.ErrHarnessAdmissionDenied) {

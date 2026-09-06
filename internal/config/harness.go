@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -22,7 +23,12 @@ const (
 	microsPerUSD   = int64(1_000_000)
 )
 
-var ErrInvalidHarnessConfiguration = errors.New("invalid test harness configuration")
+var (
+	ErrInvalidHarnessConfiguration   = errors.New("invalid test harness configuration")
+	workloadIdentityPrincipalPattern = regexp.MustCompile(
+		`^(?:principal://iam\.googleapis\.com/projects/[1-9][0-9]*/locations/global/workloadIdentityPools/[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?/subject/[A-Za-z0-9][A-Za-z0-9._:@/-]*|principalSet://iam\.googleapis\.com/projects/[1-9][0-9]*/locations/global/workloadIdentityPools/[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?/attribute\.repository/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$`,
+	)
+)
 
 // HarnessConfiguration is an immutable, non-secret projection of the fields
 // needed to plan WF-TEST-01. It can only be built after the complete manifest
@@ -50,6 +56,7 @@ type HarnessConfiguration struct {
 	wipeRunJob         string
 	wipeServiceAccount string
 	imageDigest        string
+	reconcilerEnabled  bool
 	caps               HarnessCaps
 }
 
@@ -82,6 +89,7 @@ type harnessManifestWire struct {
 			AuditBucket string `json:"auditBucket"`
 		} `json:"control"`
 		Reconciler struct {
+			Enabled        bool   `json:"enabled"`
 			SchedulerJob   string `json:"schedulerJob"`
 			RunJob         string `json:"runJob"`
 			ServiceAccount string `json:"serviceAccount"`
@@ -159,6 +167,12 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 	if wire.Spec.TestIsolation.Caps.MaxDiskGiB <= 0 || wire.Spec.TestIsolation.Caps.MaxInstances <= 0 {
 		return HarnessConfiguration{}, fmt.Errorf("%w: invalid numeric caps", ErrInvalidHarnessConfiguration)
 	}
+	if !workloadIdentityPrincipalPattern.MatchString(wire.Spec.TestIsolation.CIPrincipal) {
+		return HarnessConfiguration{}, fmt.Errorf("%w: CI principal must identify one canonical workload identity subject or repository", ErrInvalidHarnessConfiguration)
+	}
+	if !wire.Spec.Reconciler.Enabled {
+		return HarnessConfiguration{}, fmt.Errorf("%w: disposable harness requires the wipe reconciler", ErrInvalidHarnessConfiguration)
+	}
 
 	hash := sha256.Sum256(document.JSON())
 	return HarnessConfiguration{
@@ -174,6 +188,7 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 		cidr: wire.Spec.TestIsolation.Network.CIDR, router: TestRouterName, nat: wire.Spec.TestIsolation.Network.NAT,
 		wipeSchedulerJob: wire.Spec.Reconciler.SchedulerJob, wipeRunJob: wire.Spec.Reconciler.RunJob,
 		wipeServiceAccount: wire.Spec.Reconciler.ServiceAccount, imageDigest: wire.Spec.Reconciler.ImageDigest,
+		reconcilerEnabled: wire.Spec.Reconciler.Enabled,
 		caps: HarnessCaps{
 			maxMachineType: wire.Spec.TestIsolation.Caps.MaxMachineType,
 			maxDiskGiB:     wire.Spec.TestIsolation.Caps.MaxDiskGiB,
@@ -245,7 +260,10 @@ func (configuration HarnessConfiguration) WipeServiceAccount() string {
 	return configuration.wipeServiceAccount
 }
 func (configuration HarnessConfiguration) ImageDigest() string { return configuration.imageDigest }
-func (configuration HarnessConfiguration) Caps() HarnessCaps   { return configuration.caps }
+func (configuration HarnessConfiguration) ReconcilerEnabled() bool {
+	return configuration.reconcilerEnabled
+}
+func (configuration HarnessConfiguration) Caps() HarnessCaps { return configuration.caps }
 
 func (caps HarnessCaps) MaxMachineType() string        { return caps.maxMachineType }
 func (caps HarnessCaps) MaxDiskGiB() int64             { return caps.maxDiskGiB }

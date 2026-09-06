@@ -33,7 +33,7 @@ func TestHarnessConfigurationFromManifestPreservesExplicitValues(t *testing.T) {
 		"operator":       {configuration.OperatorPrincipal(), "ctrldb-test-operator@example-project.iam.gserviceaccount.com"},
 		"destructive":    {configuration.DestructivePrincipal(), "ctrldb-test-destructive@example-project.iam.gserviceaccount.com"},
 		"vm":             {configuration.VMPrincipal(), "ctrldb-test-vm@example-project.iam.gserviceaccount.com"},
-		"ci":             {configuration.CIPrincipal(), "principalSet://example-ci"},
+		"ci":             {configuration.CIPrincipal(), "principalSet://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/example-pool/attribute.repository/example-org/ctrldb"},
 		"vpc":            {configuration.VPC(), "ctrldb-test-vpc"},
 		"subnet":         {configuration.Subnet(), "ctrldb-test-subnet"},
 		"cidr":           {configuration.CIDR(), "10.40.0.0/24"},
@@ -55,6 +55,9 @@ func TestHarnessConfigurationFromManifestPreservesExplicitValues(t *testing.T) {
 	}
 	if configuration.ManifestHash() == "" {
 		t.Fatal("ManifestHash() is empty")
+	}
+	if !configuration.ReconcilerEnabled() {
+		t.Fatal("ReconcilerEnabled() = false; disposable harness requires the wipe reconciler")
 	}
 	if got := configuration.Caps().MaxDiskGiB(); got != 100 {
 		t.Errorf("MaxDiskGiB() = %d; want 100", got)
@@ -129,6 +132,15 @@ func TestHarnessConfigurationRequiresCompleteValidation(t *testing.T) {
 		{name: "policy invalid", mutate: func(t *testing.T, manifest map[string]any) {
 			nestedMap(t, manifest, "spec", "testIsolation", "network")["cidr"] = "10.30.0.0/25"
 		}},
+		{name: "public CI principal", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "testIsolation")["ciPrincipal"] = "allUsers"
+		}},
+		{name: "unscoped CI principal", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "testIsolation")["ciPrincipal"] = "principalSet://example-ci"
+		}},
+		{name: "disabled wipe reconciler", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "reconciler")["enabled"] = false
+		}},
 	}
 	for _, test := range tests {
 		test := test
@@ -160,5 +172,6 @@ func validHarnessManifest(t *testing.T) map[string]any {
 	reconciler["schedulerJob"] = "ctrldb-test-wipe-schedule"
 	reconciler["runJob"] = "ctrldb-test-wipe"
 	reconciler["serviceAccount"] = "ctrldb-test-wipe@example-project.iam.gserviceaccount.com"
+	nestedMap(t, manifest, "spec", "testIsolation")["ciPrincipal"] = "principalSet://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/example-pool/attribute.repository/example-org/ctrldb"
 	return manifest
 }

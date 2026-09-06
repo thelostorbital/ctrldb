@@ -123,82 +123,104 @@ type PermanentOwnershipRecordV1 struct {
 	DescriptionFingerprint  string
 }
 
-// PermanentSingletonObservation is a complete provider observation supplied
-// by the future typed discovery adapter.
+// PermanentSingletonExpectation is the independently trusted identity and
+// complete desired state derived from HarnessConfiguration and the sealed
+// plan. It contains no provider-sourced identity.
+type PermanentSingletonExpectation struct {
+	Identity                ResourceIdentity
+	DesiredStateFingerprint string
+	DescriptionFingerprint  string
+}
+
+// PermanentSingletonObservation is a complete, bounded provider observation
+// supplied by the future typed discovery adapter.
 type PermanentSingletonObservation struct {
 	Identity                ResourceIdentity
 	ProviderID              string
 	DesiredStateFingerprint string
 	DescriptionFingerprint  string
+	Revision                string
+	ObservedAt              time.Time
+	ValidUntil              time.Time
 }
 
-// PermanentSingletonProof binds desired identity, complete observed state,
-// and the matching durable ownership record. It deliberately has no age or
-// expiry field: permanent singletons are never wipe candidates.
+// PermanentSingletonProof binds desired identity, a fresh complete provider
+// observation, and the matching durable ownership record. Observation expiry
+// proves mutation-boundary freshness only; permanent singletons are never
+// age-wipe candidates.
 type PermanentSingletonProof struct {
-	ProjectID        string
-	ExpectedIdentity ResourceIdentity
-	Desired          PermanentSingletonObservation
-	Observed         PermanentSingletonObservation
-	Record           PermanentOwnershipRecordV1
+	ProjectID string
+	Expected  PermanentSingletonExpectation
+	Observed  PermanentSingletonObservation
+	Record    PermanentOwnershipRecordV1
 }
 
 // ValidatePermanentSingletonOwnership rejects adoption by name alone and any
 // cross-project, partial, unknown-kind, state, description, or record drift.
-func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof) error {
+func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof, now time.Time) error {
 	if !projectIDPattern.MatchString(proof.ProjectID) {
 		return guardError(ErrInvalidOwnershipProof, "projectID", "must be an explicit canonical project")
 	}
-	if err := validateResourceIdentity(proof.ExpectedIdentity); err != nil ||
-		proof.ExpectedIdentity.Project != proof.ProjectID || !supportedPermanentSingletonIdentity(proof.ExpectedIdentity) {
-		return guardError(ErrInvalidOwnershipProof, "expectedIdentity", "is not an independently trusted harness singleton identity")
+	if now.IsZero() {
+		return guardError(ErrInvalidOwnershipProof, "now", "must be an explicit mutation-boundary time")
 	}
-	for _, entry := range []struct {
-		path  string
-		value PermanentSingletonObservation
-	}{{path: "desired", value: proof.Desired}, {path: "observed", value: proof.Observed}} {
-		path, value := entry.path, entry.value
-		if err := validatePermanentSingletonObservation(path, value); err != nil {
-			return err
-		}
-		if value.Identity.Project != proof.ProjectID {
-			return guardError(ErrInvalidOwnershipProof, path+".identity.project", "does not match the configured project")
-		}
+	if _, offset := now.Zone(); offset != 0 {
+		return guardError(ErrInvalidOwnershipProof, "now", "must use UTC")
 	}
-	if proof.Desired.Identity != proof.ExpectedIdentity {
-		return guardError(ErrInvalidOwnershipProof, "desired.identity", "does not match the independently trusted harness configuration")
+	if err := validatePermanentSingletonExpectation(proof.ProjectID, proof.Expected); err != nil {
+		return err
 	}
-	if proof.Desired != proof.Observed {
+	if err := validatePermanentSingletonObservation(proof.ProjectID, proof.Observed, now); err != nil {
+		return err
+	}
+	if proof.Observed.Identity != proof.Expected.Identity ||
+		proof.Observed.DesiredStateFingerprint != proof.Expected.DesiredStateFingerprint ||
+		proof.Observed.DescriptionFingerprint != proof.Expected.DescriptionFingerprint {
 		return guardError(ErrInvalidOwnershipProof, "observed", "does not equal the complete desired singleton state")
 	}
 	record := proof.Record
 	if record.SchemaVersion != OwnershipRecordSchemaV1 || !canonicalIDPattern.MatchString(record.RecordID) || record.RecordGeneration == 0 {
 		return guardError(ErrInvalidOwnershipProof, "record", "does not identify a supported durable record generation")
 	}
-	if record.Identity != proof.Desired.Identity || record.ProviderID != proof.Desired.ProviderID ||
-		record.DesiredStateFingerprint != proof.Desired.DesiredStateFingerprint ||
-		record.DescriptionFingerprint != proof.Desired.DescriptionFingerprint {
+	if record.Identity != proof.Expected.Identity || record.ProviderID != proof.Observed.ProviderID ||
+		record.DesiredStateFingerprint != proof.Expected.DesiredStateFingerprint ||
+		record.DescriptionFingerprint != proof.Expected.DescriptionFingerprint {
 		return guardError(ErrInvalidOwnershipProof, "record", "does not match the desired singleton")
 	}
 	return nil
 }
 
-func validatePermanentSingletonObservation(path string, value PermanentSingletonObservation) error {
-	if err := validateResourceIdentity(value.Identity); err != nil {
-		return guardError(ErrInvalidOwnershipProof, path+".identity", "is incomplete")
+func validatePermanentSingletonExpectation(projectID string, value PermanentSingletonExpectation) error {
+	if err := validateResourceIdentity(value.Identity); err != nil || value.Identity.Project != projectID ||
+		!supportedPermanentSingletonIdentity(value.Identity) {
+		return guardError(ErrInvalidOwnershipProof, "expected.identity", "is not an independently trusted harness singleton identity")
 	}
-	if !supportedPermanentSingletonIdentity(value.Identity) {
-		return guardError(ErrInvalidOwnershipProof, path+".identity", "uses an unsupported permanent singleton kind")
+	return validatePermanentSingletonFingerprints("expected", value.Identity, value.DesiredStateFingerprint, value.DescriptionFingerprint)
+}
+
+func validatePermanentSingletonObservation(projectID string, value PermanentSingletonObservation, now time.Time) error {
+	if err := validateResourceIdentity(value.Identity); err != nil || value.Identity.Project != projectID ||
+		!supportedPermanentSingletonIdentity(value.Identity) {
+		return guardError(ErrInvalidOwnershipProof, "observed.identity", "is not the expected project singleton identity")
 	}
-	if value.ProviderID == "" || strings.TrimSpace(value.ProviderID) != value.ProviderID ||
-		!isSHA256Fingerprint(value.DesiredStateFingerprint) {
-		return guardError(ErrInvalidOwnershipProof, path, "requires provider ID and a complete state fingerprint")
+	if value.ProviderID == "" || strings.TrimSpace(value.ProviderID) != value.ProviderID || !isSHA256Fingerprint(value.Revision) {
+		return guardError(ErrInvalidOwnershipProof, "observed", "requires provider ID and an exhaustive observation revision")
 	}
-	if permanentSingletonSupportsDescription(value.Identity) {
-		if !isSHA256Fingerprint(value.DescriptionFingerprint) {
-			return guardError(ErrInvalidOwnershipProof, path+".descriptionFingerprint", "is required for this provider kind")
-		}
-	} else if value.DescriptionFingerprint != "" {
+	if err := validateUTCWindow(value.ObservedAt, value.ValidUntil, MaxPreMutationProofLifetime); err != nil ||
+		now.Before(value.ObservedAt) || !now.Before(value.ValidUntil) {
+		return guardError(ErrInvalidOwnershipProof, "observed", "is not a fresh bounded provider observation")
+	}
+	return validatePermanentSingletonFingerprints("observed", value.Identity, value.DesiredStateFingerprint, value.DescriptionFingerprint)
+}
+
+func validatePermanentSingletonFingerprints(path string, identity ResourceIdentity, state, description string) error {
+	if !isSHA256Fingerprint(state) {
+		return guardError(ErrInvalidOwnershipProof, path+".desiredStateFingerprint", "must bind complete desired state")
+	}
+	if permanentSingletonSupportsDescription(identity) && !isSHA256Fingerprint(description) {
+		return guardError(ErrInvalidOwnershipProof, path+".descriptionFingerprint", "is required for this provider kind")
+	}
+	if !permanentSingletonSupportsDescription(identity) && description != "" {
 		return guardError(ErrInvalidOwnershipProof, path+".descriptionFingerprint", "must be absent for this provider kind")
 	}
 	return nil

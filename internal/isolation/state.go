@@ -73,25 +73,28 @@ type HarnessStateSeed struct {
 }
 
 type harnessStatePayloadV1 struct {
-	ProjectID               string                      `json:"projectId"`
-	Environment             string                      `json:"environment"`
-	EnvironmentClass        string                      `json:"environmentClass"`
-	ManifestHash            string                      `json:"manifestHash"`
-	ApprovedPlan            PlanIdentity                `json:"approvedPlan"`
-	OperationID             string                      `json:"operationId"`
-	BootstrapEnvelopeHash   string                      `json:"bootstrapEnvelopeHash"`
-	ControlRecordGeneration uint64                      `json:"controlRecordGeneration"`
-	Resources               HarnessResourceFingerprints `json:"resources"`
-	CleanupCapabilities     []CleanupCapability         `json:"cleanupCapabilities"`
-	BootstrapSteps          []string                    `json:"bootstrapSteps"`
-	RollbackSteps           []string                    `json:"rollbackSteps"`
-	ApprovedAt              time.Time                   `json:"approvedAt"`
-	ApprovalValidUntil      time.Time                   `json:"approvalValidUntil"`
-	BootstrapPhase          BootstrapPhase              `json:"bootstrapPhase"`
-	TestUsability           TestUsability               `json:"testUsability"`
-	T8ObservationRevision   string                      `json:"t8ObservationRevision,omitempty"`
-	T8ObservedAt            *time.Time                  `json:"t8ObservedAt,omitempty"`
-	T8ValidUntil            *time.Time                  `json:"t8ValidUntil,omitempty"`
+	ProjectID                string                      `json:"projectId"`
+	Environment              string                      `json:"environment"`
+	EnvironmentClass         string                      `json:"environmentClass"`
+	ManifestHash             string                      `json:"manifestHash"`
+	ApprovedPlan             PlanIdentity                `json:"approvedPlan"`
+	OperationID              string                      `json:"operationId"`
+	BootstrapEnvelopeHash    string                      `json:"bootstrapEnvelopeHash"`
+	ControlRecordGeneration  uint64                      `json:"controlRecordGeneration"`
+	Resources                HarnessResourceFingerprints `json:"resources"`
+	CleanupCapabilities      []CleanupCapability         `json:"cleanupCapabilities"`
+	BootstrapSteps           []string                    `json:"bootstrapSteps"`
+	RollbackSteps            []string                    `json:"rollbackSteps"`
+	ApprovedAt               time.Time                   `json:"approvedAt"`
+	ApprovalValidUntil       time.Time                   `json:"approvalValidUntil"`
+	BootstrapPhase           BootstrapPhase              `json:"bootstrapPhase"`
+	BootstrapOpenedAt        *time.Time                  `json:"bootstrapOpenedAt,omitempty"`
+	TestUsability            TestUsability               `json:"testUsability"`
+	T8ObservationRevision    string                      `json:"t8ObservationRevision,omitempty"`
+	T8ObservedAt             *time.Time                  `json:"t8ObservedAt,omitempty"`
+	T8ValidUntil             *time.Time                  `json:"t8ValidUntil,omitempty"`
+	DriftObservationRevision string                      `json:"driftObservationRevision,omitempty"`
+	DriftDetectedAt          *time.Time                  `json:"driftDetectedAt,omitempty"`
 }
 
 type harnessStateWireV1 struct {
@@ -135,7 +138,7 @@ type T8Evidence struct {
 
 // OpenAfterT8 performs the one-way bootstrap transition after a complete T8
 // success. It cannot reopen or extend an already-open state.
-func (state HarnessStateV1) OpenAfterT8(evidence T8Evidence) (HarnessStateV1, error) {
+func (state HarnessStateV1) OpenAfterT8(evidence T8Evidence, now time.Time) (HarnessStateV1, error) {
 	if err := state.validate(); err != nil {
 		return HarnessStateV1{}, err
 	}
@@ -145,11 +148,16 @@ func (state HarnessStateV1) OpenAfterT8(evidence T8Evidence) (HarnessStateV1, er
 	if err := validateT8Evidence(evidence); err != nil {
 		return HarnessStateV1{}, err
 	}
-	if evidence.ObservedAt.Before(state.payload.ApprovedAt) || evidence.ObservedAt.After(state.payload.ApprovalValidUntil) {
+	if !isFreshAt(evidence.ObservedAt, evidence.ValidUntil, now) {
+		return HarnessStateV1{}, guardError(ErrHarnessStateStale, "now", "does not fall within the fresh T8 evidence window")
+	}
+	if now.Before(state.payload.ApprovedAt) || !now.Before(state.payload.ApprovalValidUntil) ||
+		evidence.ObservedAt.Before(state.payload.ApprovedAt) || !evidence.ObservedAt.Before(state.payload.ApprovalValidUntil) {
 		return HarnessStateV1{}, guardError(ErrHarnessStateStale, "t8ObservedAt", "is outside the approved bootstrap window")
 	}
 	payload := cloneHarnessPayload(state.payload)
 	payload.BootstrapPhase = BootstrapPhaseOpen
+	payload.BootstrapOpenedAt = timePointer(evidence.ObservedAt)
 	payload.TestUsability = TestUsabilityUsable
 	payload.T8ObservationRevision = evidence.Revision
 	payload.T8ObservedAt = timePointer(evidence.ObservedAt)
@@ -157,23 +165,39 @@ func (state HarnessStateV1) OpenAfterT8(evidence T8Evidence) (HarnessStateV1, er
 	return sealHarnessState(payload)
 }
 
+// HarnessDriftEvidence records the exact observation which invalidated the
+// last usable T8 result.
+type HarnessDriftEvidence struct {
+	Revision   string
+	DetectedAt time.Time
+}
+
 // MarkTestsUnusable records drift without returning the harness to the global
-// pending phase. Repair and a new T8 can restore usability separately.
-func (state HarnessStateV1) MarkTestsUnusable() (HarnessStateV1, error) {
+// pending phase. Repair and a strictly newer T8 can restore usability.
+func (state HarnessStateV1) MarkTestsUnusable(drift HarnessDriftEvidence) (HarnessStateV1, error) {
 	if err := state.validate(); err != nil {
 		return HarnessStateV1{}, err
 	}
-	if state.payload.BootstrapPhase != BootstrapPhaseOpen {
-		return HarnessStateV1{}, guardError(ErrHarnessStateMismatch, "bootstrapPhase", "has not completed its first T8")
+	if state.payload.BootstrapPhase != BootstrapPhaseOpen || state.payload.TestUsability != TestUsabilityUsable {
+		return HarnessStateV1{}, guardError(ErrHarnessStateMismatch, "bootstrapPhase", "is not currently open and usable")
+	}
+	if !isSHA256Fingerprint(drift.Revision) || drift.DetectedAt.IsZero() || state.payload.T8ObservedAt == nil ||
+		!drift.DetectedAt.After(*state.payload.T8ObservedAt) {
+		return HarnessStateV1{}, guardError(ErrInvalidHarnessState, "drift", "must bind a complete observation strictly newer than T8")
+	}
+	if _, offset := drift.DetectedAt.Zone(); offset != 0 {
+		return HarnessStateV1{}, guardError(ErrInvalidHarnessState, "drift.detectedAt", "must use UTC")
 	}
 	payload := cloneHarnessPayload(state.payload)
 	payload.TestUsability = TestUsabilityUnusable
+	payload.DriftObservationRevision = drift.Revision
+	payload.DriftDetectedAt = timePointer(drift.DetectedAt)
 	return sealHarnessState(payload)
 }
 
 // RestoreTestsUsable accepts a new complete T8 while preserving Open. It does
 // not change the original approved bootstrap binding.
-func (state HarnessStateV1) RestoreTestsUsable(evidence T8Evidence) (HarnessStateV1, error) {
+func (state HarnessStateV1) RestoreTestsUsable(evidence T8Evidence, now time.Time) (HarnessStateV1, error) {
 	if err := state.validate(); err != nil {
 		return HarnessStateV1{}, err
 	}
@@ -183,15 +207,20 @@ func (state HarnessStateV1) RestoreTestsUsable(evidence T8Evidence) (HarnessStat
 	if err := validateT8Evidence(evidence); err != nil {
 		return HarnessStateV1{}, err
 	}
-	if evidence.ObservedAt.Before(state.payload.ApprovedAt) ||
-		(state.payload.T8ObservedAt != nil && evidence.ObservedAt.Before(*state.payload.T8ObservedAt)) {
-		return HarnessStateV1{}, guardError(ErrHarnessStateStale, "t8ObservedAt", "moves the observation clock backward")
+	if !isFreshAt(evidence.ObservedAt, evidence.ValidUntil, now) {
+		return HarnessStateV1{}, guardError(ErrHarnessStateStale, "now", "does not fall within the replacement T8 evidence window")
+	}
+	if state.payload.TestUsability != TestUsabilityUnusable || state.payload.DriftDetectedAt == nil ||
+		!evidence.ObservedAt.After(*state.payload.DriftDetectedAt) {
+		return HarnessStateV1{}, guardError(ErrHarnessStateStale, "t8ObservedAt", "is not strictly newer than the drift observation")
 	}
 	payload := cloneHarnessPayload(state.payload)
 	payload.TestUsability = TestUsabilityUsable
 	payload.T8ObservationRevision = evidence.Revision
 	payload.T8ObservedAt = timePointer(evidence.ObservedAt)
 	payload.T8ValidUntil = timePointer(evidence.ValidUntil)
+	payload.DriftObservationRevision = ""
+	payload.DriftDetectedAt = nil
 	return sealHarnessState(payload)
 }
 
@@ -297,7 +326,8 @@ func (state HarnessStateV1) validatePayload() error {
 	switch payload.BootstrapPhase {
 	case BootstrapPhasePending:
 		if payload.TestUsability != TestUsabilityUnusable || payload.T8ObservationRevision != "" ||
-			payload.T8ObservedAt != nil || payload.T8ValidUntil != nil {
+			payload.BootstrapOpenedAt != nil || payload.T8ObservedAt != nil || payload.T8ValidUntil != nil || payload.DriftObservationRevision != "" ||
+			payload.DriftDetectedAt != nil {
 			return guardError(ErrInvalidHarnessState, "bootstrapPhase", "pending state cannot contain usable T8 evidence")
 		}
 	case BootstrapPhaseOpen:
@@ -307,6 +337,24 @@ func (state HarnessStateV1) validatePayload() error {
 		if payload.T8ObservedAt == nil || payload.T8ValidUntil == nil ||
 			validateT8Evidence(T8Evidence{payload.T8ObservationRevision, *payload.T8ObservedAt, *payload.T8ValidUntil}) != nil {
 			return guardError(ErrInvalidHarnessState, "t8", "does not contain complete evidence")
+		}
+		if payload.BootstrapOpenedAt == nil || payload.BootstrapOpenedAt.Before(payload.ApprovedAt) ||
+			!payload.BootstrapOpenedAt.Before(payload.ApprovalValidUntil) ||
+			payload.T8ObservedAt.Before(*payload.BootstrapOpenedAt) {
+			return guardError(ErrInvalidHarnessState, "bootstrapOpenedAt", "falls outside the approved bootstrap window")
+		}
+		if _, offset := payload.BootstrapOpenedAt.Zone(); offset != 0 {
+			return guardError(ErrInvalidHarnessState, "bootstrapOpenedAt", "must use UTC")
+		}
+		if payload.TestUsability == TestUsabilityUsable {
+			if payload.DriftObservationRevision != "" || payload.DriftDetectedAt != nil {
+				return guardError(ErrInvalidHarnessState, "drift", "usable state cannot retain a drift boundary")
+			}
+		} else if !isSHA256Fingerprint(payload.DriftObservationRevision) || payload.DriftDetectedAt == nil ||
+			!payload.DriftDetectedAt.After(*payload.T8ObservedAt) {
+			return guardError(ErrInvalidHarnessState, "drift", "unusable state requires a drift observation strictly newer than T8")
+		} else if _, offset := payload.DriftDetectedAt.Zone(); offset != 0 {
+			return guardError(ErrInvalidHarnessState, "drift.detectedAt", "must use UTC")
 		}
 	default:
 		return guardError(ErrInvalidHarnessState, "bootstrapPhase", "is unknown")
@@ -352,6 +400,16 @@ func validateUTCWindow(start, end time.Time, maximum time.Duration) error {
 	return nil
 }
 
+func isFreshAt(observedAt, validUntil, now time.Time) bool {
+	if now.IsZero() {
+		return false
+	}
+	if _, offset := now.Zone(); offset != 0 {
+		return false
+	}
+	return !now.Before(observedAt) && now.Before(validUntil)
+}
+
 func harnessPayloadFingerprint(payload harnessStatePayloadV1) (string, error) {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -368,8 +426,14 @@ func cloneHarnessPayload(payload harnessStatePayloadV1) harnessStatePayloadV1 {
 	if payload.T8ObservedAt != nil {
 		payload.T8ObservedAt = timePointer(*payload.T8ObservedAt)
 	}
+	if payload.BootstrapOpenedAt != nil {
+		payload.BootstrapOpenedAt = timePointer(*payload.BootstrapOpenedAt)
+	}
 	if payload.T8ValidUntil != nil {
 		payload.T8ValidUntil = timePointer(*payload.T8ValidUntil)
+	}
+	if payload.DriftDetectedAt != nil {
+		payload.DriftDetectedAt = timePointer(*payload.DriftDetectedAt)
 	}
 	return payload
 }

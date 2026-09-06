@@ -92,7 +92,7 @@ func TestPermanentSingletonOwnershipRequiresExactStateAndDurableRecord(t *testin
 	t.Parallel()
 
 	proof := validPermanentSingletonProof()
-	if err := isolation.ValidatePermanentSingletonOwnership(proof); err != nil {
+	if err := isolation.ValidatePermanentSingletonOwnership(proof, permanentOwnershipNow()); err != nil {
 		t.Fatalf("ValidatePermanentSingletonOwnership() unexpected error: %v", err)
 	}
 
@@ -115,12 +115,15 @@ func TestPermanentSingletonOwnershipRequiresExactStateAndDurableRecord(t *testin
 		{name: "record identity drift", mutate: func(value *isolation.PermanentSingletonProof) { value.Record.ProviderID = "other" }},
 		{name: "unknown kind", mutate: func(value *isolation.PermanentSingletonProof) {
 			identity := resourceIdentityForProject("ctrldb-test-widget", isolation.ResourceKind("widgets"), isolation.ResourceScopeGlobal, "global", "example-test-project")
-			value.ExpectedIdentity = identity
-			value.Desired.Identity, value.Observed.Identity, value.Record.Identity = identity, identity, identity
+			value.Expected.Identity, value.Observed.Identity, value.Record.Identity = identity, identity, identity
 		}},
 		{name: "trusted identity mismatch", mutate: func(value *isolation.PermanentSingletonProof) {
-			value.ExpectedIdentity = testResourceIdentity("ctrldb-test-other-vpc", isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
+			value.Expected.Identity = testResourceIdentity("ctrldb-test-other-vpc", isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
 		}},
+		{name: "stale observation", mutate: func(value *isolation.PermanentSingletonProof) {
+			value.Observed.ValidUntil = permanentOwnershipNow()
+		}},
+		{name: "missing observation revision", mutate: func(value *isolation.PermanentSingletonProof) { value.Observed.Revision = "" }},
 	}
 	for _, test := range tests {
 		test := test
@@ -128,7 +131,7 @@ func TestPermanentSingletonOwnershipRequiresExactStateAndDurableRecord(t *testin
 			t.Parallel()
 			value := validPermanentSingletonProof()
 			test.mutate(&value)
-			if err := isolation.ValidatePermanentSingletonOwnership(value); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
+			if err := isolation.ValidatePermanentSingletonOwnership(value, permanentOwnershipNow()); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
 				t.Fatalf("error = %v; want ErrInvalidOwnershipProof", err)
 			}
 		})
@@ -138,23 +141,62 @@ func TestPermanentSingletonOwnershipRequiresExactStateAndDurableRecord(t *testin
 func TestPermanentSingletonWithoutProviderDescriptionRequiresNoInventedFingerprint(t *testing.T) {
 	t.Parallel()
 
-	identity := testResourceIdentity("ctrldb-test-nat", isolation.ComputeRouterNATKind, isolation.ResourceScopeRegion, "us-central1")
+	identity := isolation.ResourceIdentity{
+		Project: "example-test-project", Service: isolation.ComputeServiceName,
+		Kind: isolation.ComputeRouterNATKind, Scope: isolation.ResourceScopeRegion,
+		Location: "us-central1", ParentName: "ctrldb-test-router", Name: "ctrldb-test-nat",
+	}
+	identity.CanonicalKey = mustCanonicalTargetKey(identity)
 	observation := isolation.PermanentSingletonObservation{
 		Identity: identity, ProviderID: "provider-id-nat", DesiredStateFingerprint: strings.Repeat("a", 64),
+		Revision: strings.Repeat("c", 64), ObservedAt: permanentOwnershipNow().Add(-time.Minute), ValidUntil: permanentOwnershipNow().Add(time.Minute),
 	}
 	proof := isolation.PermanentSingletonProof{
-		ProjectID: "example-test-project", ExpectedIdentity: identity, Desired: observation, Observed: observation,
+		ProjectID: "example-test-project",
+		Expected:  isolation.PermanentSingletonExpectation{Identity: identity, DesiredStateFingerprint: observation.DesiredStateFingerprint},
+		Observed:  observation,
 		Record: isolation.PermanentOwnershipRecordV1{
 			SchemaVersion: isolation.OwnershipRecordSchemaV1, RecordID: "ownership-test-nat", RecordGeneration: 1,
 			Identity: identity, ProviderID: observation.ProviderID, DesiredStateFingerprint: observation.DesiredStateFingerprint,
 		},
 	}
-	if err := isolation.ValidatePermanentSingletonOwnership(proof); err != nil {
+	if err := isolation.ValidatePermanentSingletonOwnership(proof, permanentOwnershipNow()); err != nil {
 		t.Fatalf("ValidatePermanentSingletonOwnership(NAT) unexpected error: %v", err)
 	}
 	proof.Observed.DescriptionFingerprint = strings.Repeat("b", 64)
-	if err := isolation.ValidatePermanentSingletonOwnership(proof); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
+	if err := isolation.ValidatePermanentSingletonOwnership(proof, permanentOwnershipNow()); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
 		t.Fatalf("invented NAT description error = %v; want ErrInvalidOwnershipProof", err)
+	}
+}
+
+func TestRouterNATIdentityRequiresAndBindsParentRouter(t *testing.T) {
+	t.Parallel()
+
+	base := isolation.ResourceIdentity{
+		Project: "example-test-project", Service: isolation.ComputeServiceName,
+		Kind: isolation.ComputeRouterNATKind, Scope: isolation.ResourceScopeRegion,
+		Location: "us-central1", ParentName: "ctrldb-test-router-a", Name: "ctrldb-test-nat",
+	}
+	first, err := isolation.CanonicalTargetKey(base)
+	if err != nil {
+		t.Fatalf("CanonicalTargetKey(first NAT) unexpected error: %v", err)
+	}
+	base.ParentName = "ctrldb-test-router-b"
+	second, err := isolation.CanonicalTargetKey(base)
+	if err != nil {
+		t.Fatalf("CanonicalTargetKey(second NAT) unexpected error: %v", err)
+	}
+	if first == second {
+		t.Fatal("NAT canonical identity omitted its parent router")
+	}
+	base.ParentName = ""
+	if _, err := isolation.CanonicalTargetKey(base); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("CanonicalTargetKey(parentless NAT) error = %v; want ErrInvalidGuardInput", err)
+	}
+	network := testResourceIdentity(isolation.TestVPCName, isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
+	network.ParentName = "ctrldb-test-router"
+	if _, err := isolation.CanonicalTargetKey(network); !errors.Is(err, isolation.ErrInvalidGuardInput) {
+		t.Fatalf("CanonicalTargetKey(parented network) error = %v; want ErrInvalidGuardInput", err)
 	}
 }
 
@@ -168,11 +210,10 @@ func TestRunScopedFirewallCannotBecomePermanentSingleton(t *testing.T) {
 		isolation.ResourceScopeGlobal,
 		"global",
 	)
-	proof.Desired.Identity = identity
 	proof.Observed.Identity = identity
 	proof.Record.Identity = identity
-	proof.ExpectedIdentity = identity
-	if err := isolation.ValidatePermanentSingletonOwnership(proof); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
+	proof.Expected.Identity = identity
+	if err := isolation.ValidatePermanentSingletonOwnership(proof, permanentOwnershipNow()); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
 		t.Fatalf("ValidatePermanentSingletonOwnership(run firewall) error = %v; want ErrInvalidOwnershipProof", err)
 	}
 }
@@ -183,22 +224,20 @@ func TestOnlyReservedHarnessFirewallsCanBePermanentSingletons(t *testing.T) {
 	for _, name := range []string{isolation.TestIAPSSHFirewallName, isolation.TestInternalFirewallName} {
 		proof := validPermanentSingletonProof()
 		identity := testResourceIdentity(name, isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global")
-		proof.Desired.Identity = identity
 		proof.Observed.Identity = identity
 		proof.Record.Identity = identity
-		proof.ExpectedIdentity = identity
-		if err := isolation.ValidatePermanentSingletonOwnership(proof); err != nil {
+		proof.Expected.Identity = identity
+		if err := isolation.ValidatePermanentSingletonOwnership(proof, permanentOwnershipNow()); err != nil {
 			t.Fatalf("ValidatePermanentSingletonOwnership(%q) unexpected error: %v", name, err)
 		}
 	}
 
 	proof := validPermanentSingletonProof()
 	identity := testResourceIdentity("ctrldb-test-other-firewall", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global")
-	proof.Desired.Identity = identity
 	proof.Observed.Identity = identity
 	proof.Record.Identity = identity
-	proof.ExpectedIdentity = identity
-	if err := isolation.ValidatePermanentSingletonOwnership(proof); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
+	proof.Expected.Identity = identity
+	if err := isolation.ValidatePermanentSingletonOwnership(proof, permanentOwnershipNow()); !errors.Is(err, isolation.ErrInvalidOwnershipProof) {
 		t.Fatalf("ValidatePermanentSingletonOwnership(unreserved firewall) error = %v; want ErrInvalidOwnershipProof", err)
 	}
 }
@@ -284,13 +323,22 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 
 func validPermanentSingletonProof() isolation.PermanentSingletonProof {
 	identity := testResourceIdentity(isolation.TestVPCName, isolation.ComputeNetworkKind, isolation.ResourceScopeGlobal, "global")
+	now := permanentOwnershipNow()
 	observation := isolation.PermanentSingletonObservation{
 		Identity: identity, ProviderID: "provider-id-1",
 		DesiredStateFingerprint: strings.Repeat("a", 64),
 		DescriptionFingerprint:  strings.Repeat("b", 64),
+		Revision:                strings.Repeat("c", 64),
+		ObservedAt:              now.Add(-time.Minute),
+		ValidUntil:              now.Add(time.Minute),
 	}
 	return isolation.PermanentSingletonProof{
-		ProjectID: "example-test-project", ExpectedIdentity: identity, Desired: observation, Observed: observation,
+		ProjectID: "example-test-project",
+		Expected: isolation.PermanentSingletonExpectation{
+			Identity: identity, DesiredStateFingerprint: observation.DesiredStateFingerprint,
+			DescriptionFingerprint: observation.DescriptionFingerprint,
+		},
+		Observed: observation,
 		Record: isolation.PermanentOwnershipRecordV1{
 			SchemaVersion: isolation.OwnershipRecordSchemaV1,
 			RecordID:      "ownership-test-vpc", RecordGeneration: 1,
@@ -299,6 +347,10 @@ func validPermanentSingletonProof() isolation.PermanentSingletonProof {
 			DescriptionFingerprint:  observation.DescriptionFingerprint,
 		},
 	}
+}
+
+func permanentOwnershipNow() time.Time {
+	return time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
 }
 
 func resourceIdentityForProject(name string, kind isolation.ResourceKind, scope isolation.ResourceScope, location, project string) isolation.ResourceIdentity {

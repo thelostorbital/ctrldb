@@ -40,6 +40,9 @@ type HarnessStateExpectation struct {
 	RollbackSteps           []string
 	ApprovedAt              time.Time
 	ApprovalValidUntil      time.Time
+	T8ObservationRevision   string
+	T8ObservedAt            time.Time
+	T8ValidUntil            time.Time
 }
 
 // HarnessAdmissionRequest asks only whether the TEST-ISO global blockade is
@@ -149,6 +152,19 @@ func validateHarnessExpectation(state HarnessStateV1, expected HarnessStateExpec
 	if err := ValidateCleanupCapabilities(expected.CleanupCapabilities); err != nil ||
 		!equalCleanupCapabilities(state.payload.CleanupCapabilities, expected.CleanupCapabilities) {
 		return guardError(ErrHarnessStateMismatch, "cleanupCapabilities", "does not match trusted policy")
+	}
+	if state.payload.BootstrapPhase == BootstrapPhasePending {
+		if expected.T8ObservationRevision != "" || !expected.T8ObservedAt.IsZero() || !expected.T8ValidUntil.IsZero() {
+			return guardError(ErrHarnessStateMismatch, "t8", "pending trusted state cannot contain T8 evidence")
+		}
+		return nil
+	}
+	if state.payload.T8ObservedAt == nil || state.payload.T8ValidUntil == nil ||
+		expected.T8ObservationRevision != state.payload.T8ObservationRevision ||
+		!expected.T8ObservedAt.Equal(*state.payload.T8ObservedAt) ||
+		!expected.T8ValidUntil.Equal(*state.payload.T8ValidUntil) ||
+		validateT8Evidence(T8Evidence{expected.T8ObservationRevision, expected.T8ObservedAt, expected.T8ValidUntil}) != nil {
+		return guardError(ErrHarnessStateMismatch, "t8", "does not match the trusted complete T8 observation")
 	}
 	return nil
 }

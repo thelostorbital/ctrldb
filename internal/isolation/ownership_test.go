@@ -160,7 +160,7 @@ func TestPermanentSingletonWithoutProviderDescriptionRequiresNoInventedFingerpri
 	proof := isolation.PermanentSingletonProof{
 		ProjectID: "example-test-project",
 		Expected:  isolation.PermanentSingletonExpectation{Identity: identity, DesiredStateFingerprint: observation.DesiredStateFingerprint},
-		ExpectedRecord: isolation.PermanentOwnershipRecordExpectation{
+		ExpectedRecord: isolation.OwnershipRecordExpectation{
 			RecordID: "ownership-test-nat", RecordGeneration: 1, Revision: strings.Repeat("d", 64),
 			ObservedAt: permanentOwnershipNow().Add(-time.Minute), ValidUntil: permanentOwnershipNow().Add(time.Minute),
 		},
@@ -269,7 +269,12 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 	}
 	target := isolation.RunFirewallCleanupTarget{
 		Identity:    testResourceIdentity("ctrldb-test-run1-iap-ssh", isolation.ComputeFirewallKind, isolation.ResourceScopeGlobal, "global"),
-		Description: description, RunLifetime: lifetime, ObservedAt: now,
+		Description: description, RunLifetime: lifetime,
+		ExpectedRecord: isolation.OwnershipRecordExpectation{
+			RecordID: lifetime.RecordID, RecordGeneration: lifetime.RecordGeneration, Revision: strings.Repeat("d", 64),
+			ObservedAt: now.Add(-time.Minute), ValidUntil: now.Add(time.Minute),
+		},
+		ObservedAt: now,
 	}
 	if err := isolation.ValidateRunFirewallCleanupTarget(validCleanupPolicy(), target, isolation.RunFirewallCleanupExpiredWipe, now, 3*time.Hour); err != nil {
 		t.Fatalf("ValidateRunFirewallCleanupTarget() unexpected error: %v", err)
@@ -296,6 +301,12 @@ func TestRunFirewallCleanupRequiresLifetimeDescriptionRecordAndExpiry(t *testing
 		}},
 		{name: "over lifetime cap", mutate: func(_ *isolation.RunFirewallCleanupTarget, _ *time.Time, maximum *time.Duration) {
 			*maximum = time.Hour
+		}},
+		{name: "superseded lifetime generation", mutate: func(value *isolation.RunFirewallCleanupTarget, _ *time.Time, _ *time.Duration) {
+			value.ExpectedRecord.RecordGeneration++
+		}},
+		{name: "stale lifetime record observation", mutate: func(value *isolation.RunFirewallCleanupTarget, _ *time.Time, _ *time.Duration) {
+			value.ExpectedRecord.ValidUntil = now
 		}},
 	}
 	for _, test := range tests {
@@ -348,7 +359,7 @@ func validPermanentSingletonProof() isolation.PermanentSingletonProof {
 			Identity: identity, DesiredStateFingerprint: observation.DesiredStateFingerprint,
 			DescriptionFingerprint: observation.DescriptionFingerprint,
 		},
-		ExpectedRecord: isolation.PermanentOwnershipRecordExpectation{
+		ExpectedRecord: isolation.OwnershipRecordExpectation{
 			RecordID: "ownership-test-vpc", RecordGeneration: 1, Revision: strings.Repeat("d", 64),
 			ObservedAt: now.Add(-time.Minute), ValidUntil: now.Add(time.Minute),
 		},

@@ -144,10 +144,9 @@ type PermanentSingletonObservation struct {
 	ValidUntil              time.Time
 }
 
-// PermanentOwnershipRecordExpectation is a fresh trusted control-store
-// observation of the exact ownership object generation current at the
-// mutation boundary.
-type PermanentOwnershipRecordExpectation struct {
+// OwnershipRecordExpectation is a fresh trusted control-store observation of
+// the exact ownership object generation current at the mutation boundary.
+type OwnershipRecordExpectation struct {
 	RecordID         string
 	RecordGeneration uint64
 	Revision         string
@@ -162,7 +161,7 @@ type PermanentOwnershipRecordExpectation struct {
 type PermanentSingletonProof struct {
 	ProjectID      string
 	Expected       PermanentSingletonExpectation
-	ExpectedRecord PermanentOwnershipRecordExpectation
+	ExpectedRecord OwnershipRecordExpectation
 	Observed       PermanentSingletonObservation
 	Record         PermanentOwnershipRecordV1
 }
@@ -185,7 +184,7 @@ func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof, now time
 	if err := validatePermanentSingletonObservation(proof.ProjectID, proof.Observed, now); err != nil {
 		return err
 	}
-	if err := validatePermanentOwnershipRecordExpectation(proof.ExpectedRecord, now); err != nil {
+	if err := validateOwnershipRecordExpectation(proof.ExpectedRecord, now); err != nil {
 		return err
 	}
 	if proof.Observed.Identity != proof.Expected.Identity ||
@@ -208,7 +207,7 @@ func ValidatePermanentSingletonOwnership(proof PermanentSingletonProof, now time
 	return nil
 }
 
-func validatePermanentOwnershipRecordExpectation(value PermanentOwnershipRecordExpectation, now time.Time) error {
+func validateOwnershipRecordExpectation(value OwnershipRecordExpectation, now time.Time) error {
 	if !canonicalIDPattern.MatchString(value.RecordID) || value.RecordGeneration == 0 || !isSHA256Fingerprint(value.Revision) {
 		return guardError(ErrInvalidOwnershipProof, "expectedRecord", "does not identify one exhaustive durable record observation")
 	}
@@ -292,10 +291,11 @@ func supportedPermanentSingletonIdentity(identity ResourceIdentity) bool {
 // RunFirewallCleanupTarget contains the non-label ownership evidence required
 // before a classic firewall may be selected by teardown or the nightly wipe.
 type RunFirewallCleanupTarget struct {
-	Identity    ResourceIdentity
-	Description string
-	RunLifetime RunLifetimeContract
-	ObservedAt  time.Time
+	Identity       ResourceIdentity
+	Description    string
+	RunLifetime    RunLifetimeContract
+	ExpectedRecord OwnershipRecordExpectation
+	ObservedAt     time.Time
 }
 
 // RunFirewallCleanupMode distinguishes an approved operation's immediate
@@ -337,6 +337,13 @@ func ValidateRunFirewallCleanupTarget(policy CleanupPolicy, target RunFirewallCl
 	description, _ := RunFirewallDescription(fingerprint)
 	if target.RunLifetime.ProjectID != policy.ProjectID {
 		return guardError(ErrInvalidOwnershipProof, "runLifetime.projectID", "does not match the cleanup project")
+	}
+	if err := validateOwnershipRecordExpectation(target.ExpectedRecord, now); err != nil {
+		return err
+	}
+	if target.ExpectedRecord.RecordID != target.RunLifetime.RecordID ||
+		target.ExpectedRecord.RecordGeneration != target.RunLifetime.RecordGeneration {
+		return guardError(ErrInvalidOwnershipProof, "expectedRecord", "does not match the current run lifetime record")
 	}
 	if target.Description != description {
 		return guardError(ErrInvalidOwnershipProof, "description", "does not match the durable lifetime record")

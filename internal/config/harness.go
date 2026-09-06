@@ -169,6 +169,9 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 	if wire.Spec.TestIsolation.Caps.MaxDiskGiB <= 0 || wire.Spec.TestIsolation.Caps.MaxInstances <= 0 {
 		return HarnessConfiguration{}, fmt.Errorf("%w: invalid numeric caps", ErrInvalidHarnessConfiguration)
 	}
+	if wire.Spec.TestIsolation.OperatorServiceAccount == wire.Spec.TestIsolation.DestructiveServiceAccount {
+		return HarnessConfiguration{}, fmt.Errorf("%w: test operator and destructive service accounts must be distinct", ErrInvalidHarnessConfiguration)
+	}
 	if !workloadIdentityPrincipalPattern.MatchString(wire.Spec.TestIsolation.CIPrincipal) {
 		return HarnessConfiguration{}, fmt.Errorf("%w: CI principal must identify one canonical workload identity subject or repository", ErrInvalidHarnessConfiguration)
 	}

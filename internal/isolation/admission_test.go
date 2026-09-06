@@ -107,13 +107,20 @@ func TestOpenHarnessRequiresFreshExactUsableT8ForTests(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*isolation.HarnessAdmissionRequest)
+		kind   error
 	}{
-		{name: "stale T8", mutate: func(value *isolation.HarnessAdmissionRequest) { value.Now = validT8Evidence().ValidUntil }},
+		{name: "stale T8", mutate: func(value *isolation.HarnessAdmissionRequest) { value.Now = validT8Evidence().ValidUntil }, kind: isolation.ErrHarnessAdmissionDenied},
 		{name: "future clock", mutate: func(value *isolation.HarnessAdmissionRequest) {
 			value.Now = validT8Evidence().ObservedAt.Add(-time.Second)
-		}},
-		{name: "wrong revision", mutate: func(value *isolation.HarnessAdmissionRequest) { value.T8ObservationRevision = strings.Repeat("f", 64) }},
-		{name: "missing revision", mutate: func(value *isolation.HarnessAdmissionRequest) { value.T8ObservationRevision = "" }},
+		}, kind: isolation.ErrHarnessAdmissionDenied},
+		{name: "wrong revision", mutate: func(value *isolation.HarnessAdmissionRequest) { value.T8ObservationRevision = strings.Repeat("f", 64) }, kind: isolation.ErrHarnessAdmissionDenied},
+		{name: "missing revision", mutate: func(value *isolation.HarnessAdmissionRequest) { value.T8ObservationRevision = "" }, kind: isolation.ErrHarnessAdmissionDenied},
+		{name: "trusted observation time drift", mutate: func(value *isolation.HarnessAdmissionRequest) {
+			value.Expected.T8ObservedAt = value.Expected.T8ObservedAt.Add(time.Minute)
+		}, kind: isolation.ErrHarnessStateMismatch},
+		{name: "trusted validity extension", mutate: func(value *isolation.HarnessAdmissionRequest) {
+			value.Expected.T8ValidUntil = value.Expected.T8ValidUntil.Add(time.Minute)
+		}, kind: isolation.ErrHarnessStateMismatch},
 	}
 	for _, test := range tests {
 		test := test
@@ -121,8 +128,8 @@ func TestOpenHarnessRequiresFreshExactUsableT8ForTests(t *testing.T) {
 			t.Parallel()
 			value := validOpenTestAdmission()
 			test.mutate(&value)
-			if err := isolation.AdmitHarnessAction(open, value); !errors.Is(err, isolation.ErrHarnessAdmissionDenied) {
-				t.Fatalf("AdmitHarnessAction() error = %v; want ErrHarnessAdmissionDenied", err)
+			if err := isolation.AdmitHarnessAction(open, value); !errors.Is(err, test.kind) {
+				t.Fatalf("AdmitHarnessAction() error = %v; want %v", err, test.kind)
 			}
 		})
 	}
@@ -175,10 +182,14 @@ func validPendingAdmission(state isolation.HarnessStateV1) isolation.HarnessAdmi
 
 func validOpenTestAdmission() isolation.HarnessAdmissionRequest {
 	evidence := validT8Evidence()
+	expected := validHarnessExpectation()
+	expected.T8ObservationRevision = evidence.Revision
+	expected.T8ObservedAt = evidence.ObservedAt
+	expected.T8ValidUntil = evidence.ValidUntil
 	return isolation.HarnessAdmissionRequest{
 		Action:                isolation.HarnessActionIntegrationTest,
 		T8ObservationRevision: evidence.Revision,
-		Expected:              validHarnessExpectation(), Now: evidence.ObservedAt.Add(time.Minute),
+		Expected:              expected, Now: evidence.ObservedAt.Add(time.Minute),
 	}
 }
 

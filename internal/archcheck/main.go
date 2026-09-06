@@ -514,6 +514,9 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 			})
 		}
 	}
+	if policy.allowProcessBoundary {
+		findings = append(findings, findProcessBoundarySelectorViolations(files, parsed)...)
+	}
 
 	uses := make(map[*ast.Ident]types.Object)
 	packageImporter := newArchitectureImporter(policy.allowSourceImporter)
@@ -615,6 +618,38 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 		return true
 	})
 	return findings, nil
+}
+
+func findProcessBoundarySelectorViolations(files *token.FileSet, parsed *ast.File) []finding {
+	allowed := map[string]struct{}{
+		"ESRCH":       {},
+		"Kill":        {},
+		"SIGKILL":     {},
+		"SysProcAttr": {},
+	}
+	var findings []finding
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		qualifier, ok := selector.X.(*ast.Ident)
+		if !ok || qualifier.Name != "syscall" {
+			return true
+		}
+		if _, approved := allowed[selector.Sel.Name]; approved {
+			return true
+		}
+		position := files.Position(selector.Sel.Pos())
+		findings = append(findings, finding{
+			filename: position.Filename,
+			line:     position.Line,
+			column:   position.Column,
+			message:  "the process boundary may use syscall only to configure and terminate its isolated process group",
+		})
+		return true
+	})
+	return findings
 }
 
 func calledFunction(expression ast.Expr, uses map[*ast.Ident]types.Object) (*types.Func, bool) {

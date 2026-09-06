@@ -79,6 +79,10 @@ func TestProcessBoundaryRejectsInvalidConstruction(t *testing.T) {
 	if err := os.WriteFile(nonExecutable, []byte("fixture"), 0o600); err != nil {
 		t.Fatalf("write non-executable fixture: %v", err)
 	}
+	launcherLink := filepath.Join(t.TempDir(), "gcloud")
+	if err := os.Symlink("/bin/sh", launcherLink); err != nil {
+		t.Fatalf("create forbidden launcher link: %v", err)
+	}
 
 	tests := []struct {
 		name        string
@@ -92,6 +96,7 @@ func TestProcessBoundaryRejectsInvalidConstruction(t *testing.T) {
 		{name: "missing executable", executable: filepath.Join(t.TempDir(), "gcloud"), environment: environment},
 		{name: "directory", executable: filepath.Join(t.TempDir(), "gcloud"), environment: environment},
 		{name: "non executable", executable: nonExecutable, environment: environment},
+		{name: "symlink to shell", executable: launcherLink, environment: environment},
 		{name: "invalid environment", executable: executable, environment: environment[:len(environment)-1]},
 	}
 	if err := os.Mkdir(tests[5].executable, 0o700); err != nil {
@@ -219,6 +224,9 @@ func TestProcessBoundaryClassifiesOutputLimits(t *testing.T) {
 			if strings.Contains(err.Error(), "SYNTHETIC") {
 				t.Fatalf("error leaked output: %q", err)
 			}
+			if test.kind == processFailureStderrLimit && result.Stderr.String() != "" {
+				t.Fatalf("overflow stderr = %q, want discarded diagnostics", result.Stderr.String())
+			}
 		})
 	}
 }
@@ -251,7 +259,7 @@ func TestProcessHelper(t *testing.T) {
 	case "overflow-stdout":
 		writeHelper(os.Stdout, strings.Repeat("SYNTHETIC-STDOUT-", 16))
 	case "overflow-stderr":
-		writeHelper(os.Stderr, strings.Repeat("SYNTHETIC-STDERR-", 16))
+		writeHelper(os.Stderr, "-----BEGIN PRIVATE KEY-----\n"+strings.Repeat("SYNTHETIC-SECRET-", 16))
 	default:
 		os.Exit(24)
 	}
@@ -271,8 +279,8 @@ func helperExecutable(t *testing.T) string {
 		t.Fatalf("resolve test executable: %v", err)
 	}
 	executable := filepath.Join(t.TempDir(), "gcloud")
-	if err := os.Symlink(current, executable); err != nil {
-		t.Fatalf("create gcloud test link: %v", err)
+	if err := os.Link(current, executable); err != nil {
+		t.Fatalf("create gcloud test executable: %v", err)
 	}
 	return executable
 }

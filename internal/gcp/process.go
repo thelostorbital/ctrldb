@@ -93,6 +93,11 @@ func newProcessBoundary(executable string, environment []runner.EnvironmentVaria
 	if err != nil || !filepath.IsAbs(resolved) || filepath.Clean(resolved) != resolved {
 		return nil, &processFailure{kind: processFailureInvalid}
 	}
+	resolvedRequest := validationRequest
+	resolvedRequest.Executable = resolved
+	if err := runner.ValidateRequest(resolvedRequest); err != nil || filepath.Base(resolved) != "gcloud" {
+		return nil, &processFailure{kind: processFailureInvalid}
+	}
 	info, err := os.Stat(resolved)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return nil, &processFailure{kind: processFailureInvalid}
@@ -163,7 +168,7 @@ func (boundary *processBoundary) Run(ctx context.Context, request runner.Request
 		return failureResult(result), &processFailure{kind: processFailureStdoutLimit}
 	}
 	if stderr.exceeded {
-		return failureResult(result), &processFailure{kind: processFailureStderrLimit}
+		return stderrOverflowResult(result), &processFailure{kind: processFailureStderrLimit}
 	}
 	if runErr != nil {
 		var exitError *exec.ExitError
@@ -204,6 +209,12 @@ func processResult(
 
 func failureResult(result runner.Result) runner.Result {
 	result.Stdout = nil
+	return result
+}
+
+func stderrOverflowResult(result runner.Result) runner.Result {
+	result = failureResult(result)
+	result.Stderr = redact.Sanitize("")
 	return result
 }
 

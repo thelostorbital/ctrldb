@@ -92,6 +92,13 @@ func TestFindArchitectureViolations(t *testing.T) {
 			message:  "standard import name",
 		},
 		{
+			name:     "native process escape inside boundary",
+			filename: "internal/gcp/process.go",
+			source:   "package gcp\nimport \"syscall\"\nvar _ = syscall.ForkExec\n",
+			want:     1,
+			message:  "isolated process group",
+		},
+		{
 			name:     "start process remains forbidden inside boundary",
 			filename: "internal/gcp/process.go",
 			source:   "package gcp\nimport \"os\"\nvar _ = os.StartProcess\n",

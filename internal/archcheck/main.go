@@ -38,6 +38,7 @@ type sourceFile struct {
 
 type sourcePolicy struct {
 	allowBubbleTeaImport         bool
+	allowProcessBoundary         bool
 	allowRuntimeIntrospection    bool
 	allowSourceImporter          bool
 	allowTestInfrastructure      bool
@@ -483,6 +484,9 @@ func findArchitectureViolations(filename string, contents []byte, policy sourceP
 			return nil, fmt.Errorf("decode import in %s: %w", filename, err)
 		}
 		var messages []string
+		if policy.allowProcessBoundary && (importPath == "os/exec" || importPath == "syscall") && imported.Name != nil {
+			messages = append(messages, "the process boundary must use the standard import name; aliases, dot imports, and blank imports are forbidden")
+		}
 		if message, forbidden := forbiddenProcessImportMessage(importPath, policy); forbidden {
 			messages = append(messages, message)
 		}
@@ -959,6 +963,7 @@ func policyForSource(relativePath string) sourcePolicy {
 	isTest := strings.HasSuffix(normalized, "_test.go")
 	policy := sourcePolicy{
 		allowBubbleTeaImport:         strings.HasPrefix(normalized, "internal/tui/"),
+		allowProcessBoundary:         normalized == "internal/gcp/process.go",
 		allowRuntimeIntrospection:    isTest,
 		allowSourceImporter:          normalized == "internal/archcheck/main.go",
 		allowTestInfrastructure:      isTest,
@@ -1065,6 +1070,9 @@ func isTestInfrastructureImport(importPath string) bool {
 
 func forbiddenProcessImportMessage(importPath string, policy sourcePolicy) (string, bool) {
 	if (importPath == "go/importer" || importPath == "go/build") && policy.allowSourceImporter {
+		return "", false
+	}
+	if policy.allowProcessBoundary && (importPath == "os/exec" || importPath == "syscall") {
 		return "", false
 	}
 	if message, forbidden := forbiddenProcessImports[importPath]; forbidden {

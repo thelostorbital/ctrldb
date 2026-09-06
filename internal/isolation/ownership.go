@@ -198,8 +198,14 @@ func validatePermanentSingletonObservation(path string, value PermanentSingleton
 }
 
 func permanentSingletonSupportsDescription(identity ResourceIdentity) bool {
-	return !(identity.Service == ComputeServiceName && identity.Kind == ComputeRouterNATKind) &&
-		!(identity.Service == RunServiceName && identity.Kind == RunJobKind)
+	switch {
+	case identity.Service == ComputeServiceName && identity.Kind == ComputeRouterNATKind:
+		return false
+	case identity.Service == RunServiceName && identity.Kind == RunJobKind:
+		return false
+	default:
+		return true
+	}
 }
 
 func supportedPermanentSingletonIdentity(identity ResourceIdentity) bool {

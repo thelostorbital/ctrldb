@@ -60,6 +60,9 @@ func TestHarnessConfigurationFromManifestPreservesExplicitValues(t *testing.T) {
 	if !configuration.ReconcilerEnabled() {
 		t.Fatal("ReconcilerEnabled() = false; disposable harness requires the wipe reconciler")
 	}
+	if got := configuration.PlanValidity(); got != time.Hour {
+		t.Errorf("PlanValidity() = %s; want 1h", got)
+	}
 	if got := configuration.Caps().MaxDiskGiB(); got != 100 {
 		t.Errorf("MaxDiskGiB() = %d; want 100", got)
 	}
@@ -195,6 +198,9 @@ func TestHarnessConfigurationRequiresCompleteValidation(t *testing.T) {
 		}},
 		{name: "wipe belongs to another project", mutate: func(t *testing.T, manifest map[string]any) {
 			nestedMap(t, manifest, "spec", "reconciler")["serviceAccount"] = "ctrldb-test-wipe@foreign-project.iam.gserviceaccount.com"
+		}},
+		{name: "VM belongs to another project", mutate: func(t *testing.T, manifest map[string]any) {
+			nestedMap(t, manifest, "spec", "host")["serviceAccount"] = "ctrldb-test-vm@foreign-project.iam.gserviceaccount.com"
 		}},
 		{name: "operator has provider-invalid identity", mutate: func(t *testing.T, manifest map[string]any) {
 			nestedMap(t, manifest, "spec", "testIsolation")["operatorServiceAccount"] = "BAD@example-project.iam.gserviceaccount.com"

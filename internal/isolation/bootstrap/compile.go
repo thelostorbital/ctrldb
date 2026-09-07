@@ -99,6 +99,9 @@ func Compile(request CompileRequest) (CompiledPlan, error) {
 		return CompiledPlan{}, err
 	}
 	definitions := stepRegistry(desiredResources)
+	if err := validatePermissionEvidence(request.Permissions, definitions, request.Preflight.Account(), request.Configuration.Project(), request.CreatedAt); err != nil {
+		return CompiledPlan{}, err
+	}
 	plan, contract, err := buildPlanValues(
 		request.PlanID, request.Configuration.Project(), request.Configuration.Environment(), request.Preflight.Account(),
 		request.CreatedAt, request.ExpiresAt, request.LocalPolicyHash, request.ApprovedPolicyHash,
@@ -114,7 +117,7 @@ func Compile(request CompileRequest) (CompiledPlan, error) {
 	intents := buildIntents(definitions, binding.BindingSHA256)
 	payload := compiledPayloadV1{
 		Plan: plan, Binding: binding, Desired: desired, DesiredResources: desiredResources,
-		Limits: limits, Pricing: request.Pricing,
+		Limits: limits, Pricing: request.Pricing, Permissions: clonePermissionEvidence(request.Permissions),
 		CleanupCapabilities: isolation.InitialCleanupCapabilities(), Intents: intents,
 		Risks: buildRiskSummary(limits),
 	}
@@ -130,7 +133,9 @@ func validateCompileRequest(request CompileRequest) error {
 	}
 	if !validUTC(request.CreatedAt) || !validUTC(request.ExpiresAt) ||
 		!request.ExpiresAt.After(request.CreatedAt) ||
-		request.ExpiresAt.Sub(request.CreatedAt) < minimumPlanValidity {
+		request.ExpiresAt.Sub(request.CreatedAt) < minimumPlanValidity ||
+		request.Configuration.PlanValidity() <= 0 ||
+		!request.ExpiresAt.Equal(request.CreatedAt.Add(request.Configuration.PlanValidity())) {
 		return invalidCompile("plan time window")
 	}
 	if !sha256Pattern.MatchString(request.LocalPolicyHash) ||
@@ -176,7 +181,12 @@ func validatePricing(request CompileRequest) error {
 	price := request.Pricing
 	if price.Schema != PricingSchemaV1 || !sha256Pattern.MatchString(price.Revision) ||
 		price.MachineType != request.Configuration.Caps().MaxMachineType() ||
+		price.Region != request.Configuration.Region() || price.Zone != request.Configuration.Zone() ||
 		price.GuestCPUs <= 0 || price.MemoryMiB <= 0 || price.EstimatedRunMicros < 0 ||
+		price.DiskGiB != request.Configuration.Caps().MaxDiskGiB() ||
+		price.Instances != int64(request.Configuration.Caps().MaxInstances()) ||
+		price.LifetimeSeconds != int64(request.Configuration.Caps().MaxLifetime()/time.Second) ||
+		price.Currency != "USD" ||
 		price.EstimatedRunMicros > maximumExactMicros || !validUTC(price.ObservedAt) ||
 		!validUTC(price.ValidUntil) || !price.ObservedAt.Before(price.ValidUntil) ||
 		request.CreatedAt.Before(price.ObservedAt) || !request.CreatedAt.Before(price.ValidUntil) {
@@ -188,6 +198,9 @@ func validatePricing(request CompileRequest) error {
 	}
 	if price.EstimatedRunMicros > request.Configuration.Caps().MaxEstimatedCostMicros() {
 		return blocked("run cost cap")
+	}
+	if revision, err := pricingEvidenceRevision(price); err != nil || revision != price.Revision {
+		return invalidCompile("pricing revision")
 	}
 	matches := 0
 	for _, machine := range request.Preflight.MachineTypes() {
@@ -203,6 +216,51 @@ func validatePricing(request CompileRequest) error {
 		return blocked("machine capability")
 	}
 	return nil
+}
+
+func pricingEvidenceRevision(value PricingEvidence) (string, error) {
+	value.Revision = ""
+	return hashJSON(value)
+}
+
+func validatePermissionEvidence(
+	evidence PermissionEvidence,
+	definitions []stepDefinition,
+	account, project string,
+	at time.Time,
+) error {
+	if evidence.Schema != PermissionEvidenceSchemaV1 || evidence.Account != account || evidence.Project != project ||
+		!validUTC(evidence.ObservedAt) || !validUTC(evidence.ValidUntil) ||
+		!evidence.ObservedAt.Before(evidence.ValidUntil) || at.Before(evidence.ObservedAt) || !at.Before(evidence.ValidUntil) ||
+		!sha256Pattern.MatchString(evidence.Revision) {
+		return blocked("permission evidence")
+	}
+	expected := expectedPermissionGrants(definitions)
+	if len(evidence.Grants) != len(expected) {
+		return blocked("permission evidence")
+	}
+	for index, grant := range evidence.Grants {
+		if grant != expected[index] || !grant.Granted {
+			return blocked("permission evidence")
+		}
+	}
+	copy := clonePermissionEvidence(evidence)
+	copy.Revision = ""
+	revision, err := hashJSON(copy)
+	if err != nil || revision != evidence.Revision {
+		return blocked("permission evidence")
+	}
+	return nil
+}
+
+func expectedPermissionGrants(definitions []stepDefinition) []PermissionGrant {
+	result := make([]PermissionGrant, 0)
+	for _, definition := range definitions {
+		for _, permission := range definition.permissions {
+			result = append(result, PermissionGrant{StepID: definition.id, Identity: definition.identity, Permission: permission, Granted: true})
+		}
+	}
+	return result
 }
 
 func buildRunLimits(request CompileRequest) (RunLimits, error) {
@@ -234,7 +292,8 @@ func desiredState(request CompileRequest) HarnessDesiredState {
 		CIPrincipal: configuration.CIPrincipal(), OperatorRole: operatorRoleName,
 		DestructiveRole: destructiveRoleName, WipeRunJob: configuration.WipeRunJob(),
 		WipeSchedulerJob: configuration.WipeSchedulerJob(), WipeScheduleUTC: wipeScheduleUTC,
-		ImageDigest: configuration.ImageDigest(),
+		ImageDigest:         configuration.ImageDigest(),
+		PlanValiditySeconds: int64(configuration.PlanValidity() / time.Second),
 	}
 }
 
@@ -429,7 +488,7 @@ func buildPlanValues(
 			SuccessCondition: redact.Sanitize(definition.success), FailureBehavior: definition.failure,
 		}
 	}
-	contract, err := domain.NewExecutionContract(WorkflowID, "audit-retention-lock", definitions[0].id,
+	contract, err := domain.NewExecutionContract(WorkflowID, "audit-retention-lock", "k1-retention-lock",
 		domain.PointOfNoReturnMutationObserved, contractSteps)
 	if err != nil {
 		return domain.Plan{}, domain.ExecutionContract{}, fmt.Errorf("%w: execution contract", ErrInvalidCompileRequest)
@@ -457,7 +516,7 @@ func buildPlanValues(
 		Downtime: domain.PlanDowntime{ExpectedSeconds: 0, Kind: "none"}, Exposure: domain.ExposureNone,
 		Protection:      []redact.Text{redact.Sanitize("production resources remain outside the reserved disposable namespace"), redact.Sanitize("permanent control resources are excluded from disposable cleanup")},
 		Rollback:        domain.PlanRollback{Boundary: "audit-retention-lock", Assets: []domain.PlanRecoveryAsset{}},
-		PointOfNoReturn: definitions[0].id, PointOfNoReturnTrigger: domain.PointOfNoReturnMutationObserved,
+		PointOfNoReturn: "k1-retention-lock", PointOfNoReturnTrigger: domain.PointOfNoReturnMutationObserved,
 		Verification: []redact.Text{redact.Sanitize("every desired provider object is re-observed at exact desired state"), redact.Sanitize("T8 completes every TEST-ISO proof before opening test admission")},
 	}
 	sealed, err := policy.SealPlan(plan)
@@ -498,6 +557,7 @@ func planPreconditions() []domain.PlanPrecondition {
 		{"target-identities-absent", "no exact desired provider identity collides"},
 		{"bucket-conflict-guarded", "M1-05 must treat create-time global bucket-name conflict as a blocking outcome"},
 		{"capability-set-closed", "mutation and cleanup are limited to the recorded three-kind capability set"},
+		{"permissions-proven", "every declared bootstrap permission has fresh exact positive evidence"},
 		{"pre-t8-admission", "only this approved WF-TEST-01 envelope may mutate before T8"},
 	}
 	result := make([]domain.PlanPrecondition, len(values))
@@ -510,7 +570,8 @@ func planPreconditions() []domain.PlanPrecondition {
 func buildEnvelopeBinding(request CompileRequest, plan domain.Plan) (EnvelopeBinding, error) {
 	binding := EnvelopeBinding{WorkflowID: WorkflowID, PlanID: plan.PlanID, PlanHash: plan.PlanHash, Account: request.Preflight.Account(),
 		ManifestHash: request.Configuration.ManifestHash(), ObservationRevision: request.Preflight.Revision(),
-		ObservedAt: request.Preflight.ObservedAt(), ValidUntil: request.Preflight.ValidUntil()}
+		PermissionRevision: request.Permissions.Revision,
+		ObservedAt:         request.Preflight.ObservedAt(), ValidUntil: request.Preflight.ValidUntil()}
 	digest, err := hashJSON(binding)
 	if err != nil {
 		return EnvelopeBinding{}, invalidCompile("envelope binding")
@@ -544,15 +605,16 @@ func buildRiskSummary(limits RunLimits) RiskSummary {
 }
 
 func stepRegistry(resources []DesiredResource) []stepDefinition {
-	allPreconditions := []string{"manifest-bound", "provider-context-bound", "observation-fresh", "schemas-complete", "cidr-clear", "api-set-enabled", "no-public-mongodb", "machine-cap-resolved", "cost-cap-respected", "target-identities-absent", "bucket-conflict-guarded", "capability-set-closed", "pre-t8-admission"}
+	allPreconditions := []string{"manifest-bound", "provider-context-bound", "observation-fresh", "schemas-complete", "cidr-clear", "api-set-enabled", "no-public-mongodb", "machine-cap-resolved", "cost-cap-respected", "target-identities-absent", "bucket-conflict-guarded", "capability-set-closed", "permissions-proven", "pre-t8-admission"}
 	retry3210 := domain.RetryPolicy{MaxAttempts: 3, InitialBackoffSeconds: 2, MaxBackoffSeconds: 10}
 	retry3520 := domain.RetryPolicy{MaxAttempts: 3, InitialBackoffSeconds: 5, MaxBackoffSeconds: 20}
 	retry5220 := domain.RetryPolicy{MaxAttempts: 5, InitialBackoffSeconds: 2, MaxBackoffSeconds: 20}
 	retry3530 := domain.RetryPolicy{MaxAttempts: 3, InitialBackoffSeconds: 5, MaxBackoffSeconds: 30}
 	once := domain.RetryPolicy{MaxAttempts: 1}
 	return []stepDefinition{
-		{id: "k1-audit-bootstrap", kind: IntentAuditBootstrap, identity: domain.IdentityHuman, resourceIDs: []string{"audit-bucket"}, preconditions: allPreconditions, verification: []string{"envelope hash and server generation match", "retention is locked for 365 days", "archive lifecycle has no delete rule"}, retry: retry3210, timeoutSeconds: 120, cancelSafe: false, compensation: "before retention lock remove only an audit bucket created by this operation; after lock pause and preserve", ponr: PONRAuditRetentionLock, permissions: []string{"storage.buckets.create", "storage.buckets.get", "storage.buckets.update", "storage.objects.create", "storage.objects.get"}, summary: "create and verify the audit bootstrap handoff, then lock retention", success: "the exact envelope is durable and the compliant audit retention policy is locked", failure: domain.FailurePause},
-		{id: "k2-control-bucket", kind: IntentControlBucket, identity: domain.IdentityHuman, resourceIDs: []string{"control-bucket"}, dependencies: []string{"k1-audit-bootstrap"}, preconditions: allPreconditions, verification: []string{"control bucket desired state matches exactly"}, retry: retry3210, timeoutSeconds: 60, cancelSafe: true, compensation: "remove only a preexisting-empty control bucket created by this operation before durable state is written", ponr: PONRReversible, permissions: []string{"storage.buckets.create", "storage.buckets.get", "storage.buckets.update"}, summary: "create the permanent versioned control bucket", success: "the control bucket has exact UBLA, PAP, versioning, and soft-delete state", failure: domain.FailureRollback},
+		{id: "k1-audit-bootstrap", kind: IntentAuditBootstrap, identity: domain.IdentityHuman, resourceIDs: []string{"audit-bucket"}, preconditions: allPreconditions, verification: []string{"envelope hash and server generation match", "archive lifecycle has no delete rule"}, retry: retry3210, timeoutSeconds: 120, cancelSafe: true, compensation: "before retention lock remove only an audit bucket created by this operation", ponr: PONRReversible, permissions: []string{"storage.buckets.create", "storage.buckets.get", "storage.objects.create", "storage.objects.get"}, summary: "create and verify the audit bootstrap handoff", success: "the exact envelope is durable and verified before retention is locked", failure: domain.FailurePause},
+		{id: "k1-retention-lock", kind: IntentAuditRetention, identity: domain.IdentityHuman, resourceIDs: []string{"audit-bucket"}, dependencies: []string{"k1-audit-bootstrap"}, preconditions: allPreconditions, verification: []string{"retention is locked for 365 days", "archive lifecycle has no delete rule"}, retry: retry3210, timeoutSeconds: 60, cancelSafe: false, compensation: "after the retention-lock mutation is observed pause and preserve the permanent audit bucket", ponr: PONRAuditRetentionLock, permissions: []string{"storage.buckets.get", "storage.buckets.update"}, summary: "lock the verified audit bucket retention policy", success: "the compliant 365-day audit retention policy is irreversibly locked", failure: domain.FailurePause},
+		{id: "k2-control-bucket", kind: IntentControlBucket, identity: domain.IdentityHuman, resourceIDs: []string{"control-bucket"}, dependencies: []string{"k1-retention-lock"}, preconditions: allPreconditions, verification: []string{"control bucket desired state matches exactly"}, retry: retry3210, timeoutSeconds: 60, cancelSafe: true, compensation: "remove only a preexisting-empty control bucket created by this operation before durable state is written", ponr: PONRReversible, permissions: []string{"storage.buckets.create", "storage.buckets.get", "storage.buckets.update"}, summary: "create the permanent versioned control bucket", success: "the control bucket has exact UBLA, PAP, versioning, and soft-delete state", failure: domain.FailureRollback},
 		{id: "k3-bucket-iam", kind: IntentBucketIAM, identity: domain.IdentityHuman, resourceIDs: []string{"audit-bucket", "control-bucket"}, dependencies: []string{"k2-control-bucket"}, preconditions: allPreconditions, verification: []string{"bucket IAM policies equal the closed rendered policy"}, retry: retry5220, timeoutSeconds: 120, cancelSafe: true, compensation: "remove only IAM bindings added by this operation", ponr: PONRReversible, permissions: []string{"storage.buckets.getIamPolicy", "storage.buckets.setIamPolicy"}, summary: "apply exact control and audit bucket IAM", success: "bucket IAM equals the closed prefix-scoped policy", failure: domain.FailureRollback},
 		{id: "k4-seed-control", kind: IntentSeedControl, identity: domain.IdentityHuman, resourceIDs: []string{"control-bucket"}, dependencies: []string{"k3-bucket-iam"}, preconditions: allPreconditions, verification: []string{"seed objects exist and preexisting generations are unchanged"}, retry: retry3210, timeoutSeconds: 30, cancelSafe: true, compensation: "preserve all create-only seed objects and converge from their exact contents", ponr: PONRReversible, permissions: []string{"storage.objects.create", "storage.objects.get"}, summary: "create the exact control-store seed objects", success: "all required create-only seed objects are present", failure: domain.FailurePause},
 		{id: "k5-lock-round-trip", kind: IntentLockRoundTrip, identity: domain.IdentityHuman, resourceIDs: []string{"control-bucket"}, dependencies: []string{"k4-seed-control"}, preconditions: allPreconditions, verification: []string{"generation-preconditioned acquire and release succeeds"}, retry: once, timeoutSeconds: 30, cancelSafe: true, compensation: "release only the lock generation acquired by this operation", ponr: PONRReversible, permissions: []string{"storage.objects.create", "storage.objects.get", "storage.objects.update"}, summary: "prove the control-store lock round trip", success: "one generation-bound lock is acquired and released", failure: domain.FailurePause},
@@ -562,8 +624,8 @@ func stepRegistry(resources []DesiredResource) []stepDefinition {
 		{id: "t4-firewall", kind: IntentFirewall, identity: domain.IdentityHuman, resourceIDs: []string{"test-iap-firewall", "test-internal-firewall"}, dependencies: []string{"t3-nat"}, preconditions: allPreconditions, verification: []string{"IAP SSH and node-internal MongoDB rules match exactly", "no public or non-test source and target is present"}, retry: retry3520, timeoutSeconds: 60, cancelSafe: true, compensation: "delete only firewall rules recorded as created by this operation", ponr: PONRReversible, permissions: []string{"compute.firewalls.create", "compute.firewalls.get"}, summary: "create the two closed test firewall rules", success: "only the exact IAP SSH and test-node MongoDB rules exist", failure: domain.FailureRollback},
 		{id: "t5-identities", kind: IntentIdentities, identity: domain.IdentityHuman, resourceIDs: []string{"test-operator-sa", "test-destructive-sa", "test-vm-sa", "test-wipe-sa", "test-operator-role", "test-destructive-role"}, dependencies: []string{"t4-firewall"}, preconditions: allPreconditions, verification: []string{"service accounts have no keys", "role and conditional binding fingerprints match", "expected allows and denies are proven exactly"}, retry: retry5220, timeoutSeconds: 180, cancelSafe: true, compensation: "remove only roles, bindings, and service accounts created by this operation", ponr: PONRReversible, permissions: []string{"iam.roles.create", "iam.roles.get", "iam.roles.update", "iam.serviceAccounts.create", "iam.serviceAccounts.get", "iam.serviceAccounts.setIamPolicy", "resourcemanager.projects.getIamPolicy", "resourcemanager.projects.setIamPolicy"}, summary: "create test identities, closed roles, and conditional bindings", success: "identity desired state and exact permission matrix are proven", failure: domain.FailureRollback},
 		{id: "t6-control-prefix", kind: IntentControlPrefix, identity: domain.IdentityHuman, resourceIDs: []string{"control-bucket"}, dependencies: []string{"t5-identities"}, preconditions: allPreconditions, verification: []string{"only the test control prefix bindings are present"}, retry: retry5220, timeoutSeconds: 60, cancelSafe: true, compensation: "remove only prefix bindings added by this operation", ponr: PONRReversible, permissions: []string{"storage.buckets.getIamPolicy", "storage.buckets.setIamPolicy"}, summary: "bind test identities to the control-store test prefix", success: "the exact test-prefix IAM bindings are present", failure: domain.FailureRollback},
-		{id: "t7-nightly-wipe", kind: IntentNightlyWipe, identity: domain.IdentityHuman, resourceIDs: []string{"test-wipe-job", "test-wipe-scheduler"}, dependencies: []string{"t6-control-prefix"}, preconditions: allPreconditions, verification: []string{"wipe job image and identity match", "scheduler uses the exact Run Jobs v2 OAuth target", "first run reports zero deletions"}, retry: retry3530, timeoutSeconds: 180, cancelSafe: true, compensation: "delete only the job and scheduler recorded as created by this operation", ponr: PONRReversible, permissions: []string{"cloudscheduler.jobs.create", "cloudscheduler.jobs.get", "iam.serviceAccounts.actAs", "run.jobs.create", "run.jobs.get"}, summary: "create and dry-run the immutable nightly wipe job", success: "the pinned wipe job and UTC scheduler exist and the first run deletes nothing", failure: domain.FailureRollback},
-		{id: "t8-isolation-gate", kind: IntentIsolationGate, identity: domain.IdentityHuman, resourceIDs: desiredResourceIDs(resources), dependencies: []string{"t7-nightly-wipe"}, preconditions: allPreconditions, verification: []string{"every TEST-ISO proof passes", "harness fingerprints and cleanup capabilities match", "pending and unusable may transition to open and usable"}, retry: once, timeoutSeconds: 900, cancelSafe: true, compensation: "on failure retain pending and unusable state and keep TEST-I, TEST-D, and unrelated mutation blocked", ponr: PONRVerificationOnly, transition: &HarnessTransition{FromBootstrapPhase: "pending", FromTestUsability: "unusable", ToBootstrapPhase: "open", ToTestUsability: "usable"}, permissions: []string{"cloudscheduler.jobs.get", "compute.firewalls.get", "compute.networks.get", "iam.serviceAccounts.get", "resourcemanager.projects.getIamPolicy", "run.jobs.get"}, summary: "run the complete TEST-ISO gate without opening admission early", success: "every T8 proof passes and the proposed state transition is eligible to persist", failure: domain.FailurePause},
+		{id: "t7-nightly-wipe", kind: IntentNightlyWipe, identity: domain.IdentityHuman, resourceIDs: []string{"test-wipe-job", "test-wipe-scheduler"}, dependencies: []string{"t6-control-prefix"}, preconditions: allPreconditions, verification: []string{"wipe job image and identity match", "scheduler uses the exact Run Jobs v2 OAuth target", "first run reports zero deletions"}, retry: retry3530, timeoutSeconds: 180, cancelSafe: true, compensation: "delete only the job and scheduler recorded as created by this operation", ponr: PONRReversible, permissions: []string{"cloudscheduler.jobs.create", "cloudscheduler.jobs.get", "iam.serviceAccounts.actAs", "run.jobs.create", "run.jobs.get", "run.jobs.run"}, summary: "create and dry-run the immutable nightly wipe job", success: "the pinned wipe job and UTC scheduler exist and the first run deletes nothing", failure: domain.FailureRollback},
+		{id: "t8-isolation-gate", kind: IntentIsolationGate, identity: domain.IdentityHuman, resourceIDs: desiredResourceIDs(resources), dependencies: []string{"t7-nightly-wipe"}, preconditions: allPreconditions, verification: []string{"every TEST-ISO proof passes", "harness fingerprints and cleanup capabilities match", "pending and unusable may transition to open and usable"}, retry: once, timeoutSeconds: 900, cancelSafe: true, compensation: "on failure retain pending and unusable state and keep TEST-I, TEST-D, and unrelated mutation blocked", ponr: PONRVerificationOnly, transition: &HarnessTransition{FromBootstrapPhase: "pending", FromTestUsability: "unusable", ToBootstrapPhase: "open", ToTestUsability: "usable"}, permissions: []string{"cloudscheduler.jobs.get", "compute.firewalls.get", "compute.networks.get", "compute.routers.get", "compute.subnetworks.get", "iam.roles.get", "iam.serviceAccounts.get", "iam.serviceAccounts.getIamPolicy", "resourcemanager.projects.getIamPolicy", "run.jobs.get", "storage.buckets.get", "storage.buckets.getIamPolicy"}, summary: "run the complete TEST-ISO gate without opening admission early", success: "every T8 proof passes and the proposed state transition is eligible to persist", failure: domain.FailurePause},
 	}
 }
 

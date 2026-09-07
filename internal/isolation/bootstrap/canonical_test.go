@@ -51,6 +51,12 @@ func TestParseCompiledPlanRejectsRehashedSemanticTampering(t *testing.T) {
 	}{
 		{name: "prefix without reserved value", mutate: func(value *compiledPayloadV1) { value.Desired.NamePrefix = "other-test-" }},
 		{name: "labels without prefix", mutate: func(value *compiledPayloadV1) { value.Desired.Labels["managed-by"] = "other" }},
+		{name: "unsafe CI principal", mutate: func(value *compiledPayloadV1) { value.Desired.CIPrincipal = "allUsers" }},
+		{name: "foreign service account", mutate: func(value *compiledPayloadV1) {
+			value.Desired.VMPrincipal = "ctrldb-test-vm@foreign-project.iam.gserviceaccount.com"
+		}},
+		{name: "duplicate service account", mutate: func(value *compiledPayloadV1) { value.Desired.VMPrincipal = value.Desired.OperatorPrincipal }},
+		{name: "plan validity bypass", mutate: func(value *compiledPayloadV1) { value.Desired.PlanValiditySeconds++ }},
 		{name: "unsupported cleanup kind", mutate: func(value *compiledPayloadV1) {
 			value.CleanupCapabilities[0] = isolation.CleanupCapability("compute.snapshots")
 		}},
@@ -74,6 +80,8 @@ func TestParseCompiledPlanRejectsRehashedSemanticTampering(t *testing.T) {
 		}},
 		{name: "cost cap bypass", mutate: func(value *compiledPayloadV1) { value.Limits.MaximumCostMicros++ }},
 		{name: "estimated cost mismatch", mutate: func(value *compiledPayloadV1) { value.Limits.EstimatedCostMicros++ }},
+		{name: "pricing cost driver", mutate: func(value *compiledPayloadV1) { value.Pricing.DiskGiB-- }},
+		{name: "permission proof", mutate: func(value *compiledPayloadV1) { value.Permissions.Grants[0].Granted = false }},
 		{name: "machine shape bypass", mutate: func(value *compiledPayloadV1) { value.Limits.MaximumGuestCPUs++ }},
 		{name: "resource fingerprint", mutate: func(value *compiledPayloadV1) { value.DesiredResources[0].DesiredStateFingerprint = repeatedHex("c") }},
 		{name: "plan envelope", mutate: func(value *compiledPayloadV1) { value.Binding.PlanHash = repeatedHex("d") }},

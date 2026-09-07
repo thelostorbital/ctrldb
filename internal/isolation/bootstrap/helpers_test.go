@@ -26,26 +26,65 @@ var testNow = time.Date(2026, 9, 7, 12, 1, 0, 0, time.UTC)
 func validCompileRequest(t *testing.T) CompileRequest {
 	t.Helper()
 
-	return CompileRequest{
+	request := CompileRequest{
 		Configuration:      validHarnessConfiguration(t),
 		Preflight:          validPreflight(t, testProject, testRegion, testZone, nil, nil, nil),
 		PlanID:             "plan-0123456789abcdef",
 		CreatedAt:          testNow,
-		ExpiresAt:          testNow.Add(31 * time.Minute),
+		ExpiresAt:          testNow.Add(time.Hour),
 		LocalPolicyHash:    repeatedHex("a"),
 		ApprovedPolicyHash: repeatedHex("a"),
 		Pricing: PricingEvidence{
 			MachineType:        "e2-medium",
+			Region:             testRegion,
+			Zone:               testZone,
 			GuestCPUs:          2,
 			MemoryMiB:          4096,
+			DiskGiB:            100,
+			Instances:          3,
+			LifetimeSeconds:    int64((8 * time.Hour) / time.Second),
 			EstimatedRunMicros: 5_000_000,
+			Currency:           "USD",
 			PriceTableDate:     "2026-09-07",
 			Schema:             PricingSchemaV1,
-			Revision:           repeatedHex("b"),
 			ObservedAt:         testNow.Add(-time.Minute),
 			ValidUntil:         testNow.Add(4 * time.Minute),
 		},
 	}
+	refreshPricingRevision(t, &request.Pricing)
+	resources, err := buildDesiredResources(desiredState(request))
+	if err != nil {
+		t.Fatalf("buildDesiredResources() unexpected error: %v", err)
+	}
+	request.Permissions = PermissionEvidence{
+		Account: testAccount, Project: testProject, Schema: PermissionEvidenceSchemaV1,
+		ObservedAt: testNow.Add(-time.Minute), ValidUntil: testNow.Add(4 * time.Minute),
+		Grants: expectedPermissionGrants(stepRegistry(resources)),
+	}
+	refreshPermissionRevision(t, &request.Permissions)
+	return request
+}
+
+func refreshPricingRevision(t *testing.T, evidence *PricingEvidence) {
+	t.Helper()
+
+	revision, err := pricingEvidenceRevision(*evidence)
+	if err != nil {
+		t.Fatalf("pricingEvidenceRevision() unexpected error: %v", err)
+	}
+	evidence.Revision = revision
+}
+
+func refreshPermissionRevision(t *testing.T, evidence *PermissionEvidence) {
+	t.Helper()
+
+	copy := clonePermissionEvidence(*evidence)
+	copy.Revision = ""
+	revision, err := hashJSON(copy)
+	if err != nil {
+		t.Fatalf("hashJSON(permission evidence) unexpected error: %v", err)
+	}
+	evidence.Revision = revision
 }
 
 func validHarnessConfiguration(t *testing.T) config.HarnessConfiguration {

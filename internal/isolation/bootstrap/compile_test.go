@@ -23,7 +23,7 @@ func TestCompileProducesCompleteWFTestPlan(t *testing.T) {
 
 	compiled := mustCompile(t, validCompileRequest(t))
 	wantSteps := []string{
-		"k1-audit-bootstrap", "k2-control-bucket", "k3-bucket-iam", "k4-seed-control", "k5-lock-round-trip",
+		"k1-audit-bootstrap", "k1-retention-lock", "k2-control-bucket", "k3-bucket-iam", "k4-seed-control", "k5-lock-round-trip",
 		"t1-network", "t2-subnet", "t3-nat", "t4-firewall", "t5-identities", "t6-control-prefix",
 		"t7-nightly-wipe", "t8-isolation-gate",
 	}
@@ -69,7 +69,7 @@ func TestCompileProducesCompleteWFTestPlan(t *testing.T) {
 	if got := compiled.CleanupCapabilities(); !slices.Equal(got, isolation.InitialCleanupCapabilities()) {
 		t.Fatalf("CleanupCapabilities() = %v; want %v", got, isolation.InitialCleanupCapabilities())
 	}
-	if compiled.Plan().PointOfNoReturn != "k1-audit-bootstrap" || compiled.Risks().ExpectedDowntimeSeconds != 0 ||
+	if compiled.Plan().PointOfNoReturn != "k1-retention-lock" || compiled.Risks().ExpectedDowntimeSeconds != 0 ||
 		compiled.Risks().ProductionExposure != "none" {
 		t.Fatal("compiled review surface lost the retention boundary or safety summary")
 	}
@@ -160,7 +160,7 @@ func TestCompileRejectsStaleOrMismatchedInputs(t *testing.T) {
 	}{
 		{name: "stale observation", mutate: func(value *CompileRequest) {
 			value.CreatedAt = testNow.Add(4 * time.Minute)
-			value.ExpiresAt = value.CreatedAt.Add(31 * time.Minute)
+			value.ExpiresAt = value.CreatedAt.Add(value.Configuration.PlanValidity())
 		}, want: ErrPlanBlocked},
 		{name: "manifest project", mutate: func(value *CompileRequest) {
 			value.Preflight = validPreflight(t, "other-project", testRegion, testZone, nil, nil, nil)
@@ -172,6 +172,7 @@ func TestCompileRejectsStaleOrMismatchedInputs(t *testing.T) {
 		{name: "missing preflight", mutate: func(value *CompileRequest) { value.Preflight = observation.HarnessPreflight{} }, want: ErrPlanBlocked},
 		{name: "policy mismatch", mutate: func(value *CompileRequest) { value.ApprovedPolicyHash = repeatedHex("c") }, want: ErrPlanBlocked},
 		{name: "short validity", mutate: func(value *CompileRequest) { value.ExpiresAt = value.CreatedAt.Add(29 * time.Minute) }, want: ErrInvalidCompileRequest},
+		{name: "longer than manifest validity", mutate: func(value *CompileRequest) { value.ExpiresAt = value.CreatedAt.Add(61 * time.Minute) }, want: ErrInvalidCompileRequest},
 		{name: "non UTC creation", mutate: func(value *CompileRequest) { value.CreatedAt = value.CreatedAt.In(time.FixedZone("offset", 3600)) }, want: ErrInvalidCompileRequest},
 	}
 	for _, test := range tests {
@@ -277,6 +278,12 @@ func TestCompileRejectsUnresolvedOrAmbiguousPricing(t *testing.T) {
 		mutate func(*CompileRequest)
 	}{
 		{name: "unobserved machine", mutate: func(value *CompileRequest) { value.Pricing.MachineType = "n2-standard-2" }},
+		{name: "wrong region", mutate: func(value *CompileRequest) { value.Pricing.Region = "us-east1" }},
+		{name: "wrong zone", mutate: func(value *CompileRequest) { value.Pricing.Zone = "us-central1-b" }},
+		{name: "wrong disk", mutate: func(value *CompileRequest) { value.Pricing.DiskGiB-- }},
+		{name: "wrong count", mutate: func(value *CompileRequest) { value.Pricing.Instances-- }},
+		{name: "wrong lifetime", mutate: func(value *CompileRequest) { value.Pricing.LifetimeSeconds-- }},
+		{name: "wrong currency", mutate: func(value *CompileRequest) { value.Pricing.Currency = "EUR" }},
 		{name: "numeric mismatch", mutate: func(value *CompileRequest) { value.Pricing.GuestCPUs++ }},
 		{name: "over cost cap", mutate: func(value *CompileRequest) { value.Pricing.EstimatedRunMicros = 25_000_001 }},
 		{name: "float precision overflow", mutate: func(value *CompileRequest) { value.Pricing.EstimatedRunMicros = maximumExactMicros + 1 }},
@@ -290,6 +297,7 @@ func TestCompileRejectsUnresolvedOrAmbiguousPricing(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			request := validCompileRequest(t)
 			test.mutate(&request)
+			refreshPricingRevision(t, &request.Pricing)
 			if _, err := Compile(request); err == nil {
 				t.Fatal("Compile() succeeded; want fail-closed error")
 			}
@@ -318,6 +326,7 @@ func TestCompileAcceptsExactIntegerCostBoundary(t *testing.T) {
 
 	request := validCompileRequest(t)
 	request.Pricing.EstimatedRunMicros = 25_000_000
+	refreshPricingRevision(t, &request.Pricing)
 	compiled := mustCompile(t, request)
 	if compiled.Limits().EstimatedCostMicros != compiled.Limits().MaximumCostMicros {
 		t.Fatal("exact micro-USD cap boundary was not preserved")
@@ -360,8 +369,31 @@ func TestCompiledPlanGettersAreDetached(t *testing.T) {
 	capabilities[0] = isolation.CleanupCapability("tampered")
 	plan := compiled.Plan()
 	plan.Steps[0].ID = "tampered"
+	permissions := compiled.PermissionEvidence()
+	permissions.Grants[0].Granted = false
 	if !bytes.Equal(original, mustCanonical(t, compiled)) {
 		t.Fatal("detached getter mutation changed compiled plan")
+	}
+}
+
+func TestStepPermissionsCoverWipeExecutionAndEveryT8Read(t *testing.T) {
+	t.Parallel()
+
+	compiled := mustCompile(t, validCompileRequest(t))
+	byStep := make(map[string][]string)
+	for _, grant := range compiled.PermissionEvidence().Grants {
+		byStep[grant.StepID] = append(byStep[grant.StepID], grant.Permission)
+	}
+	if !slices.Contains(byStep["t7-nightly-wipe"], "run.jobs.run") {
+		t.Fatal("T7 omits run.jobs.run required by its first-run verification")
+	}
+	wantT8 := []string{
+		"cloudscheduler.jobs.get", "compute.firewalls.get", "compute.networks.get", "compute.routers.get",
+		"compute.subnetworks.get", "iam.roles.get", "iam.serviceAccounts.get", "iam.serviceAccounts.getIamPolicy",
+		"resourcemanager.projects.getIamPolicy", "run.jobs.get", "storage.buckets.get", "storage.buckets.getIamPolicy",
+	}
+	if !slices.Equal(byStep["t8-isolation-gate"], wantT8) {
+		t.Fatalf("T8 permissions = %v; want %v", byStep["t8-isolation-gate"], wantT8)
 	}
 }
 
@@ -372,7 +404,7 @@ func TestStepRegistryHasNoRepresentableTestRunOrUnrelatedIntent(t *testing.T) {
 
 	compiled := mustCompile(t, validCompileRequest(t))
 	allowed := []IntentKind{
-		IntentAuditBootstrap, IntentControlBucket, IntentBucketIAM, IntentSeedControl, IntentLockRoundTrip,
+		IntentAuditBootstrap, IntentAuditRetention, IntentControlBucket, IntentBucketIAM, IntentSeedControl, IntentLockRoundTrip,
 		IntentNetwork, IntentSubnet, IntentNAT, IntentFirewall, IntentIdentities, IntentControlPrefix,
 		IntentNightlyWipe, IntentIsolationGate,
 	}
@@ -385,5 +417,55 @@ func TestStepRegistryHasNoRepresentableTestRunOrUnrelatedIntent(t *testing.T) {
 		isolation.CleanupComputeDisks, isolation.CleanupComputeFirewalls, isolation.CleanupComputeInstances,
 	}) {
 		t.Fatal("compiled cleanup capability set is not the closed initial set")
+	}
+}
+
+func TestCompileRequiresExactFreshPermissionEvidence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*PermissionEvidence)
+	}{
+		{name: "missing grant", mutate: func(value *PermissionEvidence) { value.Grants = value.Grants[1:] }},
+		{name: "extra grant", mutate: func(value *PermissionEvidence) { value.Grants = append(value.Grants, value.Grants[0]) }},
+		{name: "denied grant", mutate: func(value *PermissionEvidence) { value.Grants[0].Granted = false }},
+		{name: "wrong permission", mutate: func(value *PermissionEvidence) { value.Grants[0].Permission = "storage.buckets.delete" }},
+		{name: "wrong identity", mutate: func(value *PermissionEvidence) { value.Grants[0].Identity = domain.IdentityOperator }},
+		{name: "wrong account", mutate: func(value *PermissionEvidence) { value.Account = "other@example.invalid" }},
+		{name: "wrong project", mutate: func(value *PermissionEvidence) { value.Project = "other-project" }},
+		{name: "stale", mutate: func(value *PermissionEvidence) { value.ValidUntil = testNow }},
+		{name: "unknown schema", mutate: func(value *PermissionEvidence) { value.Schema = "permission-evidence/v2" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := validCompileRequest(t)
+			test.mutate(&request.Permissions)
+			refreshPermissionRevision(t, &request.Permissions)
+			if _, err := Compile(request); !errors.Is(err, ErrPlanBlocked) {
+				t.Fatalf("Compile() error = %v; want ErrPlanBlocked", err)
+			}
+		})
+	}
+}
+
+func TestCompiledPermissionsMatchFreshEvidence(t *testing.T) {
+	t.Parallel()
+
+	request := validCompileRequest(t)
+	compiled := mustCompile(t, request)
+	if !reflect.DeepEqual(compiled.PermissionEvidence(), request.Permissions) {
+		t.Fatal("compiled permission evidence differs from the exact fresh input")
+	}
+	permissions := compiled.Plan().Permissions
+	if len(permissions) != len(request.Permissions.Grants) {
+		t.Fatalf("plan permissions = %d; want %d", len(permissions), len(request.Permissions.Grants))
+	}
+	for index, permission := range permissions {
+		grant := request.Permissions.Grants[index]
+		if permission.StepID != grant.StepID || permission.Identity != grant.Identity ||
+			permission.Permission != grant.Permission || !permission.Granted {
+			t.Fatalf("plan permission %d does not match evidence", index)
+		}
 	}
 }

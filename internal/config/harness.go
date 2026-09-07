@@ -58,6 +58,7 @@ type HarnessConfiguration struct {
 	wipeServiceAccount string
 	imageDigest        string
 	reconcilerEnabled  bool
+	planValidity       time.Duration
 	caps               HarnessCaps
 }
 
@@ -102,6 +103,9 @@ type harnessManifestWire struct {
 			ServiceAccount string `json:"serviceAccount"`
 			ImageDigest    string `json:"imageDigest"`
 		} `json:"reconciler"`
+		Policy struct {
+			PlanValidity string `json:"planValidity"`
+		} `json:"policy"`
 		TestIsolation *struct {
 			NamePrefix                string            `json:"namePrefix"`
 			Labels                    map[string]string `json:"labels"`
@@ -158,6 +162,12 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 		return HarnessConfiguration{}, fmt.Errorf("%w: invalid test lifetime", ErrInvalidHarnessConfiguration)
 	}
 	lifetime := time.Duration(lifetimeSeconds.Int64()) * time.Second
+	planValiditySeconds, ok := durationSeconds(wire.Spec.Policy.PlanValidity)
+	if !ok || planValiditySeconds.Sign() <= 0 || !planValiditySeconds.IsInt64() ||
+		planValiditySeconds.Cmp(maximumDurationSeconds) > 0 {
+		return HarnessConfiguration{}, fmt.Errorf("%w: invalid plan validity", ErrInvalidHarnessConfiguration)
+	}
+	planValidity := time.Duration(planValiditySeconds.Int64()) * time.Second
 	costMicros, err := usdNumberToMicrosCeiling(wire.Spec.TestIsolation.Caps.MaxEstimatedUSDPerRun)
 	if err != nil {
 		return HarnessConfiguration{}, fmt.Errorf("%w: invalid test cost cap", ErrInvalidHarnessConfiguration)
@@ -182,33 +192,18 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 	if wire.Spec.TestIsolation.Caps.MaxDiskGiB <= 0 || wire.Spec.TestIsolation.Caps.MaxInstances <= 0 {
 		return HarnessConfiguration{}, fmt.Errorf("%w: invalid numeric caps", ErrInvalidHarnessConfiguration)
 	}
-	if wire.Spec.TestIsolation.OperatorServiceAccount == wire.Spec.TestIsolation.DestructiveServiceAccount {
-		return HarnessConfiguration{}, fmt.Errorf("%w: test operator and destructive service accounts must be distinct", ErrInvalidHarnessConfiguration)
-	}
-	if wire.Spec.TestIsolation.OperatorServiceAccount == wire.Spec.Host.ServiceAccount ||
-		wire.Spec.TestIsolation.DestructiveServiceAccount == wire.Spec.Host.ServiceAccount {
-		return HarnessConfiguration{}, fmt.Errorf("%w: test control and database VM service accounts must be distinct", ErrInvalidHarnessConfiguration)
-	}
-	if wire.Spec.Reconciler.ServiceAccount == wire.Spec.Host.ServiceAccount ||
-		wire.Spec.Reconciler.ServiceAccount == wire.Spec.TestIsolation.OperatorServiceAccount ||
-		wire.Spec.Reconciler.ServiceAccount == wire.Spec.TestIsolation.DestructiveServiceAccount {
-		return HarnessConfiguration{}, fmt.Errorf("%w: wipe reconciler service account must be distinct from runtime and test control identities", ErrInvalidHarnessConfiguration)
-	}
-	for _, account := range []string{
+	if err := ValidateHarnessPrincipalSet(
+		wire.Spec.GCP.Project,
 		wire.Spec.TestIsolation.OperatorServiceAccount,
 		wire.Spec.TestIsolation.DestructiveServiceAccount,
+		wire.Spec.Host.ServiceAccount,
 		wire.Spec.Reconciler.ServiceAccount,
-	} {
-		if !harnessServiceAccountPattern.MatchString(account) ||
-			!serviceAccountBelongsToProject(account, wire.Spec.GCP.Project) {
-			return HarnessConfiguration{}, fmt.Errorf("%w: test control service accounts must be canonical identities in the configured project", ErrInvalidHarnessConfiguration)
-		}
+		wire.Spec.TestIsolation.CIPrincipal,
+	); err != nil {
+		return HarnessConfiguration{}, err
 	}
 	if !generatedResourceNamePattern.MatchString(wire.Spec.TestIsolation.Network.Subnet) {
 		return HarnessConfiguration{}, fmt.Errorf("%w: test subnet must be a provider-valid Compute resource name", ErrInvalidHarnessConfiguration)
-	}
-	if !workloadIdentityPrincipalPattern.MatchString(wire.Spec.TestIsolation.CIPrincipal) {
-		return HarnessConfiguration{}, fmt.Errorf("%w: CI principal must identify one canonical workload identity subject or repository", ErrInvalidHarnessConfiguration)
 	}
 	if !wire.Spec.Reconciler.Enabled {
 		return HarnessConfiguration{}, fmt.Errorf("%w: disposable harness requires the wipe reconciler", ErrInvalidHarnessConfiguration)
@@ -228,7 +223,7 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 		cidr: wire.Spec.TestIsolation.Network.CIDR, router: TestRouterName, nat: wire.Spec.TestIsolation.Network.NAT,
 		wipeSchedulerJob: wire.Spec.Reconciler.SchedulerJob, wipeRunJob: wire.Spec.Reconciler.RunJob,
 		wipeServiceAccount: wire.Spec.Reconciler.ServiceAccount, imageDigest: wire.Spec.Reconciler.ImageDigest,
-		reconcilerEnabled: wire.Spec.Reconciler.Enabled,
+		reconcilerEnabled: wire.Spec.Reconciler.Enabled, planValidity: planValidity,
 		caps: HarnessCaps{
 			maxMachineType: wire.Spec.TestIsolation.Caps.MaxMachineType,
 			maxDiskGiB:     wire.Spec.TestIsolation.Caps.MaxDiskGiB,
@@ -236,6 +231,26 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 			maxLifetime:    lifetime, maxEstimatedCostMicros: costMicros,
 		},
 	}, nil
+}
+
+// ValidateHarnessPrincipalSet applies the same canonical, project-ownership,
+// and separation rules to manifest projections and parsed compiled plans.
+func ValidateHarnessPrincipalSet(project, operator, destructive, vm, wipe, ci string) error {
+	accounts := []string{operator, destructive, vm, wipe}
+	seen := make(map[string]struct{}, len(accounts))
+	for _, account := range accounts {
+		if !harnessServiceAccountPattern.MatchString(account) || !serviceAccountBelongsToProject(account, project) {
+			return fmt.Errorf("%w: harness service accounts must be canonical identities in the configured project", ErrInvalidHarnessConfiguration)
+		}
+		if _, duplicate := seen[account]; duplicate {
+			return fmt.Errorf("%w: harness service accounts must be distinct", ErrInvalidHarnessConfiguration)
+		}
+		seen[account] = struct{}{}
+	}
+	if !workloadIdentityPrincipalPattern.MatchString(ci) {
+		return fmt.Errorf("%w: CI principal must identify one canonical workload identity subject or repository", ErrInvalidHarnessConfiguration)
+	}
+	return nil
 }
 
 func usdNumberToMicrosCeiling(value json.Number) (int64, error) {
@@ -302,6 +317,9 @@ func (configuration HarnessConfiguration) WipeServiceAccount() string {
 func (configuration HarnessConfiguration) ImageDigest() string { return configuration.imageDigest }
 func (configuration HarnessConfiguration) ReconcilerEnabled() bool {
 	return configuration.reconcilerEnabled
+}
+func (configuration HarnessConfiguration) PlanValidity() time.Duration {
+	return configuration.planValidity
 }
 func (configuration HarnessConfiguration) Caps() HarnessCaps { return configuration.caps }
 

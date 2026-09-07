@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	CompiledPlanSchemaV1 = "ctrldb.ctrlboard.dev/wf-test-plan/v1"
-	WorkflowID           = isolation.WFTestWorkflowID
+	CompiledPlanSchemaV1       = "ctrldb.ctrlboard.dev/wf-test-plan/v1"
+	PermissionEvidenceSchemaV1 = "ctrldb.ctrlboard.dev/permission-evidence/v1"
+	WorkflowID                 = isolation.WFTestWorkflowID
 )
 
 var (
@@ -36,20 +37,48 @@ type CompileRequest struct {
 	LocalPolicyHash    string
 	ApprovedPolicyHash string
 	Pricing            PricingEvidence
+	Permissions        PermissionEvidence
 }
 
 // PricingEvidence is a fresh, externally obtained integer-micro-USD estimate.
 // M1-04 validates and binds it but never performs pricing I/O.
 type PricingEvidence struct {
 	MachineType        string    `json:"machineType"`
+	Region             string    `json:"region"`
+	Zone               string    `json:"zone"`
 	GuestCPUs          int64     `json:"guestCpus"`
 	MemoryMiB          int64     `json:"memoryMiB"`
+	DiskGiB            int64     `json:"diskGiB"`
+	Instances          int64     `json:"instances"`
+	LifetimeSeconds    int64     `json:"lifetimeSeconds"`
 	EstimatedRunMicros int64     `json:"estimatedRunMicros"`
+	Currency           string    `json:"currency"`
 	PriceTableDate     string    `json:"priceTableDate"`
 	Schema             string    `json:"schema"`
 	Revision           string    `json:"revision"`
 	ObservedAt         time.Time `json:"observedAt"`
 	ValidUntil         time.Time `json:"validUntil"`
+}
+
+// PermissionGrant is one exact positive permission observation. Missing,
+// denied, duplicated, or additional entries make the evidence unusable.
+type PermissionGrant struct {
+	StepID     string                   `json:"stepId"`
+	Identity   domain.ExecutionIdentity `json:"identity"`
+	Permission string                   `json:"permission"`
+	Granted    bool                     `json:"granted"`
+}
+
+// PermissionEvidence binds the complete pre-mutation grant set to the human,
+// project, and freshness window used to compile the plan.
+type PermissionEvidence struct {
+	Account    string            `json:"account"`
+	Project    string            `json:"project"`
+	Schema     string            `json:"schema"`
+	Revision   string            `json:"revision"`
+	ObservedAt time.Time         `json:"observedAt"`
+	ValidUntil time.Time         `json:"validUntil"`
+	Grants     []PermissionGrant `json:"grants"`
 }
 
 // ResourceKind is the closed set of provider objects referenced by M1-04.
@@ -120,6 +149,7 @@ type HarnessDesiredState struct {
 	WipeSchedulerJob     string            `json:"wipeSchedulerJob"`
 	WipeScheduleUTC      string            `json:"wipeScheduleUtc"`
 	ImageDigest          string            `json:"imageDigest"`
+	PlanValiditySeconds  int64             `json:"planValiditySeconds"`
 }
 
 // RunLimits is the exact future disposable-run ceiling recorded by the plan.
@@ -143,6 +173,7 @@ type EnvelopeBinding struct {
 	Account             string    `json:"account"`
 	ManifestHash        string    `json:"manifestHash"`
 	ObservationRevision string    `json:"observationRevision"`
+	PermissionRevision  string    `json:"permissionRevision"`
 	ObservedAt          time.Time `json:"observedAt"`
 	ValidUntil          time.Time `json:"validUntil"`
 	BindingSHA256       string    `json:"bindingSha256"`
@@ -153,6 +184,7 @@ type IntentKind string
 
 const (
 	IntentAuditBootstrap IntentKind = "audit-bootstrap"
+	IntentAuditRetention IntentKind = "audit-retention-lock"
 	IntentControlBucket  IntentKind = "control-bucket"
 	IntentBucketIAM      IntentKind = "bucket-iam"
 	IntentSeedControl    IntentKind = "seed-control"
@@ -225,6 +257,7 @@ type compiledPayloadV1 struct {
 	DesiredResources    []DesiredResource             `json:"desiredResources"`
 	Limits              RunLimits                     `json:"limits"`
 	Pricing             PricingEvidence               `json:"pricing"`
+	Permissions         PermissionEvidence            `json:"permissions"`
 	CleanupCapabilities []isolation.CleanupCapability `json:"cleanupCapabilities"`
 	Intents             []StepIntent                  `json:"intents"`
 	Risks               RiskSummary                   `json:"risks"`
@@ -255,6 +288,9 @@ func (value CompiledPlan) DesiredResources() []DesiredResource {
 }
 func (value CompiledPlan) Limits() RunLimits        { return value.payload.Limits }
 func (value CompiledPlan) Pricing() PricingEvidence { return value.payload.Pricing }
+func (value CompiledPlan) PermissionEvidence() PermissionEvidence {
+	return clonePermissionEvidence(value.payload.Permissions)
+}
 func (value CompiledPlan) CleanupCapabilities() []isolation.CleanupCapability {
 	return append([]isolation.CleanupCapability(nil), value.payload.CleanupCapabilities...)
 }

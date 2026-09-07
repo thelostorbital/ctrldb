@@ -100,16 +100,19 @@ func validateCompiledPayload(payload compiledPayloadV1) (domain.ExecutionContrac
 	if err != nil || !equalCanonicalValue(expectedResources, payload.DesiredResources) {
 		return domain.ExecutionContract{}, invalidCompiled("desired resources")
 	}
-	if err := validateLimitsAndPricing(payload.Limits, payload.Pricing, payload.Plan); err != nil {
+	if err := validateLimitsAndPricing(payload.Limits, payload.Pricing, payload.Plan, payload.Desired); err != nil {
 		return domain.ExecutionContract{}, err
 	}
 	if !slices.Equal(payload.CleanupCapabilities, isolation.InitialCleanupCapabilities()) {
 		return domain.ExecutionContract{}, invalidCompiled("cleanup capabilities")
 	}
-	if err := validateBinding(payload.Binding, payload.Plan); err != nil {
+	definitions := stepRegistry(expectedResources)
+	if err := validatePermissionEvidence(payload.Permissions, definitions, payload.Desired.Account, payload.Desired.Project, payload.Plan.CreatedAt); err != nil {
+		return domain.ExecutionContract{}, invalidCompiled("permission evidence")
+	}
+	if err := validateBinding(payload.Binding, payload.Plan, payload.Permissions.Revision); err != nil {
 		return domain.ExecutionContract{}, err
 	}
-	definitions := stepRegistry(expectedResources)
 	expectedPlan, contract, err := buildPlanValues(
 		payload.Plan.PlanID, payload.Desired.Project, payload.Plan.Environment, payload.Desired.Account,
 		payload.Plan.CreatedAt, payload.Plan.ExpiresAt, payload.Plan.PolicyHash.Local, payload.Plan.PolicyHash.Approved,
@@ -133,6 +136,10 @@ func validateDesiredState(desired HarnessDesiredState, plan domain.Plan) error {
 		!desiredProjectPattern.MatchString(desired.Project) || !desiredLocationPattern.MatchString(desired.Region) ||
 		!desiredLocationPattern.MatchString(desired.Zone) || !strings.HasPrefix(desired.Zone, desired.Region+"-") {
 		return invalidCompiled("desired provider context")
+	}
+	if desired.PlanValiditySeconds <= 0 || desired.PlanValiditySeconds > int64((1<<63-1)/time.Second) ||
+		!plan.ExpiresAt.Equal(plan.CreatedAt.Add(time.Duration(desired.PlanValiditySeconds)*time.Second)) {
+		return invalidCompiled("plan validity")
 	}
 	prefix, err := netip.ParsePrefix(desired.CIDR)
 	if err != nil || prefix != prefix.Masked() || !prefix.Addr().IsPrivate() {
@@ -160,12 +167,21 @@ func validateDesiredState(desired HarnessDesiredState, plan domain.Plan) error {
 		!strings.HasPrefix(desired.ImageDigest, "sha256:") || !sha256Pattern.MatchString(strings.TrimPrefix(desired.ImageDigest, "sha256:")) {
 		return invalidCompiled("protocol-owned desired state")
 	}
+	if err := config.ValidateHarnessPrincipalSet(
+		desired.Project, desired.OperatorPrincipal, desired.DestructivePrincipal,
+		desired.VMPrincipal, desired.WipePrincipal, desired.CIPrincipal,
+	); err != nil {
+		return invalidCompiled("desired principals")
+	}
 	return nil
 }
 
-func validateLimitsAndPricing(limits RunLimits, price PricingEvidence, plan domain.Plan) error {
+func validateLimitsAndPricing(limits RunLimits, price PricingEvidence, plan domain.Plan, desired HarnessDesiredState) error {
 	if limits.MaximumMachineType == "" || limits.MaximumMachineType != price.MachineType ||
+		price.Region != desired.Region || price.Zone != desired.Zone || !strings.HasPrefix(price.Zone, price.Region+"-") ||
 		limits.MaximumGuestCPUs != price.GuestCPUs || limits.MaximumMemoryMiB != price.MemoryMiB ||
+		limits.MaximumDiskGiB != price.DiskGiB || limits.MaximumInstances != price.Instances ||
+		limits.MaximumLifetimeSec != price.LifetimeSeconds || price.Currency != "USD" ||
 		limits.MaximumDiskGiB <= 0 || limits.MaximumInstances <= 0 || limits.MaximumLifetimeSec <= 0 ||
 		limits.MaximumCostMicros < 0 || limits.MaximumCostMicros > maximumExactMicros ||
 		limits.EstimatedCostMicros != price.EstimatedRunMicros || limits.EstimatedCostMicros < 0 ||
@@ -179,13 +195,17 @@ func validateLimitsAndPricing(limits RunLimits, price PricingEvidence, plan doma
 	if err != nil || parsedDate.After(plan.CreatedAt) || plan.CreatedAt.Sub(parsedDate) > maximumPricingAge {
 		return invalidCompiled("price table date")
 	}
+	if revision, err := pricingEvidenceRevision(price); err != nil || revision != price.Revision {
+		return invalidCompiled("pricing revision")
+	}
 	return nil
 }
 
-func validateBinding(binding EnvelopeBinding, plan domain.Plan) error {
+func validateBinding(binding EnvelopeBinding, plan domain.Plan, permissionRevision string) error {
 	if binding.WorkflowID != WorkflowID || binding.PlanID != plan.PlanID || binding.PlanHash != plan.PlanHash ||
 		binding.Account != plan.Principal || !sha256Pattern.MatchString(binding.ManifestHash) ||
 		!sha256Pattern.MatchString(binding.ObservationRevision) || !validUTC(binding.ObservedAt) ||
+		binding.PermissionRevision != permissionRevision || !sha256Pattern.MatchString(binding.PermissionRevision) ||
 		!validUTC(binding.ValidUntil) || !binding.ObservedAt.Before(binding.ValidUntil) ||
 		plan.CreatedAt.Before(binding.ObservedAt) || !plan.CreatedAt.Before(binding.ValidUntil) ||
 		!sha256Pattern.MatchString(binding.BindingSHA256) {
@@ -259,6 +279,7 @@ func clonePayload(payload compiledPayloadV1) compiledPayloadV1 {
 	payload.Plan = clonePlan(payload.Plan)
 	payload.Desired = cloneDesired(payload.Desired)
 	payload.DesiredResources = append([]DesiredResource(nil), payload.DesiredResources...)
+	payload.Permissions = clonePermissionEvidence(payload.Permissions)
 	payload.CleanupCapabilities = append([]isolation.CleanupCapability(nil), payload.CleanupCapabilities...)
 	payload.Intents = cloneIntents(payload.Intents)
 	payload.Risks = cloneRisks(payload.Risks)
@@ -303,6 +324,11 @@ func cloneRisks(value RiskSummary) RiskSummary {
 	value.Risks = append([]string(nil), value.Risks...)
 	value.Rollback = append([]string(nil), value.Rollback...)
 	value.Compensation = append([]string(nil), value.Compensation...)
+	return value
+}
+
+func clonePermissionEvidence(value PermissionEvidence) PermissionEvidence {
+	value.Grants = append([]PermissionGrant(nil), value.Grants...)
 	return value
 }
 

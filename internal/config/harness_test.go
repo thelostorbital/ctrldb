@@ -169,6 +169,10 @@ func TestHarnessConfigurationRequiresCompleteValidation(t *testing.T) {
 		{name: "disabled wipe reconciler", mutate: func(t *testing.T, manifest map[string]any) {
 			nestedMap(t, manifest, "spec", "reconciler")["enabled"] = false
 		}},
+		{name: "shared control and audit bucket", mutate: func(t *testing.T, manifest map[string]any) {
+			control := nestedMap(t, manifest, "spec", "control")
+			control["auditBucket"] = control["stateBucket"]
+		}},
 		{name: "shared operator and destructive identity", mutate: func(t *testing.T, manifest map[string]any) {
 			isolation := nestedMap(t, manifest, "spec", "testIsolation")
 			isolation["destructiveServiceAccount"] = isolation["operatorServiceAccount"]

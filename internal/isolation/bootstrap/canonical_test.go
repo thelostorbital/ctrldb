@@ -56,6 +56,7 @@ func TestParseCompiledPlanRejectsRehashedSemanticTampering(t *testing.T) {
 			value.Desired.VMPrincipal = "ctrldb-test-vm@foreign-project.iam.gserviceaccount.com"
 		}},
 		{name: "duplicate service account", mutate: func(value *compiledPayloadV1) { value.Desired.VMPrincipal = value.Desired.OperatorPrincipal }},
+		{name: "shared control and audit bucket", mutate: func(value *compiledPayloadV1) { value.Desired.AuditBucket = value.Desired.ControlBucket }},
 		{name: "plan validity bypass", mutate: func(value *compiledPayloadV1) { value.Desired.PlanValiditySeconds++ }},
 		{name: "unsupported cleanup kind", mutate: func(value *compiledPayloadV1) {
 			value.CleanupCapabilities[0] = isolation.CleanupCapability("compute.snapshots")

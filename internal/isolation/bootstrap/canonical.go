@@ -161,6 +161,9 @@ func validateDesiredState(desired HarnessDesiredState, plan domain.Plan) error {
 			return invalidCompiled("desired value")
 		}
 	}
+	if desired.ControlBucket == desired.AuditBucket {
+		return invalidCompiled("distinct control and audit buckets")
+	}
 	if desired.IAPFirewall != iapFirewallName || desired.InternalFirewall != internalFirewallName ||
 		desired.NodeTag != testNodeTag || desired.OperatorRole != operatorRoleName ||
 		desired.DestructiveRole != destructiveRoleName || desired.WipeScheduleUTC != wipeScheduleUTC ||

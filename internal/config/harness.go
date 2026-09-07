@@ -189,6 +189,9 @@ func HarnessConfigurationFromManifest(document ManifestDocument) (HarnessConfigu
 			return HarnessConfiguration{}, fmt.Errorf("%w: required value is absent", ErrInvalidHarnessConfiguration)
 		}
 	}
+	if wire.Spec.Control.StateBucket == wire.Spec.Control.AuditBucket {
+		return HarnessConfiguration{}, fmt.Errorf("%w: control and audit buckets must be distinct", ErrInvalidHarnessConfiguration)
+	}
 	if wire.Spec.TestIsolation.Caps.MaxDiskGiB <= 0 || wire.Spec.TestIsolation.Caps.MaxInstances <= 0 {
 		return HarnessConfiguration{}, fmt.Errorf("%w: invalid numeric caps", ErrInvalidHarnessConfiguration)
 	}

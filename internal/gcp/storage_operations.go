@@ -78,20 +78,23 @@ func (session *StorageSession) CreateControlBucket(ctx context.Context, identity
 	return session.createBucket(ctx, opCreateControl, identity, arguments)
 }
 
+// createBucket performs discovery inside the mutation boundary: a bucket
+// already observable in the project is a positive collision and the create is
+// never rendered. A refused create is reported as the process failure with
+// its sanitized diagnostics; gcloud 560 exposes no machine-readable
+// distinction between a global-name conflict and any other refusal, so the
+// adapter never relabels a refusal as a conflict or as absence.
 func (session *StorageSession) createBucket(ctx context.Context, operation storageOperation, identity control.BucketIdentity, arguments []string) error {
+	if _, exists, err := session.DescribeBucket(ctx, identity.Name); err != nil {
+		return err
+	} else if exists {
+		return storageError(StorageFailurePrecondition, string(operation))
+	}
 	if _, err := session.run(ctx, operation, arguments); err != nil {
-		state, exists, describeErr := session.DescribeBucket(ctx, identity.Name)
-		if describeErr != nil {
-			return err
+		if _, exists, describeErr := session.DescribeBucket(ctx, identity.Name); describeErr == nil && exists {
+			return &StorageError{kind: StorageFailurePrecondition, source: string(operation), diagnostics: redactDiagnostics(err)}
 		}
-		var failure *StorageError
-		diagnostics := redactDiagnostics(err)
-		if exists && state.Identity.Project == session.project {
-			failure = &StorageError{kind: StorageFailurePrecondition, source: string(operation), diagnostics: diagnostics}
-			return failure
-		}
-		failure = &StorageError{kind: StorageFailureConflict, source: string(operation), diagnostics: diagnostics}
-		return failure
+		return err
 	}
 	_, err := session.run(ctx, opEnableVersioning, session.globals("storage", "buckets", "update", bucketURL(identity.Name), "--versioning"))
 	return err
@@ -144,6 +147,9 @@ func (session *StorageSession) upload(ctx context.Context, operation storageOper
 	if !storageObjectNamePattern.MatchString(object) || len(content) == 0 || len(content) > storageStdoutLimit {
 		return control.ObjectDescriptor{}, storageError(StorageFailureInvalid, "object")
 	}
+	if err := session.admitObject(object); err != nil {
+		return control.ObjectDescriptor{}, err
+	}
 	var descriptor control.ObjectDescriptor
 	err := session.withWorkFile(content, func(path string) error {
 		arguments := session.globals("storage", "cp", path, objectURL(identity.Name, object),
@@ -188,6 +194,9 @@ func (session *StorageSession) describeObject(ctx context.Context, identity cont
 	if !storageObjectNamePattern.MatchString(object) {
 		return control.ObjectDescriptor{}, false, storageError(StorageFailureInvalid, "object")
 	}
+	if err := session.admitObject(object); err != nil {
+		return control.ObjectDescriptor{}, false, err
+	}
 	// objects list on the exact URL answers absence with an empty JSON array.
 	result, err := session.run(ctx, opDescribeObject, session.globals("storage", "objects", "list", objectURL(identity.Name, object), "--format="+objectDescribeProjection))
 	if err != nil {
@@ -214,7 +223,10 @@ func (session *StorageSession) readObject(ctx context.Context, identity control.
 	if err != nil || !exists {
 		return nil, control.ObjectDescriptor{}, false, err
 	}
-	result, err := session.run(ctx, opReadObject, session.globals("storage", "cat", objectURL(identity.Name, object)))
+	// The read is pinned to the described generation (gs://bucket/object#gen)
+	// so a concurrent replacement cannot be mistaken for the described bytes.
+	pinned := objectURL(identity.Name, object) + "#" + strconv.FormatUint(uint64(descriptor.Generation), 10)
+	result, err := session.run(ctx, opReadObject, session.globals("storage", "cat", pinned))
 	if err != nil {
 		return nil, control.ObjectDescriptor{}, false, err
 	}
@@ -304,6 +316,9 @@ func (session *StorageSession) changeBinding(ctx context.Context, operation stor
 	}
 	if err := control.ValidateBucketBindingShape(binding, session.auditBucket, session.controlBucket); err != nil {
 		return storageError(StorageFailureUnauthorized, "binding shape")
+	}
+	if _, rendered := session.policy[binding]; !rendered {
+		return storageError(StorageFailureUnauthorized, "binding is not in the rendered K3 policy")
 	}
 	arguments := session.globals("storage", "buckets", verb, bucketURL(identity.Name), "--member="+binding.Member, "--role="+binding.Role,
 		"--condition=expression="+binding.ConditionExpression+",title="+binding.ConditionTitle)

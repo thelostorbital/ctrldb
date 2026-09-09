@@ -100,6 +100,7 @@ type BucketState struct {
 	RetentionLocked          bool
 	LifecycleArchiveAfterDay int64
 	LifecycleDeleteRule      bool
+	SoftDeleteSeconds        int64
 	Metageneration           int64
 	TimeCreated              time.Time
 }

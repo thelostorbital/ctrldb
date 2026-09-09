@@ -28,6 +28,9 @@ const (
 	storageStderrLimit  = 64 << 10
 	storageContentType  = "application/json"
 	storageWorkFileMode = os.FileMode(0o600)
+	// storageClockSkew bounds how far the gateway's Now may drift from the
+	// trusted clock before a session is treated as retained/stale.
+	storageClockSkew = 2 * time.Minute
 
 	// Exact desired bucket settings (ARCHITECTURE "Control-plane storage").
 	controlSoftDeleteSeconds int64 = 30 * 24 * 60 * 60
@@ -263,6 +266,11 @@ type StorageSession struct {
 	buckets       map[string]bootstrap.DesiredResource
 	auditBucket   string
 	controlBucket string
+	// policy is the exact rendered K3 binding set; IAM changes outside it
+	// are refused.
+	policy map[control.BucketBinding]struct{}
+	// objects is the closed object-name set a K4/K5 session may touch.
+	objects map[string]struct{}
 }
 
 var _ control.AuditBucketPort = (*StorageSession)(nil)
@@ -295,11 +303,69 @@ func (client *StorageClient) Authorize(
 	if err != nil {
 		return nil, err
 	}
-	return &StorageSession{
+	session := &StorageSession{
 		client: client, authorization: authorization, kind: kind, account: target.Account,
 		project: configuration.Project(), location: configuration.Region(), buckets: buckets,
 		auditBucket: configuration.AuditBucket(), controlBucket: configuration.ControlBucket(),
-	}, nil
+		policy: map[control.BucketBinding]struct{}{}, objects: map[string]struct{}{},
+	}
+	if err := session.bindStepTargets(configuration); err != nil {
+		return nil, err
+	}
+	// The trusted clock, not the caller's Now, decides freshness now and
+	// again before every mutation.
+	if err := session.fresh(); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+// bindStepTargets closes the K3 policy set and the K4/K5 object-name set from
+// the validated configuration, never from caller input.
+func (session *StorageSession) bindStepTargets(configuration config.HarnessConfiguration) error {
+	switch session.kind {
+	case bootstrap.IntentBucketIAM:
+		desired := bootstrap.HarnessDesiredState{
+			AuditBucket: configuration.AuditBucket(), ControlBucket: configuration.ControlBucket(),
+			OperatorPrincipal: configuration.OperatorPrincipal(), DestructivePrincipal: configuration.DestructivePrincipal(),
+			VMPrincipal: configuration.VMPrincipal(), WipePrincipal: configuration.WipeServiceAccount(),
+		}
+		policy, err := control.RenderBucketPolicy("k3-bucket-iam", desired)
+		if err != nil {
+			return storageError(StorageFailureUnauthorized, "rendered policy")
+		}
+		for _, binding := range policy.Bindings {
+			session.policy[binding] = struct{}{}
+		}
+	case bootstrap.IntentSeedControl:
+		environment := configuration.Environment()
+		for _, name := range control.SeedObjectNames(environment) {
+			session.objects[name] = struct{}{}
+		}
+		if len(session.objects) == 0 {
+			return storageError(StorageFailureUnauthorized, "seed object names")
+		}
+	case bootstrap.IntentLockRoundTrip:
+		lock, err := control.LockObjectName(configuration.Environment())
+		if err != nil {
+			return storageError(StorageFailureUnauthorized, "lock object name")
+		}
+		session.objects[lock.String()] = struct{}{}
+	}
+	return nil
+}
+
+// fresh revalidates the authorization window against the trusted clock. It
+// runs at Authorize and immediately before every state-changing call, so a
+// retained session cannot outlive its window.
+func (session *StorageSession) fresh() error {
+	now := session.client.clock().UTC()
+	authorization := session.authorization
+	if now.IsZero() || now.Before(authorization.ObservedAt) || !now.Before(authorization.ValidUntil) ||
+		authorization.Now.After(now.Add(storageClockSkew)) || now.Sub(authorization.Now) > storageClockSkew {
+		return storageError(StorageFailureUnauthorized, "authorization is stale at the trusted clock")
+	}
+	return nil
 }
 
 func validateStorageAuthorization(authorization StorageMutationAuthorization, intent bootstrap.StepIntent) error {
@@ -370,6 +436,17 @@ func (session *StorageSession) admit(operation storageOperation, bucket string) 
 	return nil
 }
 
+// admitObject confines K4/K5 object writes and reads to the closed name set.
+func (session *StorageSession) admitObject(object string) error {
+	if len(session.objects) == 0 {
+		return nil
+	}
+	if _, ok := session.objects[object]; !ok {
+		return storageError(StorageFailureUnauthorized, "object is not an approved step target")
+	}
+	return nil
+}
+
 func (session *StorageSession) identity(identity control.BucketIdentity) error {
 	if identity.Project != session.project || identity.Location != session.location || !storageBucketNamePattern.MatchString(identity.Name) {
 		return storageError(StorageFailureIdentity, "bucket identity")
@@ -386,10 +463,18 @@ func bucketURL(name string) string { return "gs://" + name }
 
 func objectURL(bucket string, object string) string { return "gs://" + bucket + "/" + object }
 
-// run executes one fixed argv template through the sealed boundary.
+var mutatingOperations = set(opCreateAudit, opCreateControl, opEnableVersioning, opLifecycle, opRetention, opLockRetention, opUploadCreateOnly, opUploadCAS, opAddBinding, opRemoveBinding)
+
+// run executes one fixed argv template through the sealed boundary. Every
+// mutating template is preceded by a trusted-clock freshness check.
 func (session *StorageSession) run(ctx context.Context, source storageOperation, arguments []string) (runner.Result, error) {
 	if ctx == nil {
 		return runner.Result{}, storageError(StorageFailureInvalid, string(source))
+	}
+	if _, mutating := mutatingOperations[source]; mutating {
+		if err := session.fresh(); err != nil {
+			return runner.Result{}, err
+		}
 	}
 	client := session.client
 	result, err := client.boundary.Run(ctx, runner.Request{

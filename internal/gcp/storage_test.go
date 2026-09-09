@@ -259,14 +259,18 @@ func (fake *gcloudStorageFake) objectsList(args []string) (runner.Result, error)
 
 func (fake *gcloudStorageFake) cat(args []string) (runner.Result, error) {
 	target := strings.TrimPrefix(args[2], "gs://")
-	bucketName, object, _ := strings.Cut(target, "/")
+	path, generation, pinned := strings.Cut(target, "#")
+	if !pinned {
+		return failure("fake: cat must pin a generation")
+	}
+	bucketName, object, _ := strings.Cut(path, "/")
 	bucket := fake.buckets[bucketName]
 	if bucket == nil {
 		return failure("ERROR: NotFoundException 404 bucket")
 	}
 	stored, exists := bucket.objects[object]
-	if !exists {
-		return failure("ERROR: NotFoundException 404 object")
+	if !exists || strconv.FormatInt(stored.generation, 10) != generation {
+		return failure("ERROR: NotFoundException 404 object generation")
 	}
 	return runner.Result{ExitCode: 0, Stdout: append([]byte(nil), stored.content...), Stderr: redact.Sanitize("")}, nil
 }
@@ -581,18 +585,26 @@ func TestStorageCreateConflictIsAnExplicitPreconditionFailureNeverAbsence(t *tes
 	}
 	err = session.CreateAuditBucket(ctx, auditIdentity())
 	var failure *StorageError
-	if !errors.As(err, &failure) || failure.Kind() != StorageFailureConflict || !errors.Is(err, control.ErrBucketNameConflict) {
-		t.Fatalf("create conflict error = %v", err)
+	// gcloud exposes no machine-readable conflict signal, so the refusal is
+	// reported as the process failure with sanitized diagnostics: it blocks,
+	// it is never relabelled as a name conflict, and it never claims absence.
+	if !errors.As(err, &failure) || failure.Kind() != StorageFailureProcess || !errors.Is(err, ErrStorageRejected) ||
+		errors.Is(err, control.ErrBucketNameConflict) || errors.Is(err, control.ErrObjectNotFound) {
+		t.Fatalf("create refusal error = %v", err)
 	}
 	if strings.Contains(strings.ToLower(err.Error()), "absent") || strings.Contains(strings.ToLower(err.Error()), "not found") {
-		t.Fatalf("conflict error claims absence: %v", err)
+		t.Fatalf("refusal error claims absence: %v", err)
 	}
 	if failure.Diagnostics().String() == "" {
 		t.Fatal("sanitized diagnostics were dropped")
 	}
+	argv := fake.argv()
+	if len(argv) != 4 || !strings.HasPrefix(argv[1], "storage buckets list") || !strings.HasPrefix(argv[2], "storage buckets create") || !strings.HasPrefix(argv[3], "storage buckets list") {
+		t.Fatalf("create path argv = %v", fake.argv())
+	}
 
-	// A project-local bucket that appears between describe and create is a
-	// positive collision (precondition), not a global-name conflict.
+	// A project-local bucket is a positive collision (precondition) and the
+	// create is never rendered.
 	local := newGcloudStorageFake()
 	local.buckets[storageTestAudit] = &fakeBucket{project: storageTestProject, objects: map[string]fakeStoredObject{},
 		state: map[string]any{"name": storageTestAudit, "location": "US-CENTRAL1", "metageneration": 1, "creation_time": "2026-09-09T12:05:00+0000",
@@ -601,6 +613,43 @@ func TestStorageCreateConflictIsAnExplicitPreconditionFailureNeverAbsence(t *tes
 	err = session.CreateAuditBucket(ctx, auditIdentity())
 	if !errors.As(err, &failure) || failure.Kind() != StorageFailurePrecondition || !errors.Is(err, control.ErrPreconditionFailed) {
 		t.Fatalf("local collision error = %v", err)
+	}
+	for _, line := range local.argv() {
+		if strings.HasPrefix(line, "storage buckets create") {
+			t.Fatalf("create rendered over an existing bucket: %v", local.argv())
+		}
+	}
+}
+
+func TestStorageSessionUsesTheTrustedClockAndRefusesRetainedSessions(t *testing.T) {
+	t.Parallel()
+	client, fake := testStorageClient(t)
+	current := storageTestNow
+	client.clock = func() time.Time { return current }
+	target := storageTarget(t)
+	intent := storageIntent("k2-control-bucket", bootstrap.IntentControlBucket, "control-bucket")
+	resources := []bootstrap.DesiredResource{storageResource("control-bucket", storageTestControl)}
+	// The caller's Now inside the window does not help when the trusted clock is past it.
+	current = storageTestNow.Add(10 * time.Minute)
+	if _, err := client.Authorize(validStorageAuthorization("k2-control-bucket"), intent, resources, target); err == nil {
+		t.Fatal("expired authorization accepted on the trusted clock")
+	}
+	current = storageTestNow
+	session, err := client.Authorize(validStorageAuthorization("k2-control-bucket"), intent, resources, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A retained session is refused at the next mutation once the window passes.
+	current = storageTestNow.Add(4*time.Minute + 30*time.Second)
+	err = session.CreateControlBucket(context.Background(), controlIdentity())
+	var failure *StorageError
+	if !errors.As(err, &failure) || failure.Kind() != StorageFailureUnauthorized {
+		t.Fatalf("retained session error = %v", err)
+	}
+	for _, line := range fake.argv() {
+		if strings.HasPrefix(line, "storage buckets create") || strings.HasPrefix(line, "storage buckets update") {
+			t.Fatalf("stale session mutated: %v", fake.argv())
+		}
 	}
 }
 
@@ -624,7 +673,7 @@ func TestStorageControlBucketAndIAMAndCAS(t *testing.T) {
 		t.Fatalf("CreateControlBucket() error = %v", err)
 	}
 	state, exists, err := k2.DescribeBucket(ctx, storageTestControl)
-	if err != nil || !exists || !state.Versioning || !state.UniformBucketLevelAccess || state.PublicAccessPrevention != "enforced" || state.Identity != controlIdentity() {
+	if err != nil || !exists || !state.Versioning || !state.UniformBucketLevelAccess || state.PublicAccessPrevention != "enforced" || state.Identity != controlIdentity() || state.SoftDeleteSeconds != 2592000 {
 		t.Fatalf("control bucket state = %#v, %v, %v", state, exists, err)
 	}
 	if !strings.Contains(strings.Join(fake.argv(), "\n"), "--soft-delete-duration=2592000s") {
@@ -669,6 +718,17 @@ func TestStorageControlBucketAndIAMAndCAS(t *testing.T) {
 	if err := k3.AddBinding(ctx, auditIdentity(), unscoped); err == nil {
 		t.Fatal("bucket-wide binding rendered")
 	}
+	foreignMember := control.BucketBinding{Bucket: storageTestAudit, Role: control.RoleObjectViewer, Member: "serviceAccount:intruder@other-project.iam.gserviceaccount.com", Prefix: control.TestPrefix}
+	foreignMember.ConditionTitle, foreignMember.ConditionExpression = policy.Bindings[0].ConditionTitle, policy.Bindings[0].ConditionExpression
+	if err := k3.AddBinding(ctx, auditIdentity(), foreignMember); err == nil {
+		t.Fatal("binding outside the rendered policy rendered")
+	}
+	auditUser := control.BucketBinding{Bucket: storageTestAudit, Role: control.RoleObjectUser, Member: policy.Bindings[0].Member, Prefix: control.TestPrefix}
+	auditUser.ConditionTitle = "ctrldb-test-objectUser"
+	auditUser.ConditionExpression = policy.Bindings[0].ConditionExpression
+	if err := k3.AddBinding(ctx, auditIdentity(), auditUser); err == nil {
+		t.Fatal("objectUser on the audit bucket rendered")
+	}
 	if err := k3.RemoveBinding(ctx, auditIdentity(), control.CompensationBindings(policy.Bindings, nil)[0]); err != nil {
 		t.Fatalf("RemoveBinding() error = %v", err)
 	}
@@ -707,6 +767,15 @@ func TestStorageControlBucketAndIAMAndCAS(t *testing.T) {
 	if _, err := k5.UploadIfGenerationMatch(ctx, controlIdentity(), lockName, 0, []byte(`x`)); err == nil {
 		t.Fatal("CAS with generation 0 accepted")
 	}
+	if _, err := k5.UploadIfGenerationMatch(ctx, controlIdentity(), control.HarnessStateObjectName(), held.Generation, []byte(`x`)); err == nil {
+		t.Fatal("K5 CAS reached an object other than the approved lock")
+	}
+	if _, _, err := k5.DescribeControlObject(ctx, controlIdentity(), control.HarnessStateObjectName()); err == nil {
+		t.Fatal("K5 observed an object other than the approved lock")
+	}
+	if _, err := k4.UploadControlCreateOnly(ctx, controlIdentity(), control.HarnessStateObjectName(), []byte(`x`)); err == nil {
+		t.Fatal("K4 wrote an object outside the seed set")
+	}
 	content, descriptor, exists, err := k5.ReadControlObject(ctx, controlIdentity(), lockName)
 	if err != nil || !exists || descriptor != held || string(content) != `{"state":"held"}` {
 		t.Fatalf("ReadControlObject() = %s, %#v, %v, %v", content, descriptor, exists, err)
@@ -728,21 +797,23 @@ func TestStorageControlBucketAndIAMAndCAS(t *testing.T) {
 func TestStorageParsersFailClosedOnHostileOutput(t *testing.T) {
 	t.Parallel()
 	for name, input := range map[string]string{
-		"two buckets":      `[{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD"},{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD"}]`,
-		"wrong name":       `[{"name":"other","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD"}]`,
-		"unknown key":      `[{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD","surprise":1}]`,
-		"duplicate key":    `[{"name":"` + storageTestAudit + `","name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD"}]`,
-		"delete lifecycle": `[{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD","lifecycle_config":{"rule":[{"action":{"type":"Unknown"},"condition":{"age":1}}]}}]`,
-		"null":             `null`,
-		"trailing":         `[] {}`,
+		"two buckets":       `[{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD"},{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD"}]`,
+		"wrong name":        `[{"name":"other","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD"}]`,
+		"unknown key":       `[{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD","surprise":1}]`,
+		"duplicate key":     `[{"name":"` + storageTestAudit + `","name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD"}]`,
+		"delete lifecycle":  `[{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD","lifecycle_config":{"rule":[{"action":{"type":"Unknown"},"condition":{"age":1}}]}}]`,
+		"null":              `null`,
+		"trailing":          `[] {}`,
+		"two archive rules": `[{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD","lifecycle_config":{"rule":[{"action":{"type":"SetStorageClass","storageClass":"ARCHIVE"},"condition":{"age":30}},{"action":{"type":"SetStorageClass","storageClass":"ARCHIVE"},"condition":{"age":365}}]}}]`,
+		"bad soft delete":   `[{"name":"` + storageTestAudit + `","location":"US","metageneration":1,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD","soft_delete_policy":{"retentionDurationSeconds":"x"}}]`,
 	} {
 		if _, _, err := parseBucketState([]byte(input), storageTestAudit); err == nil {
 			t.Fatalf("%s accepted", name)
 		}
 	}
-	state, exists, err := parseBucketState([]byte(`[{"name":"`+storageTestAudit+`","location":"US-CENTRAL1","metageneration":4,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD","uniform_bucket_level_access":true,"public_access_prevention":"enforced","versioning_enabled":true,"retention_period":31536000,"retention_policy_is_locked":true,"lifecycle_config":{"rule":[{"action":{"type":"SetStorageClass","storageClass":"ARCHIVE"},"condition":{"age":365}},{"action":{"type":"Delete"},"condition":{"age":9}}]}}]`), storageTestAudit)
+	state, exists, err := parseBucketState([]byte(`[{"name":"`+storageTestAudit+`","location":"US-CENTRAL1","metageneration":4,"creation_time":"2026-09-09T12:05:00+0000","default_storage_class":"STANDARD","uniform_bucket_level_access":true,"public_access_prevention":"enforced","versioning_enabled":true,"retention_period":31536000,"retention_policy_is_locked":true,"soft_delete_policy":{"retentionDurationSeconds":"2592000","effectiveTime":"2026-09-09T12:05:00.000000+00:00"},"lifecycle_config":{"rule":[{"action":{"type":"SetStorageClass","storageClass":"ARCHIVE"},"condition":{"age":365}},{"action":{"type":"Delete"},"condition":{"age":9}}]}}]`), storageTestAudit)
 	if err != nil || !exists || state.Identity.Location != "us-central1" || state.RetentionSeconds != 31536000 || !state.RetentionLocked ||
-		state.LifecycleArchiveAfterDay != 365 || !state.LifecycleDeleteRule || state.Metageneration != 4 || !state.TimeCreated.Equal(time.Date(2026, 9, 9, 12, 5, 0, 0, time.UTC)) {
+		state.LifecycleArchiveAfterDay != 365 || !state.LifecycleDeleteRule || state.Metageneration != 4 || state.SoftDeleteSeconds != 2592000 || !state.TimeCreated.Equal(time.Date(2026, 9, 9, 12, 5, 0, 0, time.UTC)) {
 		t.Fatalf("parsed = %#v, %v, %v", state, exists, err)
 	}
 	if _, exists, err := parseBucketState([]byte(`[]`), storageTestAudit); err != nil || exists {

@@ -135,20 +135,34 @@ func bucketStateFromWire(wire bucketWireV560) (control.BucketState, error) {
 		Metageneration:           metageneration,
 		TimeCreated:              created,
 	}
+	if wire.SoftDeletePolicy != nil {
+		seconds, err := numberInt64(wire.SoftDeletePolicy.RetentionDurationSeconds, true)
+		if err != nil || seconds < 0 {
+			return control.BucketState{}, storageError(StorageFailureSchema, "soft delete policy")
+		}
+		state.SoftDeleteSeconds = seconds
+	}
 	if wire.LifecycleConfig != nil {
+		archiveRules := 0
 		for _, rule := range wire.LifecycleConfig.Rule {
 			switch rule.Action.Type {
 			case "SetStorageClass":
 				age, err := numberInt64(rule.Condition.Age, true)
-				if err != nil || rule.Action.StorageClass != "ARCHIVE" {
+				if err != nil || rule.Action.StorageClass != "ARCHIVE" || age <= 0 {
 					return control.BucketState{}, storageError(StorageFailureSchema, "lifecycle rule")
 				}
+				archiveRules++
 				state.LifecycleArchiveAfterDay = age
 			case "Delete":
 				state.LifecycleDeleteRule = true
 			default:
 				return control.BucketState{}, storageError(StorageFailureSchema, "lifecycle action")
 			}
+		}
+		// The approved lifecycle is exactly one ARCHIVE transition; more than
+		// one is not the approved document and fails closed.
+		if archiveRules > 1 {
+			return control.BucketState{}, storageError(StorageFailureSchema, "lifecycle has more than one archive rule")
 		}
 	}
 	return state, nil

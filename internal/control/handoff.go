@@ -63,13 +63,15 @@ const (
 	PhaseRetentionConfigured  HandoffPhase = "retention-configured"
 	PhaseRetentionLockClaimed HandoffPhase = "retention-lock-claimed"
 	PhaseRetentionLocked      HandoffPhase = "retention-locked"
+	PhaseControlBucketClaimed HandoffPhase = "control-bucket-create-claimed"
+	PhaseControlBucketCreated HandoffPhase = "control-bucket-created"
 	phaseOrderUnknown                      = -1
 )
 
 var handoffPhaseOrder = [...]HandoffPhase{
 	PhaseEnvelopeSealed, PhaseAuditBucketClaimed, PhaseAuditBucketCreated, PhaseEnvelopeUploaded,
 	PhaseJournalUploaded, PhaseLifecycleConfigured, PhaseHandoffVerified, PhaseRetentionConfigured,
-	PhaseRetentionLockClaimed, PhaseRetentionLocked,
+	PhaseRetentionLockClaimed, PhaseRetentionLocked, PhaseControlBucketClaimed, PhaseControlBucketCreated,
 }
 
 func (phase HandoffPhase) order() int {

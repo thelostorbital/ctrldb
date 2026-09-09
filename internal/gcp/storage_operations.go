@@ -57,11 +57,12 @@ func (session *StorageSession) CreateAuditBucket(ctx context.Context, identity c
 	}
 	arguments := session.globals("storage", "buckets", "create", bucketURL(identity.Name), "--location="+identity.Location,
 		"--uniform-bucket-level-access", "--public-access-prevention", "--default-storage-class=STANDARD")
-	return session.createBucket(ctx, opCreateAudit, identity, arguments)
+	return session.createBucket(ctx, opCreateAudit, identity, arguments, true)
 }
 
 // CreateControlBucket creates the mutable control bucket: UBLA, enforced PAP,
-// STANDARD class, 30-day soft delete, then versioning.
+// STANDARD class, 30-day soft delete. Versioning is a separate EnableVersioning
+// call so the executor can record the creation before converging it.
 func (session *StorageSession) CreateControlBucket(ctx context.Context, identity control.BucketIdentity) error {
 	if err := session.admit(opCreateControl, identity.Name); err != nil {
 		return err
@@ -75,7 +76,7 @@ func (session *StorageSession) CreateControlBucket(ctx context.Context, identity
 	arguments := session.globals("storage", "buckets", "create", bucketURL(identity.Name), "--location="+identity.Location,
 		"--uniform-bucket-level-access", "--public-access-prevention", "--default-storage-class=STANDARD",
 		"--soft-delete-duration="+strconv.FormatInt(controlSoftDeleteSeconds, 10)+"s")
-	return session.createBucket(ctx, opCreateControl, identity, arguments)
+	return session.createBucket(ctx, opCreateControl, identity, arguments, false)
 }
 
 // createBucket performs discovery inside the mutation boundary: a bucket
@@ -84,7 +85,7 @@ func (session *StorageSession) CreateControlBucket(ctx context.Context, identity
 // its sanitized diagnostics; gcloud 560 exposes no machine-readable
 // distinction between a global-name conflict and any other refusal, so the
 // adapter never relabels a refusal as a conflict or as absence.
-func (session *StorageSession) createBucket(ctx context.Context, operation storageOperation, identity control.BucketIdentity, arguments []string) error {
+func (session *StorageSession) createBucket(ctx context.Context, operation storageOperation, identity control.BucketIdentity, arguments []string, versioning bool) error {
 	if _, exists, err := session.DescribeBucket(ctx, identity.Name); err != nil {
 		return err
 	} else if exists {
@@ -94,6 +95,29 @@ func (session *StorageSession) createBucket(ctx context.Context, operation stora
 		if _, exists, describeErr := session.DescribeBucket(ctx, identity.Name); describeErr == nil && exists {
 			return &StorageError{kind: StorageFailurePrecondition, source: string(operation), diagnostics: redactDiagnostics(err)}
 		}
+		return err
+	}
+	if !versioning {
+		return nil
+	}
+	_, err := session.run(ctx, opEnableVersioning, session.globals("storage", "buckets", "update", bucketURL(identity.Name), "--versioning"))
+	return err
+}
+
+// AuthorizedStep exposes the binding this session was authorized for.
+func (session *StorageSession) AuthorizedStep() (string, string, string) {
+	if session == nil {
+		return "", "", ""
+	}
+	return session.authorization.EnvelopeBindingSHA256, session.authorization.OperationID, session.authorization.StepID
+}
+
+// EnableVersioning converges versioning on an approved bucket (K2 repair).
+func (session *StorageSession) EnableVersioning(ctx context.Context, identity control.BucketIdentity) error {
+	if err := session.admit(opEnableVersioning, identity.Name); err != nil {
+		return err
+	}
+	if err := session.identity(identity); err != nil {
 		return err
 	}
 	_, err := session.run(ctx, opEnableVersioning, session.globals("storage", "buckets", "update", bucketURL(identity.Name), "--versioning"))

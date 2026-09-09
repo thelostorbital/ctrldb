@@ -672,6 +672,9 @@ func TestStorageControlBucketAndIAMAndCAS(t *testing.T) {
 	if err := k2.CreateControlBucket(ctx, controlIdentity()); err != nil {
 		t.Fatalf("CreateControlBucket() error = %v", err)
 	}
+	if err := k2.EnableVersioning(ctx, controlIdentity()); err != nil {
+		t.Fatalf("EnableVersioning() error = %v", err)
+	}
 	state, exists, err := k2.DescribeBucket(ctx, storageTestControl)
 	if err != nil || !exists || !state.Versioning || !state.UniformBucketLevelAccess || state.PublicAccessPrevention != "enforced" || state.Identity != controlIdentity() || state.SoftDeleteSeconds != 2592000 {
 		t.Fatalf("control bucket state = %#v, %v, %v", state, exists, err)

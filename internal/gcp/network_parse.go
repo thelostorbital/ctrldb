@@ -4,6 +4,7 @@
 package gcp
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -234,7 +235,7 @@ type routerStatusWire struct {
 		Network   string `json:"network"`
 		NATStatus []struct {
 			Name                 string `json:"name"`
-			MinExtraNATIPsNeeded int64  `json:"minExtraNatIpsNeeded"`
+			MinExtraNATIPsNeeded *int64 `json:"minExtraNatIpsNeeded"`
 		} `json:"natStatus"`
 	} `json:"result"`
 }
@@ -278,10 +279,70 @@ func (expected expectedNetworkResource) parseObservation(data []byte) (bool, err
 
 func decodeNetworkList[T any](data []byte, id string) ([]T, error) {
 	var wire []T
-	if err := decodeProviderJSON(data, &wire, false); err != nil || len(wire) > 1 {
+	if err := decodeNetworkProviderJSON(data, &wire); err != nil || len(wire) > 1 {
 		return nil, networkError(NetworkFailureSchema, id+" observation")
 	}
 	return wire, nil
+}
+
+// decodeNetworkProviderJSON adds case-folded duplicate rejection to the
+// shared strict decoder. encoding/json matches struct fields using Unicode
+// case folding, so accepting both "name" and "Name" would otherwise let a
+// later contradictory value replace the projected provider field.
+func decodeNetworkProviderJSON(data []byte, target any) error {
+	if err := decodeProviderJSON(data, target, false); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	return inspectFoldedNetworkJSON(decoder)
+}
+
+func inspectFoldedNetworkJSON(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make([]string, 0)
+		for decoder.More() {
+			keyToken, keyErr := decoder.Token()
+			if keyErr != nil {
+				return keyErr
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("object key is not a string")
+			}
+			for _, prior := range seen {
+				if strings.EqualFold(prior, key) {
+					return fmt.Errorf("case-folded duplicate object key")
+				}
+			}
+			seen = append(seen, key)
+			if valueErr := inspectFoldedNetworkJSON(decoder); valueErr != nil {
+				return valueErr
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if valueErr := inspectFoldedNetworkJSON(decoder); valueErr != nil {
+				return valueErr
+			}
+		}
+	default:
+		return fmt.Errorf("unexpected delimiter")
+	}
+	closing, closeErr := decoder.Token()
+	if closeErr != nil || closing != map[json.Delim]json.Delim{'{': '}', '[': ']'}[delimiter] {
+		return fmt.Errorf("composite value is not closed")
+	}
+	return nil
 }
 
 func (expected expectedNetworkResource) identityMatches(name, selfLink string) bool {
@@ -372,7 +433,7 @@ func parseRouterObservation(expected expectedNetworkResource, data []byte) (bool
 
 func parseNATObservation(expected expectedNetworkResource, data []byte) (bool, error) {
 	var wire []natListWire
-	if err := decodeProviderJSON(data, &wire, false); err != nil {
+	if err := decodeNetworkProviderJSON(data, &wire); err != nil {
 		return false, networkError(NetworkFailureSchema, expected.resource.ID+" observation")
 	}
 	var found *natListWire
@@ -405,7 +466,7 @@ func parseNATObservation(expected expectedNetworkResource, data []byte) (bool, e
 // exactly the desired NAT on the desired network with no missing addresses.
 func (expected expectedNetworkResource) parseNATStatus(data []byte) error {
 	var wire routerStatusWire
-	if err := decodeProviderJSON(data, &wire, false); err != nil {
+	if err := decodeNetworkProviderJSON(data, &wire); err != nil {
 		return networkError(NetworkFailureSchema, expected.resource.ID+" status")
 	}
 	if !computeSelfLinkMatches(wire.Result.Network, networkProvider(expected.command.project, "global", "networks", expected.vpc)) {
@@ -414,7 +475,7 @@ func (expected expectedNetworkResource) parseNATStatus(data []byte) error {
 	if len(wire.Result.NATStatus) != 1 || wire.Result.NATStatus[0].Name != expected.resource.Name {
 		return expected.drift("router status does not name exactly the desired NAT")
 	}
-	if wire.Result.NATStatus[0].MinExtraNATIPsNeeded != 0 {
+	if wire.Result.NATStatus[0].MinExtraNATIPsNeeded == nil || *wire.Result.NATStatus[0].MinExtraNATIPsNeeded != 0 {
 		return expected.drift("is not operational")
 	}
 	return nil

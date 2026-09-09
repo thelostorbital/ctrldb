@@ -37,7 +37,7 @@ var (
 	ErrNetworkRejected   = errors.New("gcp network mutation rejected")
 	networkHexPattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	networkNamePattern   = regexp.MustCompile(`^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
-	networkRegionPattern = regexp.MustCompile(`^[a-z]+-[a-z]+[0-9]$`)
+	networkRegionPattern = regexp.MustCompile(`^[a-z]+-[a-z]+[0-9]+$`)
 	networkOpIDPattern   = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$`)
 )
 
@@ -282,7 +282,9 @@ func (client *NetworkClient) execute(
 
 	result := NetworkStepResult{OperationID: authorization.OperationID, StepID: intent.StepID, Attempt: authorization.Attempt, Kind: intent.Kind}
 	for _, expected := range plan {
-		outcome, applyErr := client.applyResource(stepContext, expected, mutate)
+		outcome, applyErr := client.applyResource(stepContext, expected, mutate, func() error {
+			return client.validateNetworkAuthorization(authorization, intent, target.Preflight)
+		})
 		if outcome.Outcome == NetworkResourceCreated {
 			result.Created = append(result.Created, NetworkCreatedResource{
 				OperationID: authorization.OperationID, StepID: intent.StepID, Attempt: authorization.Attempt,
@@ -291,6 +293,12 @@ func (client *NetworkClient) execute(
 			})
 		}
 		if applyErr != nil {
+			if len(result.Created) != 0 {
+				var failure *NetworkError
+				if errors.As(applyErr, &failure) && failure.Mutation() == domain.MutationNotOccurred {
+					applyErr = networkMutationError(failure.kind, failure.source, domain.MutationOccurred)
+				}
+			}
 			return result, applyErr
 		}
 		result.Resources = append(result.Resources, outcome)
@@ -299,7 +307,12 @@ func (client *NetworkClient) execute(
 }
 
 // applyResource is the describe-before-create loop for one resource.
-func (client *NetworkClient) applyResource(ctx context.Context, expected expectedNetworkResource, mutate bool) (NetworkResourceResult, error) {
+func (client *NetworkClient) applyResource(
+	ctx context.Context,
+	expected expectedNetworkResource,
+	mutate bool,
+	authorizeMutation func() error,
+) (NetworkResourceResult, error) {
 	result := NetworkResourceResult{
 		ResourceID: expected.resource.ID, Kind: expected.resource.Kind, Name: expected.resource.Name,
 		Project: expected.resource.Project, Location: expected.resource.Location, ProviderID: expected.resource.ProviderID,
@@ -315,6 +328,9 @@ func (client *NetworkClient) applyResource(ctx context.Context, expected expecte
 	}
 	if !mutate {
 		return NetworkResourceResult{}, networkError(NetworkFailureDrift, expected.resource.ID+" is absent")
+	}
+	if err := authorizeMutation(); err != nil {
+		return NetworkResourceResult{}, err
 	}
 	if err := client.create(ctx, expected); err != nil {
 		return NetworkResourceResult{}, err
@@ -481,7 +497,7 @@ func (client *NetworkClient) validateNetworkAuthorization(
 		return networkError(NetworkFailureAuthorization, "authorization freshness")
 	}
 	clock := client.clock().UTC()
-	if !preflight.FreshAt(clock) {
+	if clock.Before(authorization.Now) || !preflight.FreshAt(clock) {
 		return networkError(NetworkFailureAuthorization, "authorization clock")
 	}
 	return nil

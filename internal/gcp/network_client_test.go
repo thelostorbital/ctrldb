@@ -193,6 +193,7 @@ func TestNetworkClientRefusesDriftBeforeAnyMutation(t *testing.T) {
 		{name: "nat partial ranges", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(strings.Replace(presentNAT, "ALL_SUBNETWORKS_ALL_IP_RANGES", "LIST_OF_SUBNETWORKS", 1))}},
 		{name: "foreign nat on router", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(strings.Replace(presentNAT, "ctrldb-test-nat", "other-nat", 1))}},
 		{name: "nat not operational", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentStatus, `"minExtraNatIpsNeeded":0`, `"minExtraNatIpsNeeded":1`, 1))}},
+		{name: "nat status omits address shortage evidence", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentStatus, `,"minExtraNatIpsNeeded":0`, ``, 1))}},
 		{name: "status names other nat", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentStatus, `"name":"ctrldb-test-nat"`, `"name":"other-nat"`, 1))}},
 		{name: "status on other network", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentStatus, "networks/ctrldb-test-vpc", "networks/default", 1))}},
 		{name: "internet-wide ssh", kind: bootstrap.IntentFirewall, script: []networkFakeStep{ok(strings.Replace(iap, "35.235.240.0/20", "0.0.0.0/0", 1))}},
@@ -457,4 +458,60 @@ func TestNetworkClientHonoursStepTimeoutAndCancellation(t *testing.T) {
 	_, err := client.ApplyStep(ctx, networkAuthorization(intent, target.Preflight), intent, networkStepResources(intent.Kind), target)
 	assertNetworkFailure(t, "canceled", err, NetworkFailureProcess, domain.MutationNotOccurred)
 	assertNoCreate(t, fake.calls)
+}
+
+func TestNetworkClientRevalidatesAuthorizationImmediatelyBeforeEveryMutation(t *testing.T) {
+	intent := networkIntent(bootstrap.IntentNAT)
+	target := networkTarget(t)
+	authorization := networkAuthorization(intent, target.Preflight)
+
+	for _, test := range []struct {
+		name        string
+		secondNow   time.Time
+		wantCalls   int
+		wantCreated int
+	}{
+		{name: "approval expires before first create", secondNow: authorization.ValidUntil, wantCalls: 1},
+		{name: "clock regresses before first create", secondNow: authorization.Now.Add(-time.Second), wantCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake := testNetworkClient(t, createScript(bootstrap.IntentNAT)...)
+			calls := 0
+			client.clock = func() time.Time {
+				calls++
+				if calls == 1 {
+					return authorization.Now
+				}
+				return test.secondNow
+			}
+			result, err := client.ApplyStep(context.Background(), authorization, intent, networkStepResources(intent.Kind), target)
+			assertNetworkFailure(t, test.name, err, NetworkFailureAuthorization, domain.MutationNotOccurred)
+			if len(fake.calls) != test.wantCalls || len(result.Created) != test.wantCreated {
+				t.Fatalf("calls = %d, created = %d", len(fake.calls), len(result.Created))
+			}
+			assertNoCreate(t, fake.calls)
+		})
+	}
+
+	t.Run("approval expires between creates", func(t *testing.T) {
+		client, fake := testNetworkClient(t, createScript(bootstrap.IntentNAT)...)
+		calls := 0
+		client.clock = func() time.Time {
+			calls++
+			if calls <= 2 {
+				return authorization.Now
+			}
+			return authorization.ValidUntil
+		}
+		result, err := client.ApplyStep(context.Background(), authorization, intent, networkStepResources(intent.Kind), target)
+		assertNetworkFailure(t, "expiry between creates", err, NetworkFailureAuthorization, domain.MutationOccurred)
+		if len(fake.calls) != 4 || len(result.Created) != 1 || result.Created[0].ResourceID != "test-router" {
+			t.Fatalf("calls = %d, result = %#v", len(fake.calls), result)
+		}
+		for _, call := range fake.calls {
+			if len(call) > 3 && call[1] == "routers" && call[2] == "nats" && call[3] == "create" {
+				t.Fatalf("second mutation ran after approval expiry: %q", call)
+			}
+		}
+	})
 }

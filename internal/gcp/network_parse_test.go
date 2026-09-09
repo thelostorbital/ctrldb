@@ -45,6 +45,9 @@ func TestNetworkParseRejectsHostileProviderOutputWithoutMutation(t *testing.T) {
 		{name: "malformed", kind: bootstrap.IntentNetwork, output: `[`},
 		{name: "trailing", kind: bootstrap.IntentNetwork, output: presentNetwork + `{}`},
 		{name: "duplicate key", kind: bootstrap.IntentNetwork, output: strings.Replace(presentNetwork, `"autoCreateSubnetworks":false`, `"autoCreateSubnetworks":false,"autoCreateSubnetworks":false`, 1)},
+		{name: "case-folded duplicate key", kind: bootstrap.IntentNetwork, output: strings.Replace(presentNetwork, `"name":"ctrldb-test-vpc"`, `"name":"wrong","Name":"ctrldb-test-vpc"`, 1)},
+		{name: "unicode-folded duplicate key", kind: bootstrap.IntentNetwork, output: strings.Replace(presentNetwork, `"selfLink":"`+computeBase, `"selfLink":"wrong","ſelfLink":"`+computeBase, 1)},
+		{name: "nested case-folded duplicate key", kind: bootstrap.IntentFirewall, output: strings.Replace(presentFirewall("test-iap-firewall"), `"enable":false`, `"enable":true,"Enable":false`, 1)},
 		{name: "unknown key", kind: bootstrap.IntentNetwork, output: strings.Replace(presentNetwork, `"autoCreateSubnetworks":false`, `"autoCreateSubnetworks":false,"unexpected":1`, 1)},
 		{name: "two entries", kind: bootstrap.IntentNetwork, output: `[` + strings.TrimSuffix(strings.TrimPrefix(presentNetwork, "["), "]") + `,` + strings.TrimSuffix(strings.TrimPrefix(presentNetwork, "["), "]") + `]`},
 		{name: "filter disobeyed", kind: bootstrap.IntentNetwork, output: strings.Replace(presentNetwork, `"name":"ctrldb-test-vpc"`, `"name":"ctrldb-test-vpc2"`, 1)},
@@ -109,6 +112,19 @@ func TestNetworkSelfLinkMatchingIsExact(t *testing.T) {
 	for _, cidr := range []string{"", "10.40.0.1/24", "203.0.113.0/24", "0.0.0.0/0", "10.40.0.0/32", "fd00::/64", "10.40.0.0"} {
 		if canonicalPrivateIPv4Prefix(cidr) {
 			t.Fatalf("non-canonical or public prefix accepted: %s", cidr)
+		}
+	}
+}
+
+func TestNetworkRegionValidationAcceptsDiscoveredMultiDigitRegions(t *testing.T) {
+	for _, region := range []string{"us-central1", "northamerica-northeast2", "europe-west10"} {
+		if !networkRegionPattern.MatchString(region) {
+			t.Fatalf("valid discovered region rejected: %s", region)
+		}
+	}
+	for _, region := range []string{"", "us-central", "us-central1-a", "US-CENTRAL1", "us--1"} {
+		if networkRegionPattern.MatchString(region) {
+			t.Fatalf("invalid region accepted: %s", region)
 		}
 	}
 }

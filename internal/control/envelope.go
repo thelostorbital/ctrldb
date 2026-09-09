@@ -261,6 +261,25 @@ func (envelope BootstrapEnvelopeV1) validate() error {
 	return nil
 }
 
+// ErrEnvelopeExpired is returned when the approval or plan window no longer
+// admits a mutation at the evaluated time.
+var ErrEnvelopeExpired = errors.New("bootstrap envelope authorization expired or not yet valid")
+
+// validAt requires now to fall inside both the approval window and the plan
+// validity window. Observation freshness is revalidated by the gateway.
+func (envelope BootstrapEnvelopeV1) validAt(now time.Time) error {
+	if envelope.hash == "" {
+		return invalidEnvelope("unsealed")
+	}
+	sealed := envelope.plan.Plan()
+	approval := envelope.payload.Approval
+	if !validUTC(now) || now.Before(approval.ApprovedAt) || !now.Before(approval.ValidUntil) ||
+		now.Before(sealed.CreatedAt) || !now.Before(sealed.ExpiresAt) {
+		return ErrEnvelopeExpired
+	}
+	return nil
+}
+
 // ParseBootstrapEnvelope accepts only the canonical encoding. Duplicate,
 // unknown, null, or trailing fields, a hash mismatch, or any cross-binding
 // failure rejects the document.

@@ -32,7 +32,7 @@ func TestStoreInterfacesExposeNoDeleteOrOverwriteSurface(t *testing.T) {
 		t.Fatalf("ControlStore methods = %v", got)
 	}
 	if got := methods((*AuditBucketPort)(nil)); !reflect.DeepEqual(got, []string{
-		"ConfigureArchiveLifecycle", "ConfigureRetention", "CreateAuditBucket", "DescribeBucket", "DescribeObject", "LockRetention", "UploadCreateOnly",
+		"ConfigureArchiveLifecycle", "ConfigureRetention", "CreateAuditBucket", "DescribeBucket", "DescribeObject", "LockRetention", "ReadObject", "UploadCreateOnly",
 	}) {
 		t.Fatalf("AuditBucketPort methods = %v", got)
 	}

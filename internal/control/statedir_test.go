@@ -22,9 +22,24 @@ func TestStateDirectoryRejectsUnsafeLocations(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	linkParent := t.TempDir()
+	if err := os.Chmod(linkParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(linkParent, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(linkParent, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(real, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	for name, path := range map[string]string{
 		"relative": "state", "unclean": t.TempDir() + "/./", "missing": filepath.Join(t.TempDir(), "missing"),
 		"group readable": shared, "regular file": file,
+		"symlink component": filepath.Join(linkParent, "link", "state"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewStateDirectory(path); !errors.Is(err, ErrInvalidStateDirectory) {

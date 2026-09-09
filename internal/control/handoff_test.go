@@ -132,12 +132,27 @@ func (fake *fakeAuditBucket) ConfigureRetention(_ context.Context, identity Buck
 	return fake.after("retention")
 }
 
-func (fake *fakeAuditBucket) LockRetention(_ context.Context, identity BucketIdentity) error {
+func (fake *fakeAuditBucket) ReadObject(_ context.Context, identity BucketIdentity, object AuditObjectName) ([]byte, ObjectDescriptor, bool, error) {
+	fake.mutex.Lock()
+	defer fake.mutex.Unlock()
+	fake.calls["read-object"]++
+	stored, exists := fake.objects[identity.Name][object.String()]
+	if !exists {
+		return nil, ObjectDescriptor{}, false, nil
+	}
+	return append([]byte(nil), stored.content...), stored.descriptor, true, nil
+}
+
+func (fake *fakeAuditBucket) LockRetention(_ context.Context, identity BucketIdentity, expectedMetageneration int64) error {
 	fake.mutex.Lock()
 	defer fake.mutex.Unlock()
 	bucket := fake.buckets[identity.Name]
 	if bucket == nil || bucket.RetentionSeconds == 0 {
 		return errors.New("fake: lock without retention")
+	}
+	if bucket.Metageneration != expectedMetageneration {
+		fake.calls["lock-precondition-failed"]++
+		return fmt.Errorf("%w: bucket metageneration moved before the lock", ErrPreconditionFailed)
 	}
 	bucket.RetentionLocked = true
 	bucket.Metageneration++
@@ -215,7 +230,7 @@ func (fixture *handoffFixture) assertComplete(t *testing.T) {
 	}
 	fake := fixture.fake
 	if fake.count("create-bucket") != 1 || fake.count("lock") != 1 || fake.count("retention") != 1 || fake.count("lifecycle") != 1 ||
-		fake.count("create-conflict") != 0 {
+		fake.count("create-conflict") != 0 || fake.count("lock-precondition-failed") != 0 {
 		t.Fatalf("mutation counts = %v", fake.calls)
 	}
 	envelopeName, _ := BootstrapEnvelopeObjectName(fixture.envelope.Environment(), fixtureOperationID)
@@ -282,6 +297,19 @@ func TestAuditHandoffResumesAfterCrashAtEveryBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			fixture.handoff = resumed
+			if boundary == "create-bucket" {
+				// The bucket exists but holds no envelope: only an operation-bound
+				// remote marker adopts a bucket, so this blocks for explicit
+				// recovery without any further mutation (D-158).
+				_, err := fixture.handoff.Bootstrap(ctx, fixture.envelope)
+				if !errors.Is(err, ErrPartialBootstrapBlocked) {
+					t.Fatalf("resume after create crash error = %v, want ErrPartialBootstrapBlocked", err)
+				}
+				if fixture.fake.count("create-bucket") != 1 || fixture.fake.count("lifecycle") != 0 || fixture.fake.count("lock") != 0 {
+					t.Fatalf("blocked resume mutated: %v", fixture.fake.calls)
+				}
+				return
+			}
 			fixture.assertComplete(t)
 		})
 	}
@@ -336,7 +364,7 @@ func TestAuditHandoffBucketNameConflictIsAnExplicitPreconditionFailure(t *testin
 	if got := fixture.phases(t); len(got) != 2 || got[1] != PhaseAuditBucketClaimed {
 		t.Fatalf("phases after conflict = %v (create must never be recorded)", got)
 	}
-	if fixture.fake.count("lock") != 0 || fixture.fake.count("describe-object") != 0 {
+	if fixture.fake.count("lock") != 0 || fixture.fake.count("describe-object") != 0 || fixture.fake.count("read-object") != 0 {
 		t.Fatalf("calls after conflict = %v", fixture.fake.calls)
 	}
 }
@@ -484,5 +512,148 @@ func TestAuditHandoffRejectsTamperedLocalRecords(t *testing.T) {
 	}
 	if fixture.fake.count("lock") != 0 {
 		t.Fatal("lock proceeded on a tampered chain")
+	}
+}
+
+func TestAuditHandoffBlocksForeignRetentionOnLockedBucketAfterCrash(t *testing.T) {
+	t.Parallel()
+	fixture := newHandoffFixture(t)
+	ctx := context.Background()
+	fixture.fake.crashAfter["lock"] = true
+	if _, err := fixture.handoff.Bootstrap(ctx, fixture.envelope); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.handoff.LockRetention(ctx, fixture.envelope); !errors.Is(err, errSimulatedCrash) {
+		t.Fatalf("LockRetention() error = %v", err)
+	}
+	// A foreign actor changed the period on the locked bucket before the retry.
+	fixture.fake.buckets[fixture.identity.Name].RetentionSeconds = AuditRetentionSeconds + 86400
+	status, err := fixture.handoff.LockRetention(ctx, fixture.envelope)
+	if !errors.Is(err, ErrPartialBootstrapBlocked) || status.RetentionLocked {
+		t.Fatalf("retry over a foreign period = %#v, %v; want ErrPartialBootstrapBlocked", status, err)
+	}
+	if fixture.phases(t)[len(fixture.phases(t))-1] == PhaseRetentionLocked {
+		t.Fatal("retention-locked was recorded over contradictory state")
+	}
+}
+
+func TestAuditHandoffLockRefusesWhenMetagenerationMoves(t *testing.T) {
+	t.Parallel()
+	fixture := newHandoffFixture(t)
+	ctx := context.Background()
+	if _, err := fixture.handoff.Bootstrap(ctx, fixture.envelope); err != nil {
+		t.Fatal(err)
+	}
+	// The retention period is configured, then the bucket changes underneath
+	// the lock call: the port must refuse instead of locking unapproved state.
+	fixture.fake.buckets[fixture.identity.Name].RetentionSeconds = AuditRetentionSeconds
+	fixture.fake.crashAfter["retention"] = false
+	original := fixture.fake.buckets[fixture.identity.Name].Metageneration
+	fixture.fake.calls["describe-bucket"] = 0
+	racing := &racingPort{fakeAuditBucket: fixture.fake, bump: func() {
+		fixture.fake.buckets[fixture.identity.Name].Metageneration = original + 100
+	}}
+	handoff, err := NewAuditHandoff(fixture.directory, racing, fixture.handoff.clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handoff.LockRetention(ctx, fixture.envelope); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("LockRetention() error = %v, want ErrPreconditionFailed", err)
+	}
+	if fixture.fake.buckets[fixture.identity.Name].RetentionLocked || fixture.fake.count("lock") != 0 {
+		t.Fatal("lock was applied despite a moved metageneration")
+	}
+}
+
+// racingPort mutates the bucket between the handoff's last observation and the
+// lock call.
+type racingPort struct {
+	*fakeAuditBucket
+	bump func()
+}
+
+func (port *racingPort) LockRetention(ctx context.Context, identity BucketIdentity, expected int64) error {
+	port.bump()
+	return port.fakeAuditBucket.LockRetention(ctx, identity, expected)
+}
+
+func TestAuditHandoffRefusesExpiredAuthorization(t *testing.T) {
+	t.Parallel()
+	fixture := newHandoffFixture(t)
+	late := fixture.envelope.Approval().ValidUntil
+	expired, err := NewAuditHandoff(fixture.directory, fixture.fake, func() time.Time { return late })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := expired.Bootstrap(ctx, fixture.envelope); !errors.Is(err, ErrEnvelopeExpired) {
+		t.Fatalf("Bootstrap() after approval expiry error = %v", err)
+	}
+	if _, err := expired.LockRetention(ctx, fixture.envelope); !errors.Is(err, ErrEnvelopeExpired) {
+		t.Fatalf("LockRetention() after approval expiry error = %v", err)
+	}
+	early, _ := NewAuditHandoff(fixture.directory, fixture.fake, func() time.Time { return fixtureNow })
+	if _, err := early.Bootstrap(ctx, fixture.envelope); !errors.Is(err, ErrEnvelopeExpired) {
+		t.Fatalf("Bootstrap() before approval error = %v", err)
+	}
+	if fixture.fake.count("create-bucket") != 0 || fixture.fake.count("describe-bucket") != 0 {
+		t.Fatalf("expired authorization reached the provider: %v", fixture.fake.calls)
+	}
+}
+
+func TestAuditHandoffRefusesBackwardClockBeforePersisting(t *testing.T) {
+	t.Parallel()
+	envelope := fixtureEnvelope(t)
+	directory := fixtureStateDirectory(t)
+	// The first record is stamped at T+4m; every later reading regresses to
+	// T+3m, so the create claim must be refused before the provider is called.
+	index := 0
+	clock := func() time.Time {
+		index++
+		if index <= 2 {
+			return fixtureNow.Add(4 * time.Minute)
+		}
+		return fixtureNow.Add(3 * time.Minute)
+	}
+	fake := newFakeAuditBucket(clock)
+	handoff, err := NewAuditHandoff(directory, fake, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handoff.Bootstrap(context.Background(), envelope); !errors.Is(err, ErrInvalidHandoffRecord) {
+		t.Fatalf("Bootstrap() with a regressing clock error = %v", err)
+	}
+	if fake.count("create-bucket") != 0 {
+		t.Fatal("a regressing clock still reached the provider")
+	}
+}
+
+func TestAuditHandoffReverifiesCompletedBootstrapAndRejectsByteDrift(t *testing.T) {
+	t.Parallel()
+	fixture := newHandoffFixture(t)
+	ctx := context.Background()
+	if _, err := fixture.handoff.Bootstrap(ctx, fixture.envelope); err != nil {
+		t.Fatal(err)
+	}
+	envelopeName, _ := BootstrapEnvelopeObjectName(fixture.envelope.Environment(), fixtureOperationID)
+	stored := fixture.fake.objects[fixture.identity.Name][envelopeName.String()]
+	// Same size and CRC32C descriptor, different bytes: a checksum collision
+	// must not pass as the exact envelope.
+	stored.content = append([]byte(nil), stored.content...)
+	stored.content[10] ^= 0x01
+	fixture.fake.objects[fixture.identity.Name][envelopeName.String()] = stored
+	if _, err := fixture.handoff.Bootstrap(ctx, fixture.envelope); !errors.Is(err, ErrPartialBootstrapBlocked) {
+		t.Fatalf("completed Bootstrap() over drifted bytes error = %v", err)
+	}
+	if _, err := fixture.handoff.LockRetention(ctx, fixture.envelope); !errors.Is(err, ErrPartialBootstrapBlocked) {
+		t.Fatalf("LockRetention() over drifted bytes error = %v", err)
+	}
+	vanished := newHandoffFixture(t)
+	if _, err := vanished.handoff.Bootstrap(ctx, vanished.envelope); err != nil {
+		t.Fatal(err)
+	}
+	delete(vanished.fake.buckets, vanished.identity.Name)
+	if _, err := vanished.handoff.Bootstrap(ctx, vanished.envelope); !errors.Is(err, ErrPartialBootstrapBlocked) {
+		t.Fatalf("completed Bootstrap() over a vanished bucket error = %v", err)
 	}
 }

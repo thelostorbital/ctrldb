@@ -53,6 +53,10 @@ func NewStateDirectory(path string) (StateDirectory, error) {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return StateDirectory{}, fmt.Errorf("%w: path must be absolute and clean", ErrInvalidStateDirectory)
 	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || resolved != path {
+		return StateDirectory{}, fmt.Errorf("%w: no path component may be a symbolic link", ErrInvalidStateDirectory)
+	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
 		return StateDirectory{}, fmt.Errorf("%w: must be an existing owner-private directory", ErrInvalidStateDirectory)

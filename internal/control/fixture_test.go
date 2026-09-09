@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -198,7 +199,10 @@ func fixtureEnvelope(t *testing.T) BootstrapEnvelopeV1 {
 
 func fixtureStateDirectory(t *testing.T) StateDirectory {
 	t.Helper()
-	path := t.TempDir()
+	path, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp directory: %v", err)
+	}
 	if err := os.Chmod(path, 0o700); err != nil {
 		t.Fatalf("chmod state directory: %v", err)
 	}

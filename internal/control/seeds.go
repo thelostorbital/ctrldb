@@ -4,10 +4,13 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"time"
 )
 
@@ -162,9 +165,16 @@ type SeedOutcome struct {
 	Preexisting bool
 }
 
-// SeedControlStore creates every seed with a create-only precondition. An
-// existing object is read and preserved byte-for-byte; only an approved-policy
-// object bound to a different manifest hash blocks.
+// ErrSeedIncompatible is returned when an existing seed object is malformed
+// or semantically incompatible with the envelope; it is preserved, never
+// overwritten, and the operation blocks.
+var ErrSeedIncompatible = errors.New("existing control seed object is incompatible with the approved bootstrap")
+
+// SeedControlStore first reads every seed location and validates each
+// existing object strictly; only when no conflict exists does it create the
+// absent seeds with a create-only precondition. Existing objects are preserved
+// byte-for-byte. An approved-policy object bound to a different manifest hash
+// blocks toward WF-ENV-02.
 func SeedControlStore(ctx context.Context, store ControlStore, envelope BootstrapEnvelopeV1) ([]SeedOutcome, error) {
 	if store == nil {
 		return nil, fmt.Errorf("%w: nil store", ErrInvalidStoreRequest)
@@ -173,12 +183,26 @@ func SeedControlStore(ctx context.Context, store ControlStore, envelope Bootstra
 	if err != nil {
 		return nil, err
 	}
-	policyName, err := ApprovedPolicyObjectName(envelope.Environment())
-	if err != nil {
-		return nil, err
+	existing := make([]*StoredObject, len(seeds))
+	for index, seed := range seeds {
+		object, err := store.Read(ctx, seed.Name)
+		if err != nil {
+			if errors.Is(err, ErrObjectNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		if err := validateExistingSeed(seed, object.Content, envelope); err != nil {
+			return nil, err
+		}
+		existing[index] = &object
 	}
 	outcomes := make([]SeedOutcome, 0, len(seeds))
-	for _, seed := range seeds {
+	for index, seed := range seeds {
+		if existing[index] != nil {
+			outcomes = append(outcomes, SeedOutcome{Name: seed.Name, Descriptor: existing[index].Descriptor, Preexisting: true})
+			continue
+		}
 		descriptor, err := store.Create(ctx, seed.Name, seed.Content)
 		if err == nil {
 			outcomes = append(outcomes, SeedOutcome{Name: seed.Name, Descriptor: descriptor})
@@ -187,27 +211,82 @@ func SeedControlStore(ctx context.Context, store ControlStore, envelope Bootstra
 		if !errors.Is(err, ErrPreconditionFailed) {
 			return nil, err
 		}
-		existing, err := store.Read(ctx, seed.Name)
+		// Lost a create race after the preflight: re-read and validate.
+		object, err := store.Read(ctx, seed.Name)
 		if err != nil {
 			return nil, err
 		}
-		if seed.Name == policyName {
-			if err := checkApprovedPolicy(existing.Content, envelope.Plan().Binding().ManifestHash); err != nil {
-				return nil, err
-			}
+		if err := validateExistingSeed(seed, object.Content, envelope); err != nil {
+			return nil, err
 		}
-		outcomes = append(outcomes, SeedOutcome{Name: seed.Name, Descriptor: existing.Descriptor, Preexisting: true})
+		outcomes = append(outcomes, SeedOutcome{Name: seed.Name, Descriptor: object.Descriptor, Preexisting: true})
 	}
 	return outcomes, nil
 }
 
-func checkApprovedPolicy(content []byte, manifestHash string) error {
-	if len(content) == 0 || len(content) > maxSeedObjectBytes {
-		return ErrApprovedPolicyMismatch
+func validateExistingSeed(seed SeedObject, content []byte, envelope BootstrapEnvelopeV1) error {
+	if bytes.Equal(content, seed.Content) {
+		return nil
 	}
-	var policy ApprovedPolicyV1
-	if err := json.Unmarshal(content, &policy); err != nil || policy.Schema != ApprovedPolicySchemaV1 || policy.SHA256 != manifestHash {
-		return ErrApprovedPolicyMismatch
+	if len(content) == 0 || len(content) > maxSeedObjectBytes {
+		return fmt.Errorf("%w: %s size", ErrSeedIncompatible, seed.Name)
+	}
+	if err := rejectDuplicateKeys(content); err != nil {
+		return fmt.Errorf("%w: %s is ambiguous", ErrSeedIncompatible, seed.Name)
+	}
+	environment := envelope.Environment()
+	plan := envelope.Plan()
+	switch {
+	case strings.HasPrefix(seed.Name.value, "locks/"):
+		var lock LockRecordV1
+		if err := decodeStrictSeed(content, &lock); err != nil || lock.Schema != LockRecordSchemaV1 || lock.Environment != environment ||
+			(lock.State != LockStateReleased && lock.State != LockStateHeld) {
+			return fmt.Errorf("%w: %s", ErrSeedIncompatible, seed.Name)
+		}
+	case strings.HasPrefix(seed.Name.value, "adoption/"):
+		var adoption AdoptionRecordV1
+		if err := decodeStrictSeed(content, &adoption); err != nil || adoption.Schema != AdoptionRecordSchemaV1 ||
+			adoption.Environment != environment || adoption.Project != envelope.Project() ||
+			!operationIDPattern.MatchString(adoption.OperationID) || !planIDPattern.MatchString(adoption.PlanID) || !validUTC(adoption.AdoptedAt) {
+			return fmt.Errorf("%w: %s", ErrSeedIncompatible, seed.Name)
+		}
+		var expected AdoptionRecordV1
+		_ = json.Unmarshal(seed.Content, &expected)
+		if !equalCanonicalValue(adoption.Resources, expected.Resources) {
+			return fmt.Errorf("%w: %s records different permanent resources", ErrSeedIncompatible, seed.Name)
+		}
+	case strings.HasSuffix(seed.Name.value, "/manifest-approved.json"):
+		var policy ApprovedPolicyV1
+		if err := decodeStrictSeed(content, &policy); err != nil || policy.Schema != ApprovedPolicySchemaV1 ||
+			!planIDPattern.MatchString(policy.PlanID) || policy.ApprovedBy == "" {
+			return fmt.Errorf("%w: %s", ErrSeedIncompatible, seed.Name)
+		}
+		if policy.SHA256 != plan.Binding().ManifestHash {
+			return ErrApprovedPolicyMismatch
+		}
+	case strings.HasSuffix(seed.Name.value, "/cost-ceiling.json"):
+		var ceiling CostCeilingV1
+		if err := decodeStrictSeed(content, &ceiling); err != nil || ceiling.Schema != CostCeilingSchemaV1 || ceiling.Environment != environment ||
+			ceiling.Currency != "USD" || !planIDPattern.MatchString(ceiling.PlanID) {
+			return fmt.Errorf("%w: %s", ErrSeedIncompatible, seed.Name)
+		}
+		if ceiling.CeilingMicros != plan.Limits().MaximumCostMicros {
+			return fmt.Errorf("%w: %s", ErrApprovedPolicyMismatch, seed.Name)
+		}
+	default:
+		return fmt.Errorf("%w: %s", ErrSeedIncompatible, seed.Name)
+	}
+	return nil
+}
+
+func decodeStrictSeed(content []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return errors.New("trailing data")
 	}
 	return nil
 }

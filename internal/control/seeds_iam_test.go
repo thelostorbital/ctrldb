@@ -94,6 +94,50 @@ func TestSeedObjectsAreExactAndCreateOnly(t *testing.T) {
 	if _, err := SeedControlStore(ctx, mismatched, envelope); !errors.Is(err, ErrApprovedPolicyMismatch) {
 		t.Fatalf("mismatched policy error = %v", err)
 	}
+	if names := mismatched.Names(); len(names) != 1 {
+		t.Fatalf("a rejected seeding created partial state: %v", names)
+	}
+	// Existing seeds are parsed strictly and must be semantically compatible.
+	lockName, _ := LockObjectName("disposable-test")
+	adoptionName, _ := AdoptionObjectName("disposable-test")
+	ceilingName, _ := CostCeilingObjectName("disposable-test")
+	for name, existing := range map[string]struct {
+		object  ControlObjectName
+		content string
+		want    error
+	}{
+		"duplicate policy keys": {policyName, `{"schema":"ctrldb.ctrlboard.dev/approved-policy/v1","sha256":"` + repeatHex("f") + `","sha256":"` + envelope.Plan().Binding().ManifestHash + `","approvedBy":"x@example.invalid","planId":"plan-fedcba9876543210"}`, ErrSeedIncompatible},
+		"unknown policy field":  {policyName, `{"schema":"ctrldb.ctrlboard.dev/approved-policy/v1","sha256":"` + envelope.Plan().Binding().ManifestHash + `","approvedBy":"x@example.invalid","planId":"plan-fedcba9876543210","extra":1}`, ErrSeedIncompatible},
+		"foreign lock":          {lockName, `{"schema":"ctrldb.ctrlboard.dev/lock/v1","environment":"production","excludesHostAutomations":false,"state":"released","readers":[]}`, ErrSeedIncompatible},
+		"malformed lock":        {lockName, `not json`, ErrSeedIncompatible},
+		"foreign adoption":      {adoptionName, `{"schema":"ctrldb.ctrlboard.dev/adoption/v1","environment":"disposable-test","project":"other-project","operationId":"op-fedcba9876543210","planId":"plan-fedcba9876543210","adoptedAt":"2026-09-09T12:00:00Z","resources":{}}`, ErrSeedIncompatible},
+		"different ceiling":     {ceilingName, `{"schema":"ctrldb.ctrlboard.dev/cost-ceiling/v1","environment":"disposable-test","ceilingMicros":1,"estimatedRunMicros":1,"currency":"USD","approvedBy":"x@example.invalid","planId":"plan-fedcba9876543210"}`, ErrApprovedPolicyMismatch},
+	} {
+		store := NewMemoryControlStore()
+		if _, err := store.Create(ctx, existing.object, []byte(existing.content)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := SeedControlStore(ctx, store, envelope); !errors.Is(err, existing.want) {
+			t.Fatalf("%s error = %v, want %v", name, err, existing.want)
+		}
+		if names := store.Names(); len(names) != 1 {
+			t.Fatalf("%s: rejected seeding created partial state: %v", name, names)
+		}
+		after, _ := store.Read(ctx, existing.object)
+		if string(after.Content) != existing.content {
+			t.Fatalf("%s: existing object was modified", name)
+		}
+	}
+	// A compatible earlier bootstrap's records are preserved and accepted.
+	compatible := NewMemoryControlStore()
+	priorAdoption := strings.Replace(string(seeds[1].Content), fixtureOperationID, "op-fedcba9876543210", 1)
+	if _, err := compatible.Create(ctx, adoptionName, []byte(priorAdoption)); err != nil {
+		t.Fatal(err)
+	}
+	outcomes, err := SeedControlStore(ctx, compatible, envelope)
+	if err != nil || len(outcomes) != 4 || !outcomes[1].Preexisting {
+		t.Fatalf("compatible prior adoption = %v, %v", outcomes, err)
+	}
 	if _, err := SeedControlStore(ctx, nil, envelope); !errors.Is(err, ErrInvalidStoreRequest) {
 		t.Fatalf("nil store error = %v", err)
 	}

@@ -106,7 +106,10 @@ type BucketState struct {
 
 // AuditBucketPort is the narrow provider surface the handoff needs. It has no
 // delete, list, or IAM method. A conforming implementation performs exactly
-// the named mutation and nothing else.
+// the named mutation and nothing else. LockRetention must re-observe the
+// bucket immediately before the irreversible call and refuse to lock when the
+// metageneration differs from expectedMetageneration (gcloud offers no
+// server-side precondition for this update).
 type AuditBucketPort interface {
 	DescribeBucket(ctx context.Context, name string) (BucketState, bool, error)
 	CreateAuditBucket(ctx context.Context, identity BucketIdentity) error
@@ -114,7 +117,8 @@ type AuditBucketPort interface {
 	UploadCreateOnly(ctx context.Context, identity BucketIdentity, object AuditObjectName, content []byte) (ObjectDescriptor, error)
 	DescribeObject(ctx context.Context, identity BucketIdentity, object AuditObjectName) (ObjectDescriptor, bool, error)
 	ConfigureRetention(ctx context.Context, identity BucketIdentity, seconds int64) error
-	LockRetention(ctx context.Context, identity BucketIdentity) error
+	ReadObject(ctx context.Context, identity BucketIdentity, object AuditObjectName) ([]byte, ObjectDescriptor, bool, error)
+	LockRetention(ctx context.Context, identity BucketIdentity, expectedMetageneration int64) error
 }
 
 // HandoffRecordV1 is one append-only local progress record.
@@ -164,6 +168,9 @@ func (handoff *AuditHandoff) Bootstrap(ctx context.Context, envelope BootstrapEn
 		return HandoffStatus{}, err
 	}
 	if session.reached(PhaseHandoffVerified) {
+		if _, err := session.verifyObservation(ctx); err != nil {
+			return HandoffStatus{}, err
+		}
 		return session.status(), nil
 	}
 	if err := session.ensureBucket(ctx); err != nil {
@@ -197,6 +204,9 @@ func (handoff *AuditHandoff) LockRetention(ctx context.Context, envelope Bootstr
 		return HandoffStatus{}, err
 	}
 	if state.RetentionLocked {
+		if state.RetentionSeconds != AuditRetentionSeconds {
+			return HandoffStatus{}, fmt.Errorf("%w: foreign retention period on the locked audit bucket", ErrPartialBootstrapBlocked)
+		}
 		if !session.reached(PhaseRetentionLockClaimed) {
 			return HandoffStatus{}, fmt.Errorf("%w: retention is locked without a local lock claim", ErrPartialBootstrapBlocked)
 		}
@@ -232,7 +242,7 @@ func (handoff *AuditHandoff) LockRetention(ctx context.Context, envelope Bootstr
 			return HandoffStatus{}, err
 		}
 	}
-	if err := handoff.port.LockRetention(ctx, session.identity); err != nil {
+	if err := handoff.port.LockRetention(ctx, session.identity, state.Metageneration); err != nil {
 		return HandoffStatus{}, err
 	}
 	state, err = session.verifyObservation(ctx)
@@ -271,6 +281,9 @@ type handoffSession struct {
 
 func (handoff *AuditHandoff) open(ctx context.Context, envelope BootstrapEnvelopeV1) (*handoffSession, error) {
 	if err := storeContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := envelope.validAt(handoff.clock().UTC()); err != nil {
 		return nil, err
 	}
 	stored, err := EnsureBootstrapEnvelope(handoff.directory, envelope)
@@ -357,6 +370,9 @@ func (session *handoffSession) append(phase HandoffPhase, envelopeObject, journa
 		return fmt.Errorf("%w: phase %s does not advance %s", ErrInvalidHandoffRecord, phase, session.latest())
 	}
 	now := session.handoff.clock().UTC()
+	if !validUTC(now) || (len(session.records) > 0 && now.Before(session.records[len(session.records)-1].RecordedAt)) {
+		return fmt.Errorf("%w: clock moved backwards; refusing to persist a non-monotonic record", ErrInvalidHandoffRecord)
+	}
 	record := HandoffRecordV1{
 		Schema: HandoffRecordSchemaV1, OperationID: session.envelope.OperationID(), EnvelopeSHA256: session.envelope.SHA256(),
 		Sequence: uint64(len(session.records) + 1), Phase: phase, RecordedAt: now, Bucket: session.identity,
@@ -422,19 +438,10 @@ func (session *handoffSession) adoptExistingBucket(ctx context.Context, state Bu
 	if session.reached(PhaseAuditBucketCreated) {
 		return nil
 	}
-	if claim, claimed := session.recorded(PhaseAuditBucketClaimed); claimed {
-		envelopeMatches, err := session.remoteEnvelopeMatches(ctx)
-		if err != nil {
-			return err
-		}
-		if !envelopeMatches && !state.TimeCreated.IsZero() && !state.TimeCreated.Before(claim.RecordedAt.Add(-time.Minute)) {
-			return session.append(PhaseAuditBucketCreated, nil, nil)
-		}
-		if envelopeMatches {
-			return session.append(PhaseAuditBucketCreated, nil, nil)
-		}
-		return fmt.Errorf("%w: bucket predates the local create claim", ErrPartialBootstrapBlocked)
-	}
+	// Only an operation-bound remote marker proves ownership: the bucket must
+	// already hold exactly this envelope. A local create claim alone, or a
+	// creation timestamp, never adopts a bucket (D-158: an unrecorded partial
+	// bucket blocks for explicit recovery).
 	envelopeMatches, err := session.remoteEnvelopeMatches(ctx)
 	if err != nil {
 		return err
@@ -446,17 +453,22 @@ func (session *handoffSession) adoptExistingBucket(ctx context.Context, state Bu
 }
 
 // remoteEnvelopeMatches reports whether the bucket already holds exactly this
-// envelope. A present object with different content is a conflict.
+// envelope, compared byte for byte. A present object with different content
+// is a conflict.
 func (session *handoffSession) remoteEnvelopeMatches(ctx context.Context) (bool, error) {
-	descriptor, exists, err := session.handoff.port.DescribeObject(ctx, session.identity, session.envelopeName)
+	return session.remoteObjectMatches(ctx, session.envelopeName, session.envelopeJSON)
+}
+
+func (session *handoffSession) remoteObjectMatches(ctx context.Context, name AuditObjectName, content []byte) (bool, error) {
+	remote, descriptor, exists, err := session.handoff.port.ReadObject(ctx, session.identity, name)
 	if err != nil {
 		return false, err
 	}
 	if !exists {
 		return false, nil
 	}
-	if !descriptor.MatchesContent(session.envelopeJSON) {
-		return false, fmt.Errorf("%w: audit bucket holds a different envelope", ErrPartialBootstrapBlocked)
+	if !descriptor.MatchesContent(content) || !bytes.Equal(remote, content) {
+		return false, fmt.Errorf("%w: audit bucket holds different content at %s", ErrPartialBootstrapBlocked, name)
 	}
 	return true, nil
 }
@@ -494,6 +506,13 @@ func (session *handoffSession) uploadCreateOnly(ctx context.Context, name AuditO
 	}
 	if !errors.Is(err, ErrPreconditionFailed) {
 		return ObjectDescriptor{}, err
+	}
+	matches, matchErr := session.remoteObjectMatches(ctx, name, content)
+	if matchErr != nil {
+		return ObjectDescriptor{}, matchErr
+	}
+	if !matches {
+		return ObjectDescriptor{}, fmt.Errorf("%w: %s create precondition failed but the object is not observable", ErrPartialBootstrapBlocked, name)
 	}
 	existing, exists, describeErr := port.DescribeObject(ctx, session.identity, name)
 	if describeErr != nil {
@@ -578,6 +597,13 @@ func (session *handoffSession) verifyObject(ctx context.Context, name AuditObjec
 	}
 	if observed != recorded || !observed.MatchesContent(content) {
 		return fmt.Errorf("%w: %s hash or generation differs from the recorded upload", ErrPartialBootstrapBlocked, name)
+	}
+	remote, remoteDescriptor, remoteExists, err := session.handoff.port.ReadObject(ctx, session.identity, name)
+	if err != nil {
+		return err
+	}
+	if !remoteExists || remoteDescriptor != recorded || !bytes.Equal(remote, content) {
+		return fmt.Errorf("%w: %s bytes differ from the recorded upload", ErrPartialBootstrapBlocked, name)
 	}
 	return nil
 }

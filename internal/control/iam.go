@@ -169,3 +169,40 @@ func sortBindings(values []BucketBinding) {
 		return a.Prefix < b.Prefix
 	})
 }
+
+// ValidateBucketBindingShape checks a binding against the two approved bucket
+// names without the full desired state: closed role, closed prefix, project
+// service-account member, and the exact resource-scoped condition. Provider
+// adapters use it before rendering an IAM change.
+func ValidateBucketBindingShape(item BucketBinding, auditBucket, controlBucket string) error {
+	if auditBucket == "" || controlBucket == "" || auditBucket == controlBucket ||
+		(item.Bucket != auditBucket && item.Bucket != controlBucket) {
+		return fmt.Errorf("%w: bucket is not an approved control-plane bucket", ErrInvalidBucketBinding)
+	}
+	if _, ok := closedBindingRoles[item.Role]; !ok {
+		return fmt.Errorf("%w: role %q is outside the closed set", ErrInvalidBucketBinding, item.Role)
+	}
+	if _, ok := closedBindingPrefix[item.Prefix]; !ok {
+		return fmt.Errorf("%w: prefix is outside the disposable subtree", ErrInvalidBucketBinding)
+	}
+	if !serviceAccountMember.MatchString(item.Member) {
+		return fmt.Errorf("%w: member is not a project service account", ErrInvalidBucketBinding)
+	}
+	if item != binding(item.Bucket, item.Role, item.Member, item.Prefix) {
+		return fmt.Errorf("%w: condition is not the exact resource-scoped expression", ErrInvalidBucketBinding)
+	}
+	return nil
+}
+
+// PrefixFromCondition returns the closed prefix when expression is exactly the
+// resource-scoped condition for bucket, and "" for any other or absent
+// condition. An observed binding without a recognised prefix is therefore
+// never treated as one of ours.
+func PrefixFromCondition(bucket, expression string) string {
+	for prefix := range closedBindingPrefix {
+		if expression == binding(bucket, RoleObjectViewer, "", prefix).ConditionExpression {
+			return prefix
+		}
+	}
+	return ""
+}

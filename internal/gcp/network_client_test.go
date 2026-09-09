@@ -79,7 +79,7 @@ func TestNetworkClientAppliesEachStepWithByteExactArgv(t *testing.T) {
 			if got, want := encodeCalls(t, fake.calls), readGoldenArgv(t, intent.StepID); got != want {
 				t.Fatalf("argv differs from fixture:\n got: %s\nwant: %s", got, want)
 			}
-			assertClosedCommandShape(t, fake.calls, kind)
+			assertClosedCommandShape(t, fake.calls, kind, "create")
 			if result.StepID != intent.StepID || result.Kind != kind || result.Attempt != 1 || result.OperationID != "op-20260906-0001" ||
 				len(result.Resources) != len(intent.ResourceIDs) || len(result.Created) != len(intent.ResourceIDs) {
 				t.Fatalf("result = %#v", result)
@@ -103,12 +103,18 @@ func TestNetworkClientAppliesEachStepWithByteExactArgv(t *testing.T) {
 	}
 }
 
-func assertClosedCommandShape(t *testing.T, calls [][]string, kind bootstrap.IntentKind) {
+// assertClosedCommandShape proves every rendered command is explicit,
+// synchronous, and limited to the one mutation verb the operation may use.
+func assertClosedCommandShape(t *testing.T, calls [][]string, kind bootstrap.IntentKind, verb string) {
 	t.Helper()
 	regional := kind == bootstrap.IntentSubnet || kind == bootstrap.IntentNAT
+	forbiddenVerb := " delete "
+	if verb == "delete" {
+		forbiddenVerb = " create "
+	}
 	for _, call := range calls {
 		joined := " " + strings.Join(call, " ") + " "
-		for _, forbidden := range []string{"--async", "--impersonate-service-account", "--configuration", " delete ", " update ", " ssh ", "--limit", "--page-size"} {
+		for _, forbidden := range []string{"--async", "--impersonate-service-account", "--configuration", forbiddenVerb, " update ", " patch ", " ssh ", "--limit", "--page-size"} {
 			if strings.Contains(joined, forbidden) {
 				t.Fatalf("command admitted forbidden token %q: %s", forbidden, joined)
 			}
@@ -118,7 +124,8 @@ func assertClosedCommandShape(t *testing.T, calls [][]string, kind bootstrap.Int
 				t.Fatalf("command lacks %q: %s", required, joined)
 			}
 		}
-		if regional && !strings.Contains(joined, "--region="+networkTestRegion) && !strings.Contains(joined, "--regions="+networkTestRegion) {
+		if regional && !strings.Contains(joined, "--region="+networkTestRegion) && !strings.Contains(joined, "--regions="+networkTestRegion) &&
+			!strings.Contains(joined, allSubnetFormat) {
 			t.Fatalf("regional command lacks explicit region: %s", joined)
 		}
 		if call[0] != "compute" {
@@ -178,24 +185,29 @@ func TestNetworkClientRefusesDriftBeforeAnyMutation(t *testing.T) {
 	}{
 		{name: "auto-mode network", kind: bootstrap.IntentNetwork, script: []networkFakeStep{ok(strings.Replace(presentNetwork, `"autoCreateSubnetworks":false`, `"autoCreateSubnetworks":true`, 1))}},
 		{name: "legacy network", kind: bootstrap.IntentNetwork, script: []networkFakeStep{ok(strings.Replace(presentNetwork, `"autoCreateSubnetworks":false`, `"autoCreateSubnetworks":false,"IPv4Range":"10.240.0.0/16"`, 1))}},
+		{name: "network peering", kind: bootstrap.IntentNetwork, script: []networkFakeStep{ok(strings.Replace(presentNetwork, `"autoCreateSubnetworks"`, `"peerings":[{"name":"shared"}],"autoCreateSubnetworks"`, 1))}},
 		{name: "network without mode", kind: bootstrap.IntentNetwork, script: []networkFakeStep{ok(strings.Replace(presentNetwork, `,"autoCreateSubnetworks":false`, ``, 1))}},
 		{name: "subnet range", kind: bootstrap.IntentSubnet, script: []networkFakeStep{ok(strings.Replace(presentSubnet, "10.40.0.0/24", "10.40.0.0/25", 1))}},
 		{name: "subnet without private access", kind: bootstrap.IntentSubnet, script: []networkFakeStep{ok(strings.Replace(presentSubnet, `"privateIpGoogleAccess":true`, `"privateIpGoogleAccess":false`, 1))}},
 		{name: "subnet on another network", kind: bootstrap.IntentSubnet, script: []networkFakeStep{ok(strings.Replace(presentSubnet, "networks/ctrldb-test-vpc", "networks/default", 1))}},
 		{name: "subnet secondary range", kind: bootstrap.IntentSubnet, script: []networkFakeStep{ok(strings.Replace(presentSubnet, `"purpose":"PRIVATE"`, `"purpose":"PRIVATE","secondaryIpRanges":[{"ipCidrRange":"10.41.0.0/24"}]`, 1))}},
 		{name: "subnet dual stack", kind: bootstrap.IntentSubnet, script: []networkFakeStep{ok(strings.Replace(presentSubnet, "IPV4_ONLY", "IPV4_IPV6", 1))}},
+		{name: "subnet flow logs", kind: bootstrap.IntentSubnet, script: []networkFakeStep{ok(strings.Replace(presentSubnet, `"enableFlowLogs":false`, `"enableFlowLogs":true`, 1))}},
 		{name: "subnet public range", kind: bootstrap.IntentSubnet, script: []networkFakeStep{ok(strings.Replace(presentSubnet, "10.40.0.0/24", "203.0.113.0/24", 1))}},
 		{name: "router on another network", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(strings.Replace(presentRouter, "networks/ctrldb-test-vpc", "networks/default", 1))}},
 		{name: "router with foreign nat", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(strings.Replace(presentRouter, `"network"`, `"nats":[{"name":"other-nat"}],"network"`, 1))}},
+		{name: "router interface", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(strings.Replace(presentRouter, `"network"`, `"interfaces":[{"name":"peer-link"}],"network"`, 1))}},
+		{name: "router bgp peer", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(strings.Replace(presentRouter, `"network"`, `"bgpPeers":[{"name":"peer"}],"network"`, 1))}},
+		{name: "encrypted interconnect router", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(strings.Replace(presentRouter, `"network"`, `"encryptedInterconnectRouter":true,"network"`, 1))}},
 		{name: "manual nat", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(strings.Replace(presentNAT, "AUTO_ONLY", "MANUAL_ONLY", 1))}},
 		{name: "nat with addresses", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(strings.Replace(presentNAT, `"type"`, `"natIps":["`+computeBase+`regions/us-central1/addresses/x"],"type"`, 1))}},
 		{name: "private nat", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(strings.Replace(presentNAT, "PUBLIC", "PRIVATE", 1))}},
 		{name: "nat partial ranges", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(strings.Replace(presentNAT, "ALL_SUBNETWORKS_ALL_IP_RANGES", "LIST_OF_SUBNETWORKS", 1))}},
 		{name: "foreign nat on router", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(strings.Replace(presentNAT, "ctrldb-test-nat", "other-nat", 1))}},
-		{name: "nat not operational", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentStatus, `"minExtraNatIpsNeeded":0`, `"minExtraNatIpsNeeded":1`, 1))}},
-		{name: "nat status omits address shortage evidence", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentStatus, `,"minExtraNatIpsNeeded":0`, ``, 1))}},
-		{name: "status names other nat", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentStatus, `"name":"ctrldb-test-nat"`, `"name":"other-nat"`, 1))}},
-		{name: "status on other network", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentStatus, "networks/ctrldb-test-vpc", "networks/default", 1))}},
+		{name: "nat not operational", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(presentNATOwner), ok(strings.Replace(presentStatus, `"minExtraNatIpsNeeded":0`, `"minExtraNatIpsNeeded":1`, 1))}},
+		{name: "nat status omits address shortage evidence", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(presentNATOwner), ok(strings.Replace(presentStatus, `,"minExtraNatIpsNeeded":0`, ``, 1))}},
+		{name: "status names other nat", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(presentNATOwner), ok(strings.Replace(presentStatus, `"name":"ctrldb-test-nat"`, `"name":"other-nat"`, 1))}},
+		{name: "status on other network", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(presentNATOwner), ok(strings.Replace(presentStatus, "networks/ctrldb-test-vpc", "networks/default", 1))}},
 		{name: "internet-wide ssh", kind: bootstrap.IntentFirewall, script: []networkFakeStep{ok(strings.Replace(iap, "35.235.240.0/20", "0.0.0.0/0", 1))}},
 		{name: "wider iap range", kind: bootstrap.IntentFirewall, script: []networkFakeStep{ok(strings.Replace(iap, "35.235.240.0/20", "35.235.240.0/19", 1))}},
 		{name: "extra source range", kind: bootstrap.IntentFirewall, script: []networkFakeStep{ok(strings.Replace(iap, `["35.235.240.0/20"]`, `["35.235.240.0/20","203.0.113.0/24"]`, 1))}},
@@ -230,6 +242,33 @@ func TestNetworkClientRefusesDriftBeforeAnyMutation(t *testing.T) {
 			if len(fake.calls) != len(test.script) || len(result.Created) != 0 {
 				t.Fatalf("calls = %d, created = %d", len(fake.calls), len(result.Created))
 			}
+		})
+	}
+}
+
+func TestNetworkClientRejectsMalformedProviderIncarnationsBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		kind   bootstrap.IntentKind
+		script []networkFakeStep
+	}{
+		{name: "zero network id", kind: bootstrap.IntentNetwork, script: []networkFakeStep{ok(strings.Replace(presentNetwork, `"id":"`+networkIncarnation+`"`, `"id":"0"`, 1))}},
+		{name: "overflowing subnet id", kind: bootstrap.IntentSubnet, script: []networkFakeStep{ok(strings.Replace(presentSubnet, `"id":"`+subnetIncarnation+`"`, `"id":"18446744073709551616"`, 1))}},
+		{name: "nonnumeric router id", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(strings.Replace(presentRouter, `"id":"`+routerIncarnation+`"`, `"id":"router"`, 1))}},
+		{name: "malformed nat owner fingerprint", kind: bootstrap.IntentNAT, script: []networkFakeStep{ok(presentRouter), ok(presentNAT), ok(strings.Replace(presentNATOwner, natRouterFingerprint, "not+base64", 1))}},
+		{name: "missing firewall id", kind: bootstrap.IntentFirewall, script: []networkFakeStep{ok(strings.Replace(presentFirewall("test-iap-firewall"), `"id":"`+iapIncarnation+`",`, "", 1))}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			intent := networkIntent(test.kind)
+			target := networkTarget(t)
+			client, fake := testNetworkClient(t, test.script...)
+			result, err := client.ApplyStep(context.Background(), networkAuthorization(intent, target.Preflight), intent, networkStepResources(test.kind), target)
+			assertNetworkFailure(t, test.name, err, NetworkFailureSchema, domain.MutationNotOccurred)
+			if len(result.Created) != 0 || len(fake.calls) != len(test.script) {
+				t.Fatalf("result = %#v calls = %d", result, len(fake.calls))
+			}
+			assertNoCreate(t, fake.calls)
 		})
 	}
 }
@@ -398,10 +437,10 @@ func TestNetworkClientReportsMutationObservationOnPartialFailure(t *testing.T) {
 		t.Fatalf("partial result = %#v", result)
 	}
 
-	client, fake = testNetworkClient(t, ok("[]"), ok(""), ok(presentRouter), ok("[]"), ok(""), ok(presentNAT), ok(strings.Replace(presentStatus, `"minExtraNatIpsNeeded":0`, `"minExtraNatIpsNeeded":2`, 1)))
+	client, fake = testNetworkClient(t, ok("[]"), ok(""), ok(presentRouter), ok("[]"), ok(""), ok(presentNAT), ok(presentNATOwner), ok(strings.Replace(presentStatus, `"minExtraNatIpsNeeded":0`, `"minExtraNatIpsNeeded":2`, 1)))
 	result, err = client.ApplyStep(context.Background(), authorization, intent, resources, target)
 	assertNetworkFailure(t, "nat not operational after create", err, NetworkFailureUnverified, domain.MutationOccurred)
-	if len(result.Created) != 2 || len(fake.calls) != 7 {
+	if len(result.Created) != 2 || len(fake.calls) != 8 {
 		t.Fatalf("nat status result = %#v", result)
 	}
 
@@ -431,7 +470,7 @@ func TestNetworkClientRunsThroughTheSealedProcessBoundary(t *testing.T) {
 	// therefore report drift after exactly one real process and render no
 	// create command.
 	result, err := client.ApplyStep(context.Background(), networkAuthorization(intent, target.Preflight), intent, networkStepResources(intent.Kind), target)
-	assertNetworkFailure(t, "helper", err, NetworkFailureDrift, domain.MutationNotOccurred)
+	assertNetworkFailure(t, "helper", err, NetworkFailureSchema, domain.MutationNotOccurred)
 	if len(result.Created) != 0 {
 		t.Fatalf("helper result = %#v", result)
 	}

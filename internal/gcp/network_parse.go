@@ -196,12 +196,17 @@ func (expected expectedNetworkResource) statusArguments() []string {
 // Wire projections. Pointer fields distinguish an absent provider value from
 // its zero value where the distinction is security-relevant.
 type networkListWire struct {
+	ID                    string `json:"id"`
 	Name                  string `json:"name"`
 	SelfLink              string `json:"selfLink"`
 	AutoCreateSubnetworks *bool  `json:"autoCreateSubnetworks"`
 	IPv4Range             string `json:"IPv4Range"`
+	Peerings              []struct {
+		Name string `json:"name"`
+	} `json:"peerings"`
 }
 type subnetListWire struct {
+	ID                    string `json:"id"`
 	Name                  string `json:"name"`
 	SelfLink              string `json:"selfLink"`
 	Region                string `json:"region"`
@@ -212,9 +217,11 @@ type subnetListWire struct {
 	SecondaryIPRanges     []struct {
 		IPCIDRRange string `json:"ipCidrRange"`
 	} `json:"secondaryIpRanges"`
-	StackType string `json:"stackType"`
+	StackType      string `json:"stackType"`
+	EnableFlowLogs bool   `json:"enableFlowLogs"`
 }
 type routerListWire struct {
+	ID       string `json:"id"`
 	Name     string `json:"name"`
 	SelfLink string `json:"selfLink"`
 	Region   string `json:"region"`
@@ -222,6 +229,20 @@ type routerListWire struct {
 	NATs     []struct {
 		Name string `json:"name"`
 	} `json:"nats"`
+	Interfaces []struct {
+		Name string `json:"name"`
+	} `json:"interfaces"`
+	BGPPeers []struct {
+		Name string `json:"name"`
+	} `json:"bgpPeers"`
+	EncryptedInterconnectRouter bool `json:"encryptedInterconnectRouter"`
+}
+type natOwnerWire struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	SelfLink    string `json:"selfLink"`
+	Region      string `json:"region"`
+	Fingerprint string `json:"fingerprint"`
 }
 type natListWire struct {
 	Name                          string   `json:"name"`
@@ -240,6 +261,7 @@ type routerStatusWire struct {
 	} `json:"result"`
 }
 type firewallListWire struct {
+	ID                    string        `json:"id"`
 	Name                  string        `json:"name"`
 	SelfLink              string        `json:"selfLink"`
 	Network               string        `json:"network"`
@@ -260,9 +282,14 @@ type firewallListWire struct {
 	} `json:"logConfig"`
 }
 
+type networkObservation struct {
+	present       bool
+	incarnationID string
+}
+
 // parseObservation reduces one exact-name read to presence. A present
 // resource must reduce to the desired fingerprint and identity exactly.
-func (expected expectedNetworkResource) parseObservation(data []byte) (bool, error) {
+func (expected expectedNetworkResource) parseObservation(data []byte) (networkObservation, error) {
 	switch expected.resource.Kind {
 	case bootstrap.ResourceNetwork:
 		return parseNetworkObservation(expected, data)
@@ -358,63 +385,79 @@ func (expected expectedNetworkResource) drift(detail string) error {
 	return networkError(NetworkFailureDrift, expected.resource.ID+" "+detail)
 }
 
-func parseNetworkObservation(expected expectedNetworkResource, data []byte) (bool, error) {
+func parseNetworkObservation(expected expectedNetworkResource, data []byte) (networkObservation, error) {
 	wire, err := decodeNetworkList[networkListWire](data, expected.resource.ID)
 	if err != nil || len(wire) == 0 {
-		return false, err
+		return networkObservation{}, err
 	}
 	item := wire[0]
 	if !expected.identityMatches(item.Name, item.SelfLink) {
-		return false, networkError(NetworkFailureSchema, expected.resource.ID+" identity")
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" identity")
+	}
+	if !validNetworkID(item.ID) {
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" incarnation")
+	}
+	if len(item.Peerings) != 0 {
+		return networkObservation{}, expected.drift("has network peerings")
 	}
 	state := networkStateV1{}
 	if item.AutoCreateSubnetworks != nil && !*item.AutoCreateSubnetworks && item.IPv4Range == "" {
 		state.Mode = "custom-subnet"
 	}
 	if !expected.fingerprintMatches(state) {
-		return false, expected.drift("is not a custom-mode network")
+		return networkObservation{}, expected.drift("is not a custom-mode network")
 	}
-	return true, nil
+	return networkObservation{present: true, incarnationID: item.ID}, nil
 }
 
-func parseSubnetObservation(expected expectedNetworkResource, data []byte) (bool, error) {
+func parseSubnetObservation(expected expectedNetworkResource, data []byte) (networkObservation, error) {
 	wire, err := decodeNetworkList[subnetListWire](data, expected.resource.ID)
 	if err != nil || len(wire) == 0 {
-		return false, err
+		return networkObservation{}, err
 	}
 	item := wire[0]
 	region, regionOK := normalizeComputeLocation(item.Region, expected.command.project, "regions")
 	if !expected.identityMatches(item.Name, item.SelfLink) || !regionOK || region != expected.command.region {
-		return false, networkError(NetworkFailureSchema, expected.resource.ID+" identity")
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" identity")
+	}
+	if !validNetworkID(item.ID) {
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" incarnation")
 	}
 	if !computeSelfLinkMatches(item.Network, expected.resource.ParentProviderID) {
-		return false, expected.drift("belongs to another network")
+		return networkObservation{}, expected.drift("belongs to another network")
 	}
-	if len(item.SecondaryIPRanges) != 0 || (item.Purpose != "" && item.Purpose != "PRIVATE") || (item.StackType != "" && item.StackType != "IPV4_ONLY") {
-		return false, expected.drift("has secondary ranges, a special purpose, or an IPv6 stack")
+	if len(item.SecondaryIPRanges) != 0 || (item.Purpose != "" && item.Purpose != "PRIVATE") ||
+		(item.StackType != "" && item.StackType != "IPV4_ONLY") || item.EnableFlowLogs {
+		return networkObservation{}, expected.drift("has secondary ranges, a special purpose, an IPv6 stack, or flow logs")
 	}
 	if !canonicalPrivateIPv4Prefix(item.IPCIDRRange) {
-		return false, expected.drift("has a non-private or non-canonical range")
+		return networkObservation{}, expected.drift("has a non-private or non-canonical range")
 	}
 	state := networkStateV1{CIDR: item.IPCIDRRange}
 	if item.PrivateIPGoogleAccess {
 		state.Mode = "private-google-access"
 	}
 	if !expected.fingerprintMatches(state) {
-		return false, expected.drift("range or private Google access differs")
+		return networkObservation{}, expected.drift("range or private Google access differs")
 	}
-	return true, nil
+	return networkObservation{present: true, incarnationID: item.ID}, nil
 }
 
-func parseRouterObservation(expected expectedNetworkResource, data []byte) (bool, error) {
+func parseRouterObservation(expected expectedNetworkResource, data []byte) (networkObservation, error) {
 	wire, err := decodeNetworkList[routerListWire](data, expected.resource.ID)
 	if err != nil || len(wire) == 0 {
-		return false, err
+		return networkObservation{}, err
 	}
 	item := wire[0]
 	region, regionOK := normalizeComputeLocation(item.Region, expected.command.project, "regions")
 	if !expected.identityMatches(item.Name, item.SelfLink) || !regionOK || region != expected.command.region {
-		return false, networkError(NetworkFailureSchema, expected.resource.ID+" identity")
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" identity")
+	}
+	if !validNetworkID(item.ID) {
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" incarnation")
+	}
+	if len(item.Interfaces) != 0 || len(item.BGPPeers) != 0 || item.EncryptedInterconnectRouter {
+		return networkObservation{}, expected.drift("has attached interfaces, BGP peers, or encrypted interconnect state")
 	}
 	state := networkStateV1{}
 	if computeSelfLinkMatches(item.Network, expected.resource.ParentProviderID) {
@@ -422,44 +465,62 @@ func parseRouterObservation(expected expectedNetworkResource, data []byte) (bool
 	}
 	for _, nat := range item.NATs {
 		if nat.Name != expected.nat {
-			return false, expected.drift("carries an unexpected NAT")
+			return networkObservation{}, expected.drift("carries an unexpected NAT")
 		}
 	}
-	if !expected.fingerprintMatches(state) {
-		return false, expected.drift("belongs to another network")
+	if len(item.NATs) > 1 {
+		return networkObservation{}, expected.drift("carries duplicate NAT state")
 	}
-	return true, nil
+	if !expected.fingerprintMatches(state) {
+		return networkObservation{}, expected.drift("belongs to another network")
+	}
+	return networkObservation{present: true, incarnationID: item.ID}, nil
 }
 
-func parseNATObservation(expected expectedNetworkResource, data []byte) (bool, error) {
+func parseNATObservation(expected expectedNetworkResource, data []byte) (networkObservation, error) {
 	var wire []natListWire
 	if err := decodeNetworkProviderJSON(data, &wire); err != nil {
-		return false, networkError(NetworkFailureSchema, expected.resource.ID+" observation")
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" observation")
 	}
 	var found *natListWire
 	for index := range wire {
 		if wire[index].Name != expected.resource.Name {
-			return false, expected.drift("router carries an unexpected NAT")
+			return networkObservation{}, expected.drift("router carries an unexpected NAT")
 		}
 		if found != nil {
-			return false, networkError(NetworkFailureSchema, expected.resource.ID+" duplicate")
+			return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" duplicate")
 		}
 		found = &wire[index]
 	}
 	if found == nil {
-		return false, nil
+		return networkObservation{}, nil
 	}
 	if len(found.NATIPs) != 0 || (found.Type != "" && found.Type != "PUBLIC") {
-		return false, expected.drift("uses manual or private NAT addressing")
+		return networkObservation{}, expected.drift("uses manual or private NAT addressing")
 	}
 	state := networkStateV1{}
 	if found.NATIPAllocateOption == "AUTO_ONLY" && found.SourceSubnetworkIPRangesToNAT == "ALL_SUBNETWORKS_ALL_IP_RANGES" {
 		state.Mode = "auto-ip-all-subnet-ranges"
 	}
 	if !expected.fingerprintMatches(state) {
-		return false, expected.drift("allocation or subnet range mode differs")
+		return networkObservation{}, expected.drift("allocation or subnet range mode differs")
 	}
-	return true, nil
+	return networkObservation{present: true}, nil
+}
+
+func (expected expectedNetworkResource) parseNATOwner(data []byte) (string, error) {
+	wire, err := decodeNetworkList[natOwnerWire](data, expected.resource.ID)
+	if err != nil || len(wire) != 1 {
+		return "", networkError(NetworkFailureSchema, expected.resource.ID+" owner")
+	}
+	item := wire[0]
+	region, regionOK := normalizeComputeLocation(item.Region, expected.command.project, "regions")
+	if item.Name != expected.router || !computeSelfLinkMatches(item.SelfLink, expected.resource.ParentProviderID) ||
+		!regionOK || region != expected.command.region || !validNetworkID(item.ID) ||
+		!validRouterFingerprint(item.Fingerprint) {
+		return "", networkError(NetworkFailureSchema, expected.resource.ID+" owner")
+	}
+	return item.ID + ":" + item.Fingerprint, nil
 }
 
 // parseNATStatus proves the NAT is operational: the router status names
@@ -481,30 +542,33 @@ func (expected expectedNetworkResource) parseNATStatus(data []byte) error {
 	return nil
 }
 
-func parseFirewallObservation(expected expectedNetworkResource, data []byte) (bool, error) {
+func parseFirewallObservation(expected expectedNetworkResource, data []byte) (networkObservation, error) {
 	wire, err := decodeNetworkList[firewallListWire](data, expected.resource.ID)
 	if err != nil || len(wire) == 0 {
-		return false, err
+		return networkObservation{}, err
 	}
 	item := wire[0]
 	if !expected.identityMatches(item.Name, item.SelfLink) {
-		return false, networkError(NetworkFailureSchema, expected.resource.ID+" identity")
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" identity")
+	}
+	if !validNetworkID(item.ID) {
+		return networkObservation{}, networkError(NetworkFailureSchema, expected.resource.ID+" incarnation")
 	}
 	if !computeSelfLinkMatches(item.Network, expected.resource.ParentProviderID) {
-		return false, expected.drift("belongs to another network")
+		return networkObservation{}, expected.drift("belongs to another network")
 	}
 	if item.Direction != "INGRESS" || item.Disabled || item.Priority == nil || *item.Priority != int64(isolation.FirewallPriority) {
-		return false, expected.drift("direction, state, or priority differs")
+		return networkObservation{}, expected.drift("direction, state, or priority differs")
 	}
 	if len(item.Denied) != 0 || len(item.DestinationRanges) != 0 || len(item.SourceServiceAccounts) != 0 ||
 		len(item.TargetServiceAccounts) != 0 || (item.LogConfig != nil && item.LogConfig.Enable) {
-		return false, expected.drift("carries denied tuples, destinations, service accounts, or logging")
+		return networkObservation{}, expected.drift("carries denied tuples, destinations, service accounts, or logging")
 	}
 	if item.Description != expected.firewall.description {
-		return false, expected.drift("ownership description differs")
+		return networkObservation{}, expected.drift("ownership description differs")
 	}
 	if err := isolation.ValidateFirewallTags(item.SourceTags, item.TargetTags); err != nil {
-		return false, expected.drift("uses tags outside the test namespace")
+		return networkObservation{}, expected.drift("uses tags outside the test namespace")
 	}
 	state := networkStateV1{Mode: "ingress", Targets: append([]string(nil), item.TargetTags...)}
 	switch {
@@ -513,20 +577,20 @@ func parseFirewallObservation(expected expectedNetworkResource, data []byte) (bo
 	case len(item.SourceRanges) == 0 && len(item.SourceTags) == 1:
 		state.Source = item.SourceTags[0]
 	default:
-		return false, expected.drift("admits a public or non-test source")
+		return networkObservation{}, expected.drift("admits a public or non-test source")
 	}
 	if len(item.Allowed) != 1 || len(item.Allowed[0].Ports) != 1 {
-		return false, expected.drift("allows more than one protocol tuple")
+		return networkObservation{}, expected.drift("allows more than one protocol tuple")
 	}
 	port, portErr := strconv.Atoi(item.Allowed[0].Ports[0])
 	if portErr != nil || port <= 0 || port > 65535 || strconv.Itoa(port) != item.Allowed[0].Ports[0] {
-		return false, expected.drift("allows a port range")
+		return networkObservation{}, expected.drift("allows a port range")
 	}
 	state.Protocol, state.Port = item.Allowed[0].IPProtocol, port
 	if !expected.fingerprintMatches(state) {
-		return false, expected.drift("source, target, protocol, or port differs")
+		return networkObservation{}, expected.drift("source, target, protocol, or port differs")
 	}
-	return true, nil
+	return networkObservation{present: true, incarnationID: item.ID}, nil
 }
 
 // computeSelfLinkMatches accepts only the documented Compute v1 self-link

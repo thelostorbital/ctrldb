@@ -17,12 +17,14 @@ import (
 // proven by an exact-name list which returns an empty JSON array, because
 // gcloud describe reports absence only through exit status and human text.
 const (
-	networkFormat  = "--format=json(name,selfLink,autoCreateSubnetworks,IPv4Range)"
-	subnetFormat   = "--format=json(name,selfLink,region,network,ipCidrRange,privateIpGoogleAccess,purpose,secondaryIpRanges.ipCidrRange,stackType)"
-	routerFormat   = "--format=json(name,selfLink,region,network,nats.name)"
-	natFormat      = "--format=json(name,natIpAllocateOption,sourceSubnetworkIpRangesToNat,natIps,type)"
-	natStatusFmt   = "--format=json(result.network,result.natStatus.name,result.natStatus.minExtraNatIpsNeeded)"
-	firewallFormat = "--format=json(name,selfLink,network,direction,disabled,priority,description,sourceRanges,sourceTags,targetTags,destinationRanges,sourceServiceAccounts,targetServiceAccounts,allowed.IPProtocol,allowed.ports,denied.IPProtocol,denied.ports,logConfig.enable)"
+	networkFormat   = "--format=json(id,name,selfLink,autoCreateSubnetworks,IPv4Range,peerings.name)"
+	subnetFormat    = "--format=json(id,name,selfLink,region,network,ipCidrRange,privateIpGoogleAccess,purpose,secondaryIpRanges.ipCidrRange,stackType,enableFlowLogs)"
+	routerFormat    = "--format=json(id,name,selfLink,region,network,nats.name,interfaces.name,bgpPeers.name,encryptedInterconnectRouter)"
+	natFormat       = "--format=json(name,natIpAllocateOption,sourceSubnetworkIpRangesToNat,natIps,type)"
+	natOwnerFormat  = "--format=json(id,name,selfLink,region,fingerprint)"
+	allSubnetFormat = "--format=json(name,region,ipCidrRange,secondaryIpRanges.ipCidrRange,selfLink)"
+	natStatusFmt    = "--format=json(result.network,result.natStatus.name,result.natStatus.minExtraNatIpsNeeded)"
+	firewallFormat  = "--format=json(id,name,selfLink,network,direction,disabled,priority,description,sourceRanges,sourceTags,targetTags,destinationRanges,sourceServiceAccounts,targetServiceAccounts,allowed.IPProtocol,allowed.ports,denied.IPProtocol,denied.ports,logConfig.enable)"
 )
 
 func exactNameFilter(name string) string { return "--filter=name=" + name }
@@ -47,6 +49,10 @@ func subnetObserveArguments(command commandContext, subnet string) []string {
 	return globalArguments(command, "compute", "networks", "subnets", "list", "--regions="+command.region, exactNameFilter(subnet), subnetFormat)
 }
 
+func allSubnetObserveArguments(command commandContext) []string {
+	return globalArguments(command, "compute", "networks", "subnets", "list", allSubnetFormat)
+}
+
 // T3 — `compute routers create <router> --network=<vpc> --region=<region>`.
 func routerCreateArguments(command commandContext, router, vpc string) []string {
 	return globalArguments(command, "compute", "routers", "create", router, "--network="+vpc, "--region="+command.region)
@@ -65,6 +71,10 @@ func natCreateArguments(command commandContext, nat, router string) []string {
 
 func natObserveArguments(command commandContext, router string) []string {
 	return globalArguments(command, "compute", "routers", "nats", "list", "--router="+router, "--region="+command.region, natFormat)
+}
+
+func natOwnerObserveArguments(command commandContext, router string) []string {
+	return globalArguments(command, "compute", "routers", "list", "--regions="+command.region, exactNameFilter(router), natOwnerFormat)
 }
 
 func natStatusArguments(command commandContext, router string) []string {
@@ -91,4 +101,28 @@ func firewallCreateArguments(command commandContext, spec networkFirewallSpec) [
 
 func firewallObserveArguments(command commandContext, name string) []string {
 	return globalArguments(command, "compute", "firewall-rules", "list", exactNameFilter(name), firewallFormat)
+}
+
+// Compensation templates. They are reachable only through a
+// compensableNetworkResource, which exists only for a resource whose durable
+// creation record names this exact operation and step; Apply and Verify
+// cannot render them. `--quiet` suppresses the interactive confirmation.
+func networkDeleteArguments(command commandContext, vpc string) []string {
+	return globalArguments(command, "compute", "networks", "delete", vpc)
+}
+
+func subnetDeleteArguments(command commandContext, subnet string) []string {
+	return globalArguments(command, "compute", "networks", "subnets", "delete", subnet, "--region="+command.region)
+}
+
+func routerDeleteArguments(command commandContext, router string) []string {
+	return globalArguments(command, "compute", "routers", "delete", router, "--region="+command.region)
+}
+
+func natDeleteArguments(command commandContext, nat, router string) []string {
+	return globalArguments(command, "compute", "routers", "nats", "delete", nat, "--router="+router, "--region="+command.region)
+}
+
+func firewallDeleteArguments(command commandContext, name string) []string {
+	return globalArguments(command, "compute", "firewall-rules", "delete", name)
 }

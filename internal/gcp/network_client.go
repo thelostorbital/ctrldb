@@ -5,8 +5,10 @@ package gcp
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/config"
@@ -36,10 +38,29 @@ const (
 var (
 	ErrNetworkRejected   = errors.New("gcp network mutation rejected")
 	networkHexPattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	networkIDPattern     = regexp.MustCompile(`^[1-9][0-9]{0,19}$`)
 	networkNamePattern   = regexp.MustCompile(`^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
 	networkRegionPattern = regexp.MustCompile(`^[a-z]+-[a-z]+[0-9]+$`)
 	networkOpIDPattern   = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$`)
 )
+
+func validNetworkID(value string) bool {
+	if !networkIDPattern.MatchString(value) {
+		return false
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
+}
+
+func validRouterFingerprint(value string) bool {
+	// Compute's bytes-format fingerprints are padded URL-safe base64. Decode
+	// the value instead of accepting an arbitrary string from provider output.
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	decoded, err := base64.URLEncoding.DecodeString(value)
+	return err == nil && len(decoded) != 0
+}
 
 // NetworkFailureKind classifies a refusal or failure without exposing
 // provider output.
@@ -209,21 +230,24 @@ type NetworkResourceResult struct {
 	ProviderID              string
 	Outcome                 NetworkResourceOutcome
 	DesiredStateFingerprint string
+	IncarnationID           string
 }
 
 // NetworkCreatedResource records one resource created by exactly this
-// operation, step, and attempt. Only such records can ever authorize a
-// compensating delete.
+// operation, step, and attempt, including the provider-issued immutable
+// incarnation observed after creation. Only such records can ever authorize
+// a compensating delete.
 type NetworkCreatedResource struct {
-	OperationID string
-	StepID      string
-	Attempt     uint32
-	ResourceID  string
-	Kind        bootstrap.ResourceKind
-	Name        string
-	Project     string
-	Location    string
-	ProviderID  string
+	OperationID   string
+	StepID        string
+	Attempt       uint32
+	ResourceID    string
+	Kind          bootstrap.ResourceKind
+	Name          string
+	Project       string
+	Location      string
+	ProviderID    string
+	IncarnationID string
 }
 
 // NetworkStepResult is the typed result of one T1-T4 apply or verify. On a
@@ -294,6 +318,11 @@ func (client *NetworkClient) execute(
 	result := NetworkStepResult{OperationID: authorization.OperationID, StepID: intent.StepID, Attempt: authorization.Attempt, Kind: intent.Kind}
 	for _, expected := range plan {
 		outcome, applyErr := client.applyResource(stepContext, expected, mutate, func() error {
+			if expected.resource.Kind == bootstrap.ResourceSubnetwork {
+				if err := client.requireCurrentSubnetRanges(stepContext, expected, target.Preflight); err != nil {
+					return err
+				}
+			}
 			return client.validateNetworkAuthorization(authorization, intent, target.Preflight)
 		})
 		if outcome.Outcome == NetworkResourceCreated {
@@ -301,6 +330,7 @@ func (client *NetworkClient) execute(
 				OperationID: authorization.OperationID, StepID: intent.StepID, Attempt: authorization.Attempt,
 				ResourceID: expected.resource.ID, Kind: expected.resource.Kind, Name: expected.resource.Name,
 				Project: expected.resource.Project, Location: expected.resource.Location, ProviderID: expected.resource.ProviderID,
+				IncarnationID: outcome.IncarnationID,
 			})
 		}
 		if applyErr != nil {
@@ -329,11 +359,12 @@ func (client *NetworkClient) applyResource(
 		Project: expected.resource.Project, Location: expected.resource.Location, ProviderID: expected.resource.ProviderID,
 		DesiredStateFingerprint: expected.resource.DesiredStateFingerprint,
 	}
-	present, err := client.observe(ctx, expected)
+	observed, err := client.observe(ctx, expected, true)
 	if err != nil {
 		return NetworkResourceResult{}, err
 	}
-	if present {
+	if observed.present {
+		result.IncarnationID = observed.incarnationID
 		result.Outcome = NetworkResourceAlreadyPresent
 		return result, nil
 	}
@@ -347,7 +378,8 @@ func (client *NetworkClient) applyResource(
 		return NetworkResourceResult{}, err
 	}
 	result.Outcome = NetworkResourceCreated
-	present, err = client.observe(ctx, expected)
+	observed, err = client.observe(ctx, expected, true)
+	result.IncarnationID = observed.incarnationID
 	if err != nil {
 		var failure *NetworkError
 		if errors.As(err, &failure) {
@@ -355,7 +387,7 @@ func (client *NetworkClient) applyResource(
 		}
 		return result, networkMutationError(NetworkFailureUnverified, expected.resource.ID, domain.MutationOccurred)
 	}
-	if !present {
+	if !observed.present {
 		return result, networkMutationError(NetworkFailureUnverified, expected.resource.ID+" absent after create", domain.MutationOccurred)
 	}
 	return result, nil
@@ -363,28 +395,40 @@ func (client *NetworkClient) applyResource(
 
 // observe runs the exact-name read for one resource and reports exact
 // presence. A present resource which differs from the desired state is drift.
-func (client *NetworkClient) observe(ctx context.Context, expected expectedNetworkResource) (bool, error) {
+func (client *NetworkClient) observe(ctx context.Context, expected expectedNetworkResource, requireOperational bool) (networkObservation, error) {
 	data, err := client.run(ctx, expected.observeArguments(), expected.resource.ID+" observe")
 	if err != nil {
-		return false, err
+		return networkObservation{}, err
 	}
-	present, err := expected.parseObservation(data)
+	observed, err := expected.parseObservation(data)
 	if err != nil {
-		return false, err
+		return networkObservation{}, err
 	}
-	if !present {
-		return false, nil
+	if !observed.present {
+		return observed, nil
 	}
 	if expected.resource.Kind == bootstrap.ResourceNAT {
+		ownerData, ownerErr := client.run(ctx, natOwnerObserveArguments(expected.command, expected.router), expected.resource.ID+" owner")
+		if ownerErr != nil {
+			return networkObservation{}, ownerErr
+		}
+		incarnation, incarnationErr := expected.parseNATOwner(ownerData)
+		if incarnationErr != nil {
+			return networkObservation{}, incarnationErr
+		}
+		observed.incarnationID = incarnation
+		if !requireOperational {
+			return observed, nil
+		}
 		statusData, statusErr := client.run(ctx, expected.statusArguments(), expected.resource.ID+" status")
 		if statusErr != nil {
-			return false, statusErr
+			return observed, statusErr
 		}
 		if err := expected.parseNATStatus(statusData); err != nil {
-			return false, err
+			return observed, err
 		}
 	}
-	return true, nil
+	return observed, nil
 }
 
 func (client *NetworkClient) create(ctx context.Context, expected expectedNetworkResource) error {

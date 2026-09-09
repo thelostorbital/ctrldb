@@ -23,12 +23,18 @@ import (
 )
 
 const (
-	networkTestAccount = "operator@example.invalid"
-	networkTestProject = "example-project"
-	networkTestRegion  = "us-central1"
-	networkTestZone    = "us-central1-a"
-	networkTestBinding = "d31f90cdb0354b17c102e948ef5b8ec579f97ff876ce03334714b146a719af7d"
-	computeBase        = "https://www.googleapis.com/compute/v1/projects/example-project/"
+	networkTestAccount   = "operator@example.invalid"
+	networkTestProject   = "example-project"
+	networkTestRegion    = "us-central1"
+	networkTestZone      = "us-central1-a"
+	networkTestBinding   = "d31f90cdb0354b17c102e948ef5b8ec579f97ff876ce03334714b146a719af7d"
+	computeBase          = "https://www.googleapis.com/compute/v1/projects/example-project/"
+	networkIncarnation   = "1001"
+	subnetIncarnation    = "1002"
+	routerIncarnation    = "1003"
+	iapIncarnation       = "1004"
+	internalIncarnation  = "1005"
+	natRouterFingerprint = "ulgdg-dGCms="
 )
 
 // goldenNetworkResources are the exact desired resources the M1-04 compiler
@@ -177,11 +183,12 @@ func ok(stdout string) networkFakeStep { return networkFakeStep{stdout: stdout} 
 
 // Present-state fixtures equal to the desired state.
 const (
-	presentNetwork = `[{"name":"ctrldb-test-vpc","selfLink":"` + computeBase + `global/networks/ctrldb-test-vpc","autoCreateSubnetworks":false}]`
-	presentSubnet  = `[{"name":"ctrldb-test-subnet","selfLink":"` + computeBase + `regions/us-central1/subnetworks/ctrldb-test-subnet","region":"` + computeBase + `regions/us-central1","network":"` + computeBase + `global/networks/ctrldb-test-vpc","ipCidrRange":"10.40.0.0/24","privateIpGoogleAccess":true,"purpose":"PRIVATE","stackType":"IPV4_ONLY"}]`
-	presentRouter  = `[{"name":"ctrldb-test-router","selfLink":"` + computeBase + `regions/us-central1/routers/ctrldb-test-router","region":"` + computeBase + `regions/us-central1","network":"` + computeBase + `global/networks/ctrldb-test-vpc"}]`
-	presentNAT     = `[{"name":"ctrldb-test-nat","natIpAllocateOption":"AUTO_ONLY","sourceSubnetworkIpRangesToNat":"ALL_SUBNETWORKS_ALL_IP_RANGES","type":"PUBLIC"}]`
-	presentStatus  = `{"result":{"network":"` + computeBase + `global/networks/ctrldb-test-vpc","natStatus":[{"name":"ctrldb-test-nat","minExtraNatIpsNeeded":0}]}}`
+	presentNetwork  = `[{"id":"` + networkIncarnation + `","name":"ctrldb-test-vpc","selfLink":"` + computeBase + `global/networks/ctrldb-test-vpc","autoCreateSubnetworks":false}]`
+	presentSubnet   = `[{"id":"` + subnetIncarnation + `","name":"ctrldb-test-subnet","selfLink":"` + computeBase + `regions/us-central1/subnetworks/ctrldb-test-subnet","region":"` + computeBase + `regions/us-central1","network":"` + computeBase + `global/networks/ctrldb-test-vpc","ipCidrRange":"10.40.0.0/24","privateIpGoogleAccess":true,"purpose":"PRIVATE","stackType":"IPV4_ONLY","enableFlowLogs":false}]`
+	presentRouter   = `[{"id":"` + routerIncarnation + `","name":"ctrldb-test-router","selfLink":"` + computeBase + `regions/us-central1/routers/ctrldb-test-router","region":"` + computeBase + `regions/us-central1","network":"` + computeBase + `global/networks/ctrldb-test-vpc"}]`
+	presentNAT      = `[{"name":"ctrldb-test-nat","natIpAllocateOption":"AUTO_ONLY","sourceSubnetworkIpRangesToNat":"ALL_SUBNETWORKS_ALL_IP_RANGES","type":"PUBLIC"}]`
+	presentNATOwner = `[{"id":"` + routerIncarnation + `","name":"ctrldb-test-router","selfLink":"` + computeBase + `regions/us-central1/routers/ctrldb-test-router","region":"` + computeBase + `regions/us-central1","fingerprint":"` + natRouterFingerprint + `"}]`
+	presentStatus   = `{"result":{"network":"` + computeBase + `global/networks/ctrldb-test-vpc","natStatus":[{"name":"ctrldb-test-nat","minExtraNatIpsNeeded":0}]}}`
 )
 
 func presentFirewall(id string) string {
@@ -193,7 +200,11 @@ func presentFirewall(id string) string {
 		source = `"sourceTags":["ctrldb-test-node"]`
 		port = "27017"
 	}
-	return `[{"name":"` + golden.Name + `","selfLink":"` + computeBase + `global/firewalls/` + golden.Name + `","network":"` + computeBase +
+	incarnation := iapIncarnation
+	if id == "test-internal-firewall" {
+		incarnation = internalIncarnation
+	}
+	return `[{"id":"` + incarnation + `","name":"` + golden.Name + `","selfLink":"` + computeBase + `global/firewalls/` + golden.Name + `","network":"` + computeBase +
 		`global/networks/ctrldb-test-vpc","direction":"INGRESS","disabled":false,"priority":1000,"description":"` + description + `",` + source +
 		`,"targetTags":["ctrldb-test-node"],"allowed":[{"IPProtocol":"tcp","ports":["` + port + `"]}],"logConfig":{"enable":false}}]`
 }
@@ -205,7 +216,7 @@ func presentObservations(kind bootstrap.IntentKind) [][]networkFakeStep {
 	case bootstrap.IntentSubnet:
 		return [][]networkFakeStep{{ok(presentSubnet)}}
 	case bootstrap.IntentNAT:
-		return [][]networkFakeStep{{ok(presentRouter)}, {ok(presentNAT), ok(presentStatus)}}
+		return [][]networkFakeStep{{ok(presentRouter)}, {ok(presentNAT), ok(presentNATOwner), ok(presentStatus)}}
 	default:
 		return [][]networkFakeStep{{ok(presentFirewall("test-iap-firewall"))}, {ok(presentFirewall("test-internal-firewall"))}}
 	}
@@ -214,8 +225,12 @@ func presentObservations(kind bootstrap.IntentKind) [][]networkFakeStep {
 // createScript is observe(absent) -> create -> observe(present) per resource.
 func createScript(kind bootstrap.IntentKind) []networkFakeStep {
 	var script []networkFakeStep
-	for _, present := range presentObservations(kind) {
-		script = append(script, ok("[]"), ok(""))
+	for index, present := range presentObservations(kind) {
+		script = append(script, ok("[]"))
+		if kind == bootstrap.IntentSubnet && index == 0 {
+			script = append(script, ok("[]"))
+		}
+		script = append(script, ok(""))
 		script = append(script, present...)
 	}
 	return script

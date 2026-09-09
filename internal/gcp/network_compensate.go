@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/thelostorbital/ctrldb/internal/domain"
@@ -20,6 +21,14 @@ import (
 type compensableNetworkResource struct {
 	expected expectedNetworkResource
 	record   NetworkCreatedResource
+}
+
+func validIncarnationID(kind bootstrap.ResourceKind, value string) bool {
+	if kind != bootstrap.ResourceNAT {
+		return validNetworkID(value)
+	}
+	parts := strings.Split(value, ":")
+	return len(parts) == 2 && validNetworkID(parts[0]) && validRouterFingerprint(parts[1])
 }
 
 func (compensable compensableNetworkResource) deleteArguments() []string {
@@ -106,7 +115,7 @@ func admitCompensation(plan []expectedNetworkResource, authorization NetworkMuta
 		}
 		resource := expected.resource
 		if record.Kind != resource.Kind || record.Name != resource.Name || record.Project != resource.Project ||
-			record.Location != resource.Location || record.ProviderID != resource.ProviderID {
+			record.Location != resource.Location || record.ProviderID != resource.ProviderID || !validIncarnationID(record.Kind, record.IncarnationID) {
 			return nil, networkError(NetworkFailureTarget, "creation record identity")
 		}
 		if _, duplicate := selected[record.ResourceID]; duplicate {
@@ -134,17 +143,30 @@ func (client *NetworkClient) deleteResource(
 		Project: expected.resource.Project, Location: expected.resource.Location, ProviderID: expected.resource.ProviderID,
 		DesiredStateFingerprint: expected.resource.DesiredStateFingerprint,
 	}
-	present, err := client.observe(ctx, expected)
+	observed, err := client.observe(ctx, expected, false)
 	if err != nil {
 		return NetworkResourceResult{}, err
 	}
-	if !present {
+	if !observed.present {
 		result.Outcome = NetworkResourceAbsent
 		return result, nil
+	}
+	if observed.incarnationID != item.record.IncarnationID {
+		return NetworkResourceResult{}, expected.drift("incarnation changed")
 	}
 	if expected.resource.Kind == bootstrap.ResourceRouter {
 		if err := client.requireNoNAT(ctx, expected); err != nil {
 			return NetworkResourceResult{}, err
+		}
+		// The attachment check is a separate provider call. Re-observe the
+		// router afterward so its complete state and incarnation are again the
+		// final provider evidence immediately before authorization and delete.
+		observed, err = client.observe(ctx, expected, false)
+		if err != nil {
+			return NetworkResourceResult{}, err
+		}
+		if !observed.present || observed.incarnationID != item.record.IncarnationID {
+			return NetworkResourceResult{}, expected.drift("changed during compensation preflight")
 		}
 	}
 	if err := authorizeMutation(); err != nil {
@@ -158,8 +180,8 @@ func (client *NetworkClient) deleteResource(
 		return NetworkResourceResult{}, networkMutationError(NetworkFailureProcess, expected.resource.ID+" delete", domain.MutationUnknown)
 	}
 	result.Outcome = NetworkResourceDeleted
-	present, err = client.observe(ctx, expected)
-	if err != nil || present {
+	observed, err = client.observe(ctx, expected, false)
+	if err != nil || observed.present {
 		return NetworkResourceResult{}, networkMutationError(NetworkFailureUnverified, expected.resource.ID+" present after delete", domain.MutationOccurred)
 	}
 	return result, nil
@@ -211,4 +233,67 @@ func rejectSubnetOverlap(preflight observation.HarnessPreflight, expected expect
 		return networkError(NetworkFailureTarget, "subnet CIDR overlaps a discovered range")
 	}
 	return nil
+}
+
+// requireCurrentSubnetRanges closes the interval between the sealed preflight
+// and a subnet create. The exhaustive provider projection must still equal the
+// exact set bound into the authorization; any addition, removal, or change
+// forces the caller to obtain a new observation and authorization.
+func (client *NetworkClient) requireCurrentSubnetRanges(
+	ctx context.Context,
+	expected expectedNetworkResource,
+	preflight observation.HarnessPreflight,
+) error {
+	data, err := client.run(ctx, allSubnetObserveArguments(expected.command), expected.resource.ID+" subnet ranges")
+	if err != nil {
+		return err
+	}
+	var wire []subnetWire
+	if err := decodeNetworkProviderJSON(data, &wire); err != nil {
+		return networkError(NetworkFailureSchema, expected.resource.ID+" subnet ranges")
+	}
+	current := make([]observation.SubnetRange, 0, len(wire))
+	for _, item := range wire {
+		region, ok := normalizeComputeLocation(item.Region, expected.command.project, "regions")
+		if !ok || !networkNamePattern.MatchString(item.Name) ||
+			!computeSelfLinkMatches(item.SelfLink, networkProvider(expected.command.project, "regions", region, "subnetworks", item.Name)) ||
+			!canonicalIPPrefix(item.IPCIDRRange) {
+			return networkError(NetworkFailureSchema, expected.resource.ID+" subnet ranges")
+		}
+		current = append(current, observation.SubnetRange{Name: item.Name, Project: expected.command.project, Region: region,
+			CIDR: item.IPCIDRRange, ProviderID: item.SelfLink})
+		for _, secondary := range item.SecondaryIPRanges {
+			if !canonicalIPPrefix(secondary.IPCIDRRange) {
+				return networkError(NetworkFailureSchema, expected.resource.ID+" subnet ranges")
+			}
+			current = append(current, observation.SubnetRange{Name: item.Name, Project: expected.command.project, Region: region,
+				CIDR: secondary.IPCIDRRange, Secondary: true, ProviderID: item.SelfLink})
+		}
+	}
+	if !sameSubnetRanges(current, preflight.SubnetRanges()) {
+		return networkError(NetworkFailureAuthorization, "subnet ranges changed")
+	}
+	return rejectSubnetOverlap(preflight, expected, client.clock().UTC())
+}
+
+func canonicalIPPrefix(value string) bool {
+	prefix, err := netip.ParsePrefix(value)
+	return err == nil && prefix == prefix.Masked()
+}
+
+func sameSubnetRanges(left, right []observation.SubnetRange) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[observation.SubnetRange]int, len(left))
+	for _, item := range left {
+		counts[item]++
+	}
+	for _, item := range right {
+		if counts[item] == 0 {
+			return false
+		}
+		counts[item]--
+	}
+	return true
 }

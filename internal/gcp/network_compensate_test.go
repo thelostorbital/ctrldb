@@ -67,6 +67,37 @@ func TestNetworkClientRejectsOverlappingCIDRFromTheFreshPreflightBeforeAnyProces
 	}
 }
 
+func TestNetworkClientRequiresTheCurrentExhaustiveSubnetSetImmediatelyBeforeCreate(t *testing.T) {
+	intent := networkIntent(bootstrap.IntentSubnet)
+	target := networkTarget(t)
+	authorization := networkAuthorization(intent, target.Preflight)
+	foreign := `[{"name":"shared-services","region":"` + computeBase + `regions/us-east1","ipCidrRange":"10.40.0.0/24","selfLink":"` + computeBase + `regions/us-east1/subnetworks/shared-services"}]`
+	client, fake := testNetworkClient(t, ok("[]"), ok(foreign))
+	_, err := client.ApplyStep(context.Background(), authorization, intent, networkStepResources(intent.Kind), target)
+	assertNetworkFailure(t, "changed subnet set", err, NetworkFailureAuthorization, domain.MutationNotOccurred)
+	if len(fake.calls) != 2 {
+		t.Fatalf("calls = %d", len(fake.calls))
+	}
+	assertNoCreate(t, fake.calls)
+}
+
+func TestNetworkClientFreshSubnetSetAcceptsEveryCanonicalPrefixSealedByPreflight(t *testing.T) {
+	intent := networkIntent(bootstrap.IntentSubnet)
+	foreign := observation.SubnetRange{Name: "ipv6-services", Project: networkTestProject, Region: "us-east1", CIDR: "fd20::/64",
+		ProviderID: computeBase + "regions/us-east1/subnetworks/ipv6-services"}
+	target := networkTarget(t)
+	target.Preflight = networkPreflight(t, []observation.SubnetRange{foreign})
+	fresh := `[{"name":"ipv6-services","region":"` + computeBase + `regions/us-east1","ipCidrRange":"fd20::/64","selfLink":"` + foreign.ProviderID + `"}]`
+	client, fake := testNetworkClient(t, ok("[]"), ok(fresh), ok(""), ok(presentSubnet))
+	result, err := client.ApplyStep(context.Background(), networkAuthorization(intent, target.Preflight), intent, networkStepResources(intent.Kind), target)
+	if err != nil || len(result.Resources) != 1 || result.Resources[0].Outcome != NetworkResourceCreated {
+		t.Fatalf("ApplyStep() error = %v result = %#v", err, result)
+	}
+	if len(fake.calls) != 4 {
+		t.Fatalf("calls = %d", len(fake.calls))
+	}
+}
+
 func TestNetworkClientRetriesConvergeWithoutASecondCreate(t *testing.T) {
 	for _, kind := range networkKinds {
 		intent := networkIntent(kind)
@@ -74,7 +105,12 @@ func TestNetworkClientRetriesConvergeWithoutASecondCreate(t *testing.T) {
 		// Attempt 1: the create succeeds but the post-create observation is
 		// cut off by a process failure, so the step reports an occurred but
 		// unverified mutation.
-		client, fake := testNetworkClient(t, ok("[]"), ok(""), networkFakeStep{err: errors.New("interrupted")})
+		script := []networkFakeStep{ok("[]")}
+		if kind == bootstrap.IntentSubnet {
+			script = append(script, ok("[]"))
+		}
+		script = append(script, ok(""), networkFakeStep{err: errors.New("interrupted")})
+		client, fake := testNetworkClient(t, script...)
 		first := networkAuthorization(intent, target.Preflight)
 		result, err := client.ApplyStep(context.Background(), first, intent, networkStepResources(kind), target)
 		assertNetworkFailure(t, string(kind)+" attempt 1", err, NetworkFailureUnverified, domain.MutationOccurred)
@@ -87,7 +123,11 @@ func TestNetworkClientRetriesConvergeWithoutASecondCreate(t *testing.T) {
 		second := first
 		second.Attempt = 2
 		second.ClaimGeneration = 2
-		client, fake = testNetworkClient(t, append(presentObservations(kind)[0], createScript(kind)[len(presentObservations(kind)[0])+2:]...)...)
+		firstResourceCalls := len(presentObservations(kind)[0]) + 2
+		if kind == bootstrap.IntentSubnet {
+			firstResourceCalls++
+		}
+		client, fake = testNetworkClient(t, append(presentObservations(kind)[0], createScript(kind)[firstResourceCalls:]...)...)
 		result, err = client.ApplyStep(context.Background(), second, intent, networkStepResources(kind), target)
 		if err != nil {
 			t.Fatalf("%s attempt 2 error = %v", kind, err)
@@ -114,11 +154,20 @@ func countCreates(calls [][]string) int {
 }
 
 func createdRecords(authorization NetworkMutationAuthorization, intent bootstrap.StepIntent, ids ...string) []NetworkCreatedResource {
+	incarnations := map[string]string{
+		"test-network":           networkIncarnation,
+		"test-subnet":            subnetIncarnation,
+		"test-router":            routerIncarnation,
+		"test-nat":               routerIncarnation + ":" + natRouterFingerprint,
+		"test-iap-firewall":      iapIncarnation,
+		"test-internal-firewall": internalIncarnation,
+	}
 	records := make([]NetworkCreatedResource, 0, len(ids))
 	for _, id := range ids {
 		golden := goldenNetworkResources()[id]
 		records = append(records, NetworkCreatedResource{OperationID: authorization.OperationID, StepID: intent.StepID, Attempt: authorization.Attempt,
-			ResourceID: id, Kind: golden.Kind, Name: golden.Name, Project: golden.Project, Location: golden.Location, ProviderID: golden.ProviderID})
+			ResourceID: id, Kind: golden.Kind, Name: golden.Name, Project: golden.Project, Location: golden.Location,
+			ProviderID: golden.ProviderID, IncarnationID: incarnations[id]})
 	}
 	return records
 }
@@ -127,9 +176,14 @@ func compensateScript(kind bootstrap.IntentKind) []networkFakeStep {
 	present := presentObservations(kind)
 	var script []networkFakeStep
 	for index := len(present) - 1; index >= 0; index-- {
-		script = append(script, present[index]...)
+		observation := present[index]
+		if kind == bootstrap.IntentNAT && index == 1 {
+			observation = observation[:2]
+		}
+		script = append(script, observation...)
 		if kind == bootstrap.IntentNAT && index == 0 {
 			script = append(script, ok("[]"))
+			script = append(script, observation...)
 		}
 		script = append(script, ok(""), ok("[]"))
 	}
@@ -248,6 +302,9 @@ func TestNetworkClientRefusesToDeleteWhatItCannotProveItCreated(t *testing.T) {
 			record.ProviderID = "projects/example-project/global/firewalls/default-allow-ssh"
 		}},
 		{name: "wrong kind", kind: NetworkFailureTarget, mutate: func(record *NetworkCreatedResource) { record.Kind = bootstrap.ResourceNetwork }},
+		{name: "missing incarnation", kind: NetworkFailureTarget, mutate: func(record *NetworkCreatedResource) { record.IncarnationID = "" }},
+		{name: "malformed incarnation", kind: NetworkFailureTarget, mutate: func(record *NetworkCreatedResource) { record.IncarnationID = "replacement" }},
+		{name: "overflowing incarnation", kind: NetworkFailureTarget, mutate: func(record *NetworkCreatedResource) { record.IncarnationID = "18446744073709551616" }},
 	}
 	for _, test := range tests {
 		records := createdRecords(authorization, intent, "test-iap-firewall")
@@ -276,6 +333,32 @@ func TestNetworkClientRefusesToDeleteWhatItCannotProveItCreated(t *testing.T) {
 	if len(fake.calls) != 0 {
 		t.Fatal("stale compensation reached a process")
 	}
+
+	// A same-name, same-configuration replacement is not the incarnation this
+	// operation created and therefore cannot be deleted.
+	replacement := strings.Replace(iap, `"id":"`+iapIncarnation+`"`, `"id":"9999"`, 1)
+	client, fake = testNetworkClient(t, ok(replacement))
+	_, err = client.CompensateStep(context.Background(), authorization, intent, resources, target,
+		createdRecords(authorization, intent, "test-iap-firewall"))
+	assertNetworkFailure(t, "replacement incarnation", err, NetworkFailureDrift, domain.MutationNotOccurred)
+	assertNoCreate(t, fake.calls)
+}
+
+func TestNetworkClientCanCompensateAnUnhealthyCreatedNAT(t *testing.T) {
+	intent := networkIntent(bootstrap.IntentNAT)
+	target := networkTarget(t)
+	authorization := networkAuthorization(intent, target.Preflight)
+	client, fake := testNetworkClient(t, ok(presentNAT), ok(presentNATOwner), ok(""), ok("[]"))
+	result, err := client.CompensateStep(context.Background(), authorization, intent, networkStepResources(intent.Kind), target,
+		createdRecords(authorization, intent, "test-nat"))
+	if err != nil || len(result.Resources) != 1 || result.Resources[0].Outcome != NetworkResourceDeleted {
+		t.Fatalf("CompensateStep() error = %v result = %#v", err, result)
+	}
+	for _, call := range fake.calls {
+		if len(call) > 2 && call[0] == "compute" && call[1] == "routers" && call[2] == "get-status" {
+			t.Fatalf("compensation required operational NAT status: %q", call)
+		}
+	}
 }
 
 func TestNetworkClientRouterCompensationNeverRemovesAnUnrecordedNAT(t *testing.T) {
@@ -290,9 +373,17 @@ func TestNetworkClientRouterCompensationNeverRemovesAnUnrecordedNAT(t *testing.T
 	assertNetworkFailure(t, "router with unrecorded nat", err, NetworkFailureDrift, domain.MutationNotOccurred)
 	assertNoCreate(t, fake.calls)
 
+	// Attachment state is checked again after the separate NAT query so drift
+	// in that interval cannot reach the delete.
+	routerWithInterface := strings.Replace(presentRouter, `"network"`, `"interfaces":[{"name":"peer-link"}],"network"`, 1)
+	client, fake = testNetworkClient(t, ok(presentRouter), ok("[]"), ok(routerWithInterface))
+	_, err = client.CompensateStep(context.Background(), authorization, intent, resources, target, createdRecords(authorization, intent, "test-router"))
+	assertNetworkFailure(t, "router attachment drift during compensation preflight", err, NetworkFailureDrift, domain.MutationNotOccurred)
+	assertNoCreate(t, fake.calls)
+
 	// With both recorded, the NAT is removed first and the router only after
 	// the NAT list is proven empty.
-	client, fake = testNetworkClient(t, ok(presentNAT), ok(presentStatus), ok(""), ok("[]"), ok(presentRouter), ok("[]"), ok(""), ok("[]"))
+	client, fake = testNetworkClient(t, ok(presentNAT), ok(presentNATOwner), ok(""), ok("[]"), ok(presentRouter), ok("[]"), ok(presentRouter), ok(""), ok("[]"))
 	result, err := client.CompensateStep(context.Background(), authorization, intent, resources, target, createdRecords(authorization, intent, "test-router", "test-nat"))
 	if err != nil || len(result.Resources) != 2 || result.Resources[0].ResourceID != "test-nat" || result.Resources[1].ResourceID != "test-router" {
 		t.Fatalf("ordered compensation error = %v result = %#v", err, result)

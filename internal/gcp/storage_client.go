@@ -273,7 +273,10 @@ type StorageSession struct {
 	objects map[string]struct{}
 }
 
-var _ control.AuditBucketPort = (*StorageSession)(nil)
+var (
+	_ control.AuditBucketPort = (*StorageSession)(nil)
+	_ control.StorageStepPort = (*StorageSession)(nil)
+)
 
 // Authorize validates the authorization, the intent, and the step's desired
 // resources, and binds them into a session. Missing, stale, mismatched-kind,

@@ -323,6 +323,65 @@ func TestNetworkClientReportsMutationObservationOnCompensationFailure(t *testing
 	assertNoCreate(t, fake.calls)
 }
 
+func TestNetworkClientRevalidatesAuthorizationImmediatelyBeforeEveryCompensationMutation(t *testing.T) {
+	intent := networkIntent(bootstrap.IntentNetwork)
+	target := networkTarget(t)
+	authorization := networkAuthorization(intent, target.Preflight)
+
+	for _, test := range []struct {
+		name      string
+		secondNow time.Time
+	}{
+		{name: "authorization expires before delete", secondNow: authorization.ValidUntil},
+		{name: "clock regresses before delete", secondNow: authorization.Now.Add(-time.Second)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, fake := testNetworkClient(t, ok(presentNetwork), ok(""), ok("[]"))
+			calls := 0
+			client.clock = func() time.Time {
+				calls++
+				if calls == 1 {
+					return authorization.Now
+				}
+				return test.secondNow
+			}
+			result, err := client.CompensateStep(context.Background(), authorization, intent, networkStepResources(intent.Kind), target,
+				createdRecords(authorization, intent, "test-network"))
+			assertNetworkFailure(t, test.name, err, NetworkFailureAuthorization, domain.MutationNotOccurred)
+			if len(result.Resources) != 0 || len(fake.calls) != 1 {
+				t.Fatalf("result = %#v, calls = %d", result, len(fake.calls))
+			}
+			assertNoCreate(t, fake.calls)
+		})
+	}
+
+	t.Run("authorization expires between deletes", func(t *testing.T) {
+		intent := networkIntent(bootstrap.IntentNAT)
+		target := networkTarget(t)
+		authorization := networkAuthorization(intent, target.Preflight)
+		client, fake := testNetworkClient(t, compensateScript(bootstrap.IntentNAT)...)
+		calls := 0
+		client.clock = func() time.Time {
+			calls++
+			if calls <= 2 {
+				return authorization.Now
+			}
+			return authorization.ValidUntil
+		}
+		result, err := client.CompensateStep(context.Background(), authorization, intent, networkStepResources(intent.Kind), target,
+			createdRecords(authorization, intent, "test-router", "test-nat"))
+		assertNetworkFailure(t, "expiry between deletes", err, NetworkFailureAuthorization, domain.MutationOccurred)
+		if len(result.Resources) != 1 || result.Resources[0].ResourceID != "test-nat" || result.Resources[0].Outcome != NetworkResourceDeleted {
+			t.Fatalf("result = %#v", result)
+		}
+		for _, call := range fake.calls {
+			if len(call) > 2 && call[0] == "compute" && call[1] == "routers" && call[2] == "delete" {
+				t.Fatalf("router delete ran after authorization expiry: %q", call)
+			}
+		}
+	})
+}
+
 func TestNetworkApplyAndVerifyNeverRenderADelete(t *testing.T) {
 	for _, kind := range networkKinds {
 		intent := networkIntent(kind)

@@ -66,12 +66,22 @@ func (client *NetworkClient) CompensateStep(
 	defer cancel()
 
 	result := NetworkStepResult{OperationID: authorization.OperationID, StepID: intent.StepID, Attempt: authorization.Attempt, Kind: intent.Kind}
+	mutated := false
 	for _, item := range compensable {
-		outcome, deleteErr := client.deleteResource(stepContext, item)
+		outcome, deleteErr := client.deleteResource(stepContext, item, func() error {
+			return client.validateNetworkAuthorization(authorization, intent, target.Preflight)
+		})
 		if deleteErr != nil {
+			if mutated {
+				var failure *NetworkError
+				if errors.As(deleteErr, &failure) && failure.Mutation() == domain.MutationNotOccurred {
+					deleteErr = networkMutationError(failure.kind, failure.source, domain.MutationOccurred)
+				}
+			}
 			return result, deleteErr
 		}
 		result.Resources = append(result.Resources, outcome)
+		mutated = mutated || outcome.Outcome == NetworkResourceDeleted
 	}
 	return result, nil
 }
@@ -113,7 +123,11 @@ func admitCompensation(plan []expectedNetworkResource, authorization NetworkMuta
 	return result, nil
 }
 
-func (client *NetworkClient) deleteResource(ctx context.Context, item compensableNetworkResource) (NetworkResourceResult, error) {
+func (client *NetworkClient) deleteResource(
+	ctx context.Context,
+	item compensableNetworkResource,
+	authorizeMutation func() error,
+) (NetworkResourceResult, error) {
 	expected := item.expected
 	result := NetworkResourceResult{
 		ResourceID: expected.resource.ID, Kind: expected.resource.Kind, Name: expected.resource.Name,
@@ -132,6 +146,9 @@ func (client *NetworkClient) deleteResource(ctx context.Context, item compensabl
 		if err := client.requireNoNAT(ctx, expected); err != nil {
 			return NetworkResourceResult{}, err
 		}
+	}
+	if err := authorizeMutation(); err != nil {
+		return NetworkResourceResult{}, err
 	}
 	if _, err := client.run(ctx, item.deleteArguments(), expected.resource.ID+" delete"); err != nil {
 		var failure *NetworkError

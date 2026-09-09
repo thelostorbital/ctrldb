@@ -194,6 +194,8 @@ type NetworkResourceOutcome string
 const (
 	NetworkResourceAlreadyPresent NetworkResourceOutcome = "already-present"
 	NetworkResourceCreated        NetworkResourceOutcome = "created"
+	NetworkResourceDeleted        NetworkResourceOutcome = "deleted"
+	NetworkResourceAbsent         NetworkResourceOutcome = "absent"
 )
 
 // NetworkResourceResult is a typed, provider-output-free result for one
@@ -277,7 +279,16 @@ func (client *NetworkClient) execute(
 	if err != nil {
 		return NetworkStepResult{}, err
 	}
-	stepContext, cancel := context.WithTimeout(ctx, time.Duration(intent.TimeoutSeconds)*time.Second)
+	if mutate {
+		for _, expected := range plan {
+			if expected.resource.Kind == bootstrap.ResourceSubnetwork {
+				if err := rejectSubnetOverlap(target.Preflight, expected, authorization.Now); err != nil {
+					return NetworkStepResult{}, err
+				}
+			}
+		}
+	}
+	stepContext, cancel := context.WithTimeout(ctx, stepTimeout(intent))
 	defer cancel()
 
 	result := NetworkStepResult{OperationID: authorization.OperationID, StepID: intent.StepID, Attempt: authorization.Attempt, Kind: intent.Kind}
@@ -501,6 +512,10 @@ func (client *NetworkClient) validateNetworkAuthorization(
 		return networkError(NetworkFailureAuthorization, "authorization clock")
 	}
 	return nil
+}
+
+func stepTimeout(intent bootstrap.StepIntent) time.Duration {
+	return time.Duration(intent.TimeoutSeconds) * time.Second
 }
 
 func utcInstant(value time.Time) bool {

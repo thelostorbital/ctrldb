@@ -92,3 +92,27 @@ func firewallCreateArguments(command commandContext, spec networkFirewallSpec) [
 func firewallObserveArguments(command commandContext, name string) []string {
 	return globalArguments(command, "compute", "firewall-rules", "list", exactNameFilter(name), firewallFormat)
 }
+
+// Compensation templates. They are reachable only through a
+// compensableNetworkResource, which exists only for a resource whose durable
+// creation record names this exact operation and step; Apply and Verify
+// cannot render them. `--quiet` suppresses the interactive confirmation.
+func networkDeleteArguments(command commandContext, vpc string) []string {
+	return globalArguments(command, "compute", "networks", "delete", vpc)
+}
+
+func subnetDeleteArguments(command commandContext, subnet string) []string {
+	return globalArguments(command, "compute", "networks", "subnets", "delete", subnet, "--region="+command.region)
+}
+
+func routerDeleteArguments(command commandContext, router string) []string {
+	return globalArguments(command, "compute", "routers", "delete", router, "--region="+command.region)
+}
+
+func natDeleteArguments(command commandContext, nat, router string) []string {
+	return globalArguments(command, "compute", "routers", "nats", "delete", nat, "--router="+router, "--region="+command.region)
+}
+
+func firewallDeleteArguments(command commandContext, name string) []string {
+	return globalArguments(command, "compute", "firewall-rules", "delete", name)
+}

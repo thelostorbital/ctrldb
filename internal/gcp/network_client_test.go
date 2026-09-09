@@ -79,7 +79,7 @@ func TestNetworkClientAppliesEachStepWithByteExactArgv(t *testing.T) {
 			if got, want := encodeCalls(t, fake.calls), readGoldenArgv(t, intent.StepID); got != want {
 				t.Fatalf("argv differs from fixture:\n got: %s\nwant: %s", got, want)
 			}
-			assertClosedCommandShape(t, fake.calls, kind)
+			assertClosedCommandShape(t, fake.calls, kind, "create")
 			if result.StepID != intent.StepID || result.Kind != kind || result.Attempt != 1 || result.OperationID != "op-20260906-0001" ||
 				len(result.Resources) != len(intent.ResourceIDs) || len(result.Created) != len(intent.ResourceIDs) {
 				t.Fatalf("result = %#v", result)
@@ -103,12 +103,18 @@ func TestNetworkClientAppliesEachStepWithByteExactArgv(t *testing.T) {
 	}
 }
 
-func assertClosedCommandShape(t *testing.T, calls [][]string, kind bootstrap.IntentKind) {
+// assertClosedCommandShape proves every rendered command is explicit,
+// synchronous, and limited to the one mutation verb the operation may use.
+func assertClosedCommandShape(t *testing.T, calls [][]string, kind bootstrap.IntentKind, verb string) {
 	t.Helper()
 	regional := kind == bootstrap.IntentSubnet || kind == bootstrap.IntentNAT
+	forbiddenVerb := " delete "
+	if verb == "delete" {
+		forbiddenVerb = " create "
+	}
 	for _, call := range calls {
 		joined := " " + strings.Join(call, " ") + " "
-		for _, forbidden := range []string{"--async", "--impersonate-service-account", "--configuration", " delete ", " update ", " ssh ", "--limit", "--page-size"} {
+		for _, forbidden := range []string{"--async", "--impersonate-service-account", "--configuration", forbiddenVerb, " update ", " patch ", " ssh ", "--limit", "--page-size"} {
 			if strings.Contains(joined, forbidden) {
 				t.Fatalf("command admitted forbidden token %q: %s", forbidden, joined)
 			}

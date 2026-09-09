@@ -66,7 +66,7 @@ func (fake *fakeStoragePort) RemoveBinding(_ context.Context, identity BucketIde
 }
 
 func (fake *fakeStoragePort) UploadControlCreateOnly(ctx context.Context, identity BucketIdentity, object ControlObjectName, content []byte) (ObjectDescriptor, error) {
-	return fake.UploadCreateOnly(ctx, identity, AuditObjectName{value: object.value}, content)
+	return fake.UploadCreateOnly(ctx, identity, AuditObjectName(object), content)
 }
 
 func (fake *fakeStoragePort) UploadIfGenerationMatch(_ context.Context, identity BucketIdentity, object ControlObjectName, expected Generation, content []byte) (ObjectDescriptor, error) {
@@ -86,11 +86,11 @@ func (fake *fakeStoragePort) UploadIfGenerationMatch(_ context.Context, identity
 }
 
 func (fake *fakeStoragePort) DescribeControlObject(ctx context.Context, identity BucketIdentity, object ControlObjectName) (ObjectDescriptor, bool, error) {
-	return fake.DescribeObject(ctx, identity, AuditObjectName{value: object.value})
+	return fake.DescribeObject(ctx, identity, AuditObjectName(object))
 }
 
 func (fake *fakeStoragePort) ReadControlObject(ctx context.Context, identity BucketIdentity, object ControlObjectName) ([]byte, ObjectDescriptor, bool, error) {
-	return fake.ReadObject(ctx, identity, AuditObjectName{value: object.value})
+	return fake.ReadObject(ctx, identity, AuditObjectName(object))
 }
 
 func TestStorageExecutorRunsK1ToK5FromTheSealedEnvelope(t *testing.T) {

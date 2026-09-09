@@ -221,6 +221,9 @@ func (handoff *AuditHandoff) LockRetention(ctx context.Context, envelope Bootstr
 		if state.RetentionSeconds != 0 {
 			return HandoffStatus{}, fmt.Errorf("%w: foreign retention policy", ErrPartialBootstrapBlocked)
 		}
+		if err := session.authorizeMutation(); err != nil {
+			return HandoffStatus{}, err
+		}
 		if err := handoff.port.ConfigureRetention(ctx, session.identity, AuditRetentionSeconds); err != nil {
 			return HandoffStatus{}, err
 		}
@@ -241,6 +244,9 @@ func (handoff *AuditHandoff) LockRetention(ctx context.Context, envelope Bootstr
 		if err := session.append(PhaseRetentionLockClaimed, nil, nil); err != nil {
 			return HandoffStatus{}, err
 		}
+	}
+	if err := session.authorizeMutation(); err != nil {
+		return HandoffStatus{}, err
 	}
 	if err := handoff.port.LockRetention(ctx, session.identity, state.Metageneration); err != nil {
 		return HandoffStatus{}, err
@@ -365,6 +371,17 @@ func (session *handoffSession) status() HandoffStatus {
 	return status
 }
 
+// authorizeMutation samples the clock at the last in-process boundary before
+// a provider write. Entry-time validation is insufficient because a preceding
+// observation, local record, or provider call can consume the approval window.
+func (session *handoffSession) authorizeMutation() error {
+	now := session.handoff.clock().UTC()
+	if len(session.records) > 0 && now.Before(session.records[len(session.records)-1].RecordedAt) {
+		return fmt.Errorf("%w: clock moved backwards before provider mutation", ErrInvalidHandoffRecord)
+	}
+	return session.envelope.validAt(now)
+}
+
 func (session *handoffSession) append(phase HandoffPhase, envelopeObject, journalObject *ObjectDescriptor) error {
 	if phase.order() <= session.latest().order() && session.latest() != "" {
 		return fmt.Errorf("%w: phase %s does not advance %s", ErrInvalidHandoffRecord, phase, session.latest())
@@ -414,6 +431,9 @@ func (session *handoffSession) ensureBucket(ctx context.Context) error {
 		if err := session.append(PhaseAuditBucketClaimed, nil, nil); err != nil {
 			return err
 		}
+	}
+	if err := session.authorizeMutation(); err != nil {
+		return err
 	}
 	if err := port.CreateAuditBucket(ctx, session.identity); err != nil {
 		return err
@@ -497,6 +517,9 @@ func (session *handoffSession) ensureUploads(ctx context.Context) error {
 
 func (session *handoffSession) uploadCreateOnly(ctx context.Context, name AuditObjectName, content []byte) (ObjectDescriptor, error) {
 	port := session.handoff.port
+	if err := session.authorizeMutation(); err != nil {
+		return ObjectDescriptor{}, err
+	}
 	descriptor, err := port.UploadCreateOnly(ctx, session.identity, name, content)
 	if err == nil {
 		if !descriptor.MatchesContent(content) {
@@ -539,6 +562,9 @@ func (session *handoffSession) ensureLifecycle(ctx context.Context) error {
 		return err
 	}
 	if state.LifecycleArchiveAfterDay != AuditArchiveAfterDays {
+		if err := session.authorizeMutation(); err != nil {
+			return err
+		}
 		if err := session.handoff.port.ConfigureArchiveLifecycle(ctx, session.identity); err != nil {
 			return err
 		}

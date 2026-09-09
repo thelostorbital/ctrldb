@@ -20,14 +20,15 @@ var errSimulatedCrash = errors.New("simulated crash after provider mutation")
 // hook fires after the named mutation has already been applied, modelling a
 // process death between the provider call and the local record.
 type fakeAuditBucket struct {
-	mutex       sync.Mutex
-	clock       func() time.Time
-	globalTaken map[string]bool
-	buckets     map[string]*BucketState
-	objects     map[string]map[string]fakeObject
-	generation  Generation
-	crashAfter  map[string]bool
-	calls       map[string]int
+	mutex         sync.Mutex
+	clock         func() time.Time
+	globalTaken   map[string]bool
+	buckets       map[string]*BucketState
+	objects       map[string]map[string]fakeObject
+	generation    Generation
+	crashAfter    map[string]bool
+	calls         map[string]int
+	afterMutation func(string)
 }
 
 type fakeObject struct {
@@ -48,6 +49,9 @@ func (fake *fakeAuditBucket) count(name string) int {
 
 func (fake *fakeAuditBucket) after(name string) error {
 	fake.calls[name]++
+	if fake.afterMutation != nil {
+		fake.afterMutation(name)
+	}
 	if fake.crashAfter[name] {
 		delete(fake.crashAfter, name)
 		return errSimulatedCrash
@@ -601,6 +605,69 @@ func TestAuditHandoffRefusesExpiredAuthorization(t *testing.T) {
 	}
 }
 
+func TestAuditHandoffRechecksAuthorizationBeforeEachProviderMutation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("bootstrap", func(t *testing.T) {
+		t.Parallel()
+		envelope := fixtureEnvelope(t)
+		current := fixtureNow.Add(3 * time.Minute)
+		clock := func() time.Time { return current }
+		fake := newFakeAuditBucket(clock)
+		fake.afterMutation = func(name string) {
+			if name == "create-bucket" {
+				current = envelope.Approval().ValidUntil
+			}
+		}
+		handoff, err := NewAuditHandoff(fixtureStateDirectory(t), fake, clock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := handoff.Bootstrap(ctx, envelope); !errors.Is(err, ErrEnvelopeExpired) {
+			t.Fatalf("Bootstrap() after approval expired between mutations error = %v", err)
+		}
+		if fake.count("create-bucket") != 1 || fake.count("lifecycle") != 0 {
+			t.Fatalf("provider mutations after expiry = %v", fake.calls)
+		}
+		envelopeName, _ := BootstrapEnvelopeObjectName(envelope.Environment(), envelope.OperationID())
+		if fake.count("upload:"+envelopeName.String()) != 0 || fake.count("upload:"+envelope.FirstJournalObjectName().String()) != 0 {
+			t.Fatalf("uploads continued after expiry: %v", fake.calls)
+		}
+	})
+
+	t.Run("retention lock", func(t *testing.T) {
+		t.Parallel()
+		fixture := newHandoffFixture(t)
+		if _, err := fixture.handoff.Bootstrap(ctx, fixture.envelope); err != nil {
+			t.Fatal(err)
+		}
+		directory, _ := fixture.directory.handoffPath(fixture.envelope.OperationID())
+		records, err := readHandoffRecords(directory, fixture.envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		current := records[len(records)-1].RecordedAt
+		clock := func() time.Time { return current }
+		fixture.fake.clock = clock
+		fixture.fake.afterMutation = func(name string) {
+			if name == "retention" {
+				current = fixture.envelope.Approval().ValidUntil
+			}
+		}
+		handoff, err := NewAuditHandoff(fixture.directory, fixture.fake, clock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := handoff.LockRetention(ctx, fixture.envelope); !errors.Is(err, ErrEnvelopeExpired) {
+			t.Fatalf("LockRetention() after approval expired between mutations error = %v", err)
+		}
+		if fixture.fake.count("retention") != 1 || fixture.fake.count("lock") != 0 || fixture.fake.buckets[fixture.identity.Name].RetentionLocked {
+			t.Fatalf("retention lock continued after expiry: %v", fixture.fake.calls)
+		}
+	})
+}
+
 func TestAuditHandoffRefusesBackwardClockBeforePersisting(t *testing.T) {
 	t.Parallel()
 	envelope := fixtureEnvelope(t)
@@ -625,6 +692,36 @@ func TestAuditHandoffRefusesBackwardClockBeforePersisting(t *testing.T) {
 	}
 	if fake.count("create-bucket") != 0 {
 		t.Fatal("a regressing clock still reached the provider")
+	}
+}
+
+func TestAuditHandoffRefusesBackwardClockBeforeLaterMutation(t *testing.T) {
+	t.Parallel()
+	envelope := fixtureEnvelope(t)
+	clockReads := 0
+	clock := func() time.Time {
+		clockReads++
+		if clockReads >= 7 {
+			return fixtureNow.Add(2*time.Minute + 30*time.Second)
+		}
+		return fixtureNow.Add(3 * time.Minute)
+	}
+	fake := newFakeAuditBucket(clock)
+	// The clock regresses after the create is observed and recorded, while it
+	// remains inside the approval window. Upload must still be refused.
+	handoff, err := NewAuditHandoff(fixtureStateDirectory(t), fake, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handoff.Bootstrap(context.Background(), envelope); !errors.Is(err, ErrInvalidHandoffRecord) {
+		t.Fatalf("Bootstrap() with clock regression before upload error = %v", err)
+	}
+	if fake.count("create-bucket") != 1 {
+		t.Fatalf("create count = %d, want 1", fake.count("create-bucket"))
+	}
+	envelopeName, _ := BootstrapEnvelopeObjectName(envelope.Environment(), envelope.OperationID())
+	if fake.count("upload:"+envelopeName.String()) != 0 || fake.count("lifecycle") != 0 {
+		t.Fatalf("provider mutation continued after clock regression: %v", fake.calls)
 	}
 }
 

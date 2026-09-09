@@ -290,3 +290,16 @@ func decodeStrictSeed(content []byte, target any) error {
 	}
 	return nil
 }
+
+// SeedObjectNames returns the closed K4 seed object names for environment.
+// It returns nil for an invalid environment.
+func SeedObjectNames(environment string) []string {
+	lock, err := LockObjectName(environment)
+	if err != nil {
+		return nil
+	}
+	adoption, _ := AdoptionObjectName(environment)
+	policy, _ := ApprovedPolicyObjectName(environment)
+	ceiling, _ := CostCeilingObjectName(environment)
+	return []string{lock.String(), adoption.String(), policy.String(), ceiling.String()}
+}
